@@ -1,0 +1,34 @@
+{
+  "name": "@every-dagent/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Every-DAgent web transport binding and the generic web shell: a node:http server and a fetch/SSE client channel that carry protocol frames as text, plus the React shell that reads a client snapshot.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node dist/server.mjs"
+  },
+  "dependencies": {
+    "@every-dagent/client": "workspace:*",
+    "@every-dagent/host": "workspace:*",
+    "@every-dagent/protocol": "workspace:*",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./client": {
+      "types": "./src/client/http-channel.ts",
+      "default": "./src/client/http-channel.ts"
+    },
+    "./server": {
+      "types": "./src/server/http-binding.ts",
+      "default": "./src/server/http-binding.ts"
+    }
+  }
+}

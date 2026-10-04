@@ -1,0 +1,2854 @@
+/**
+ * The connection: one logical connection to a host, from the connector promise
+ * to the last frame it will ever send.
+ *
+ * Four separations run through this module.
+ *
+ * The first is epoch versus identity. Every attempt at a connection gets a local
+ * `epoch`; every callback — connector completion, frame, close, timer, reverse
+ * handler, an `await` continuation — is bound to the attempt that created it,
+ * and anything arriving from an older one is inert. `hostInstanceId` is a
+ * different fact: it is the host's own identity, learned from `host.describe`,
+ * and it distinguishes *which* host this is, never *which* connection.
+ *
+ * The second is invalidation before publication. A connection that is ending is
+ * torn down first — epoch, channel, identity, stream, control ownership,
+ * pending — and only then does the client say so. A listener that hears
+ * "disconnected" is hearing about a client that can no longer send, reconnect on
+ * a stale path, or overwrite a newer attempt. Tearing a connection down runs
+ * foreign code — a listener disposer, an abort listener, the transport's own
+ * close — and that code may re-enter this client and say something newer; when
+ * it has, the transition that was underway publishes nothing, because the newer
+ * claim is the state.
+ *
+ * The third is the frame path versus everything foreign. Frames are routed
+ * synchronously: a response settles its pending, an event folds, and the
+ * subscription snapshot is installed before the frames behind it are read. A
+ * control transaction — `open` above all — takes its ownership synchronously,
+ * before it notifies or sends anything, so a reentrant listener starts a *new*
+ * transaction instead of joining one that finished.
+ *
+ * The fourth is the presentation versus the caller. Only a validated open
+ * snapshot and validated events move the shared presentation; an operation
+ * response resolves its caller and touches nothing else.
+ */
+
+import type {
+  ApprovalSnapshot,
+  ClientCapabilities,
+  CollectionRevisions,
+  DecodedEnvelope,
+  HostCapabilities,
+  HostDescription,
+  HostEvent,
+  HostSnapshot,
+  Id,
+  JsonValue,
+  OperationMap,
+  OperationName,
+  ProtocolChannel,
+  RunSnapshot,
+  RunSummary,
+  SessionSummary,
+  SessionSummaryPage,
+  ToolApprovalResponse,
+  Watermark,
+} from "@every-dagent/protocol";
+import {
+  PROTOCOL_VERSION,
+  decodeFrame,
+  encodeFrame,
+  validateJsonValue,
+  validateMessage,
+  validateReverseParams,
+  validateReverseResult,
+} from "@every-dagent/protocol";
+
+import type { ClientMisuseReason, ConnectionLostReason, ProtocolViolationReason } from "./errors.js";
+import { ClientError, clientMisuse, connectionLost, protocolViolation, remoteError } from "./errors.js";
+import {
+  DIRECTORY_CACHE_LIMITS,
+  EMPTY_DIRECTORY,
+  anchoredDirectory,
+  applyDirectoryPage,
+  continuationRetired,
+  directoryContinuation,
+  directoryPageOf,
+  directoryView,
+  forgetDirectorySession,
+  invalidateDirectory,
+  newerRun,
+  reanchoredDirectory,
+  runSummaryOf,
+  updateDirectorySession,
+  type DirectoryState,
+  type FocusedSession,
+} from "./directory.js";
+import {
+  applyHistoryPage,
+  deepFreeze,
+  foldEvent,
+  foldHistoryEvent,
+  foldLiveEvent,
+  liveRefreshExtends,
+  runIsPlaceable,
+  type PlaceabilityContext,
+} from "./fold.js";
+import { applySettingsSnapshot, foldSettingsEvent, forgetSettings, markSettingsStale } from "./settings.js";
+import type { ReverseHandlerContext, ReverseHandlerOutcome, ReverseHandlerRegistration, ReverseTable } from "./reverse.js";
+import { createReverseTable } from "./reverse.js";
+import type { ApprovalReplyState, ClientSnapshot, ConnectionStatus, PresentationStore } from "./store.js";
+import { createStore, NO_APPROVAL_REPLY } from "./store.js";
+
+type ResponseEnvelope = Extract<DecodedEnvelope, { kind: "host-response" }>;
+type EventEnvelope = Extract<DecodedEnvelope, { kind: "host-event" }>;
+type RequestEnvelope = Extract<DecodedEnvelope, { kind: "host-request" }>;
+
+/** Business requests one connection may have outstanding. */
+const MAX_ORDINARY_PENDING = 128;
+/** The control slots, reserved on top of them: an `open` must never be refused because business traffic is busy. */
+const MAX_CONTROL_PENDING = 2;
+/** How long a control request (`describe`, `open`, `close`) may wait for an answer. */
+const CONTROL_DEADLINE_MS = 10_000;
+/** How many reverse handlers may be running at once. */
+const MAX_REVERSE_PENDING = 32;
+/** How many reverse request ids one connection may spend before uniqueness cannot be proved. */
+const MAX_REVERSE_HISTORY = 4096;
+/**
+ * How many retired stream ids one connection remembers.
+ *
+ * Streams are never reused, so this is the client's proof that a frame belongs
+ * to a stream it has already ended. Forgetting an id would mean accepting its
+ * frames again; the budget is finite, and using it up ends the connection
+ * honestly instead of degrading into guesswork.
+ *
+ * The ledger is a fact about one connection, not about the client: a revoked
+ * stream can still have frames in flight on the channel that carried it, so the
+ * proof has to live exactly as long as that channel does — and no longer. An
+ * ended connection releases what it remembered, and the next one starts with its
+ * own budget rather than inheriting a spent one.
+ */
+const RETIRED_STREAM_BUDGET = 256;
+
+const MAX_TIMER_DELAY = 2 ** 31 - 1;
+
+/** The methods that keep this connection synchronized, and pay for their own capacity. */
+const CONTROL_METHODS: ReadonlySet<OperationName> = new Set<OperationName>([
+  "host.describe",
+  "subscriptions.open",
+  "subscriptions.close",
+]);
+
+/** A wait that survives a legal `timeoutMs` past `setTimeout`'s ceiling. */
+function scheduleDeadline(deadline: number, fire: () => void): { cancel(): void } {
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  let cancelled = false;
+
+  const arm = (): void => {
+    if (cancelled) return;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      fire();
+      return;
+    }
+    handle = setTimeout(arm, Math.min(remaining, MAX_TIMER_DELAY));
+  };
+
+  arm();
+
+  return {
+    cancel: (): void => {
+      cancelled = true;
+      if (handle !== undefined) clearTimeout(handle);
+    },
+  };
+}
+
+/** Runs foreign code — a disposer, a transport — that must not be able to fail this client's transition. */
+function quietly(act: () => void): void {
+  try {
+    act();
+  } catch {
+    // Deliberately swallowed: the caller's state is already consistent, and a
+    // transport that throws while being taken down has nothing left to say.
+  }
+}
+
+/** Which capability an operation needs before it may be sent at all. */
+const CAPABILITY_OF: Readonly<Record<OperationName, keyof HostCapabilities | undefined>> = Object.freeze({
+  "host.describe": undefined,
+  "sessions.list": "sessions",
+  "sessions.create": "sessions",
+  "sessions.get": "sessions",
+  "sessions.history": "historyPages",
+  "sessions.rename": "sessionMutations",
+  "sessions.delete": "sessionMutations",
+  "runs.start": "runs",
+  "runs.get": "runs",
+  "runs.list": "runs",
+  "runs.cancel": "runs",
+  "plugins.list": "plugins",
+  "plugins.enable": "plugins",
+  "plugins.disable": "plugins",
+  "settings.get": "settings",
+  "settings.update": "settings",
+  "subscriptions.open": "subscriptions",
+  "subscriptions.close": "subscriptions",
+});
+
+interface PendingRequest {
+  readonly method: OperationName;
+  /** Control requests are the ones this connection cannot work without. */
+  readonly control: boolean;
+  /** Answers the caller from the frame path; `owner` is the generation that frame arrived on. */
+  readonly complete: (envelope: ResponseEnvelope, owner: number) => void;
+  /** Ends the caller's wait without an answer. */
+  readonly fail: (error: ClientError) => void;
+  /** The bounded wait a control request is given; business requests have none. */
+  timer: { cancel(): void } | undefined;
+}
+
+interface ReversePending {
+  readonly requestId: string;
+  readonly streamId: string;
+  /** The connection attempt this request arrived on; an older one is inert. */
+  readonly epoch: number;
+  /** This profile's own result contract: what may travel back as a success. */
+  readonly resultIsValid: (result: JsonValue) => boolean;
+  readonly controller: AbortController;
+  timer: { cancel(): void } | undefined;
+  finished: boolean;
+}
+
+interface Attempt {
+  readonly epoch: number;
+  aborted: boolean;
+  readonly promise: Promise<void>;
+  readonly settle: { resolve(): void; reject(error: unknown): void };
+}
+
+interface Identity {
+  readonly hostInstanceId: string;
+  readonly description: HostDescription;
+}
+
+interface StreamState {
+  readonly streamId: string;
+  expected: number;
+}
+
+/** The control ownership one `open` transaction holds while it is in flight. */
+interface OpenToken {
+  readonly attempt: number;
+  readonly token: symbol;
+}
+
+interface SendHandlers<M extends OperationName> {
+  readonly accept: (result: OperationMap[M]["result"], envelope: ResponseEnvelope) => void;
+  readonly decline: (error: ClientError) => void;
+}
+
+export interface ClientOptions {
+  /** Establishes one logical connection; the channel it resolves with is already open. */
+  readonly connect: () => Promise<ProtocolChannel>;
+  /** How this client names itself to the host. */
+  readonly client?: { readonly name: string; readonly version: string };
+}
+
+/**
+ * What this client does when a host asks it about one tool execution.
+ *
+ * The handler is handed the Host's own approval snapshot — immutable, complete,
+ * and exactly what the execution will run with — plus the delivery's abort
+ * signal. It answers about that one execution: the approval id and execution id
+ * it was given, and one of two decisions. Nothing else is expressible, which is
+ * the point: a client never modifies arguments and never invents an approval.
+ *
+ * A handler may take as long as the delivery lives (the Host's own deadline is
+ * the bound). If the delivery ends first — the stream replaced, the connection
+ * dropped, the request cancelled — the signal aborts and any answer the handler
+ * still returns is read and dropped.
+ */
+export type ToolApprovalHandler = (
+  snapshot: ApprovalSnapshot,
+  signal: AbortSignal,
+) => ToolApprovalResponse | Promise<ToolApprovalResponse>;
+
+const DEFAULT_CLIENT = Object.freeze({ name: "@every-dagent/client", version: "0.1.0" });
+
+/** Every field a result must agree with, when the request named one. */
+function verifyResultIdentity(
+  method: OperationName,
+  params: unknown,
+  result: unknown,
+): ProtocolViolationReason | undefined {
+  const resultFields = fieldsOf(result);
+  const paramFields = fieldsOf(params);
+  const fail = "result-identity" as const;
+
+  switch (method) {
+    case "sessions.get": {
+      const session = fieldsOf(resultFields?.["session"] ?? null);
+      return session?.["sessionId"] === paramFields?.["sessionId"] ? undefined : fail;
+    }
+    case "runs.start": {
+      const run = fieldsOf(resultFields?.["run"] ?? null);
+      if (run === undefined || paramFields === undefined) return fail;
+      const sameSession = run["sessionId"] === paramFields["sessionId"];
+      const sameSubmission = run["submissionId"] === paramFields["submissionId"];
+      const sameText = run["text"] === paramFields["text"];
+      return sameSession && sameSubmission && sameText ? undefined : fail;
+    }
+    case "runs.get": {
+      const run = fieldsOf(resultFields?.["run"] ?? null);
+      if (run === undefined || paramFields === undefined) return fail;
+      if (paramFields["runId"] !== undefined) return run["runId"] === paramFields["runId"] ? undefined : fail;
+      return run["submissionId"] === paramFields["submissionId"] ? undefined : fail;
+    }
+    case "runs.cancel": {
+      const run = fieldsOf(resultFields?.["run"] ?? null);
+      return run?.["runId"] === paramFields?.["runId"] ? undefined : fail;
+    }
+    case "plugins.enable":
+    case "plugins.disable": {
+      const plugin = fieldsOf(resultFields?.["plugin"] ?? null);
+      return plugin?.["id"] === paramFields?.["pluginId"] ? undefined : fail;
+    }
+    case "sessions.history": {
+      const page = fieldsOf(resultFields?.["page"] ?? null);
+      return page?.["sessionId"] === paramFields?.["sessionId"] ? undefined : fail;
+    }
+    case "sessions.rename": {
+      const session = fieldsOf(resultFields?.["session"] ?? null);
+      return session?.["sessionId"] === paramFields?.["sessionId"] ? undefined : fail;
+    }
+    case "sessions.delete": {
+      return resultFields?.["sessionId"] === paramFields?.["sessionId"] ? undefined : fail;
+    }
+    case "runs.list": {
+      const runs = fieldsOf(resultFields?.["runs"] ?? null);
+      if (runs === undefined || paramFields === undefined) return fail;
+      const items = runs["items"];
+      if (!Array.isArray(items)) return fail;
+      for (const item of items) {
+        const run = fieldsOf(item);
+        if (run?.["sessionId"] !== paramFields["sessionId"]) return fail;
+      }
+      return undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** The own data fields of a JSON object; `undefined` for anything else. */
+function fieldsOf(value: unknown): Record<string, JsonValue> | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const fields: Record<string, JsonValue> = {};
+  for (const [key, field] of Object.entries(value)) fields[key] = field;
+  return fields;
+}
+
+function asClientError(error: unknown): ClientError {
+  return error instanceof ClientError ? error : connectionLost("disconnected");
+}
+
+export class ClientConnection {
+  private readonly options: ClientOptions;
+  private readonly reverseTable: ReverseTable;
+  private readonly store: PresentationStore = createStore();
+
+  private epoch = 0;
+  private attempt: Attempt | undefined;
+  private channel: ProtocolChannel | undefined;
+  private detach: (() => void) | undefined;
+  private identity: Identity | undefined;
+  private stream: StreamState | undefined;
+  /**
+   * How many cuts this connection has installed.
+   *
+   * A history read is issued against the cut it was asked under, and its answer
+   * is only allowed to move the replica while that cut still stands: a page
+   * computed before a re-cut describes a presentation the client has already
+   * replaced, and filing it under the new one would mix two replicas.
+   */
+  private cutCount = 0;
+  /**
+   * How many deleted session identities this connection remembers.
+   *
+   * A deletion is final, and the pages that raced it are the ones this ledger
+   * exists for: it has to outlive every request that could have been in flight
+   * when the deletion was folded, and no longer. The ordinary pending budget is
+   * far smaller than this, so the oldest entry is only ever forgotten long
+   * after any answer for it could still arrive.
+   */
+  private static readonly DELETED_SESSION_BUDGET = 256;
+  /**
+   * The runs whose timeline this connection is re-reading.
+   *
+   * A timeline read is what places a run after a cut, so a publication that
+   * raced the cut is expected while one is in flight rather than a fault; the
+   * entry is also the dedup that keeps a burst of content from stacking reads.
+   */
+  private readonly liveRefreshes = new Set<string>();
+  /**
+   * Runs whose timeline has to be re-read once the read already in flight lands.
+   *
+   * A dropped frame is repaired by a read that starts *after* it: an answer
+   * that was asked for before the drop may predate the content all by itself.
+   * The second read is therefore queued rather than stacked — at most one in
+   * flight and one waiting, for every run, no matter how fast content arrives.
+   */
+  private readonly liveRefreshAgain = new Set<string>();
+  /** Session identities this connection has seen deleted: a late page may not resurrect one. */
+  private readonly deletedSessions = new Set<string>();
+  /** The control transaction in flight, if any: `open` is single-flight. */
+  private openToken: OpenToken | undefined;
+  private sync: Promise<void> | undefined;
+  /** Whether a snapshot has ever been installed on this connection. */
+  private everOpened = false;
+  /**
+   * The host instance the settings cache came from, or `undefined` before any
+   * connection bound one. It outlives a generation on purpose: a reconnect to
+   * the same instance keeps what was read, and one to a different instance
+   * drops it — the two are different facts, and only the field can tell them
+   * apart.
+   */
+  private settingsHost: string | undefined;
+  private readonly pendings = new Map<string, PendingRequest>();
+  private requestCounter = 0;
+  private readonly reversePendings = new Map<string, ReversePending>();
+  private readonly reverseRequestIds = new Set<string>();
+  /** Every stream this connection has ended: the proof that its frames are not current. */
+  private readonly retiredStreams = new Set<string>();
+  /**
+   * The public lifecycle, and which transition may next say what it is.
+   *
+   * Publishing `lost`, `disconnected` or `connecting` is a claim on that fact,
+   * and a claim is good only while it is the newest one. Every retirement and
+   * every publication runs foreign code — a listener, a disposer, an abort
+   * listener, the transport itself — and that code may re-enter this client and
+   * take the lifecycle over. When it has, an older transition has nothing left
+   * to say: the state it wanted to publish is about a connection the client has
+   * already moved past.
+   */
+  private lifecycle = 0;
+
+  /**
+   * How many directory traversals this client has started.
+   *
+   * A directory read is issued against the traversal it was asked under — a
+   * cursor, a revision, a host instance — and its answer may only move the
+   * directory while that traversal still stands. Bumping a token retires every
+   * read that was issued under the previous one.
+   */
+  private directoryToken = 0;
+  /** The older-page read in flight, if any: a traversal walks one page at a time. */
+  private directoryLoad: Promise<DirectoryStep> | undefined;
+  /** The head re-read in flight, if any: a fresh anchor is single-flight. */
+  private directoryRefresh: Promise<DirectoryStep> | undefined;
+  /**
+   * How many focus changes this client has made.
+   *
+   * The focus version is the ownership of a read: a `sessions.get` answer, or a
+   * run read, belongs to the focus that asked for it, and an answer that
+   * arrives after the reader moved on changes nothing.
+   */
+  private focusCounter = 0;
+  /**
+   * The focus this client is currently resolving, if any.
+   *
+   * It is deliberately not the pin: a selection with nothing to seed it has no
+   * pin yet, and the read that answers it is still the one that may install
+   * one. What the request carries is the session, the version, and the host and
+   * storage context the confirmation will belong to.
+   */
+  private focusRequest:
+    | { readonly sessionId: Id; readonly version: number; readonly hostInstanceId: Id; readonly storageId: Id }
+    | undefined;
+
+  private toolApprovalHandler: ToolApprovalHandler | undefined;
+
+  constructor(options: ClientOptions, reverseHandlers: readonly ReverseHandlerRegistration[]) {
+    this.options = options;
+    // The production table is built here, not handed in: `tool.approval` is a
+    // frozen profile this client implements, and a registration that could
+    // shadow it would be a second, differently-contracted answer to the same
+    // question. A duplicate name is refused where the table is built.
+    this.reverseTable = createReverseTable([
+      {
+        method: "tool.approval",
+        accepts: (params: JsonValue): boolean => validateReverseParams("tool.approval", params).success,
+        resultIsValid: (result: JsonValue): boolean => validateReverseResult("tool.approval", result).success,
+        handle: (params: JsonValue, context: ReverseHandlerContext): Promise<ReverseHandlerOutcome> =>
+          this.handleToolApproval(params as unknown as ApprovalSnapshot, context),
+      },
+      ...reverseHandlers,
+    ]);
+  }
+
+  /**
+   * The one typed seam for answering a tool approval, or clears it.
+   *
+   * There is deliberately no way to answer a raw reverse request, to pick a
+   * method, or to send arbitrary JSON: an approval answer is a statement about
+   * one execution, and this is the only shape that statement has.
+   */
+  setToolApprovalHandler(handler: ToolApprovalHandler | undefined): void {
+    this.toolApprovalHandler = handler;
+  }
+
+  /**
+   * Runs the registered handler for one `tool.approval` request.
+   *
+   * Every ending is safe and explicit. With no handler, the host is told the
+   * capability is not supported — the delivery ends and the Host's business
+   * approval is untouched. A handler that throws answers with a fixed internal
+   * error and never with its own words. An answer that names a different
+   * approval or execution than the request carried is refused the same way: a
+   * handler does not get to decide which execution it is answering about.
+   *
+   * The delivery this handler answers belongs to one entry on one stream of one
+   * connection generation, and that ownership is bound *before* the handler is
+   * awaited and checked again before anything is written. A handler may take
+   * minutes; by the time it answers, the stream may have been replaced and a
+   * fresh delivery may already be waiting for the same approval. What such an
+   * answer must never do is speak for the newer delivery — the local reply
+   * state is written only while the entry this call started with is still the
+   * current one, on the current generation, holding the current stream.
+   */
+  private async handleToolApproval(
+    snapshot: ApprovalSnapshot,
+    context: ReverseHandlerContext,
+  ): Promise<ReverseHandlerOutcome> {
+    const handler = this.toolApprovalHandler;
+    if (handler === undefined) {
+      return {
+        error: Object.freeze({
+          code: "CAPABILITY_NOT_SUPPORTED" as const,
+          message: "this client has no tool approval handler",
+        }),
+      };
+    }
+
+    // The delivery this answer belongs to: the exact entry, generation and
+    // stream that were current when the handler was handed the snapshot.
+    const delivery = this.reversePendings.get(context.requestId);
+
+    this.setApprovalReplyFor(delivery, {
+      state: "pending",
+      requestId: context.requestId,
+      approvalId: snapshot.approvalId,
+      executionId: snapshot.executionId,
+    });
+
+    let answer: unknown;
+    try {
+      answer = await handler(snapshot, context.signal);
+    } catch {
+      this.setApprovalReplyFor(delivery, {
+        state: "failed",
+        approvalId: snapshot.approvalId,
+        executionId: snapshot.executionId,
+      });
+      return {
+        error: Object.freeze({
+          code: "INTERNAL_ERROR" as const,
+          message: "the tool approval handler failed",
+        }),
+      };
+    }
+
+    const validated = validateReverseResult("tool.approval", answer);
+    if (
+      !validated.success ||
+      validated.output.approvalId !== snapshot.approvalId ||
+      validated.output.executionId !== snapshot.executionId
+    ) {
+      this.setApprovalReplyFor(delivery, {
+        state: "failed",
+        approvalId: snapshot.approvalId,
+        executionId: snapshot.executionId,
+      });
+      return {
+        error: Object.freeze({
+          code: "INTERNAL_ERROR" as const,
+          message: "the tool approval handler answered about a different execution",
+        }),
+      };
+    }
+
+    // An answer for a delivery that already ended — the stream was replaced
+    // while the handler ran — never travels, and this client does not pretend
+    // it did. Whether a *sent* answer decides anything is the Host's to say:
+    // this client knows it sent a decision, and nothing more, until the Host's
+    // own approval state moves.
+    if (context.signal.aborted) {
+      this.setApprovalReplyFor(delivery, {
+        state: "closed",
+        approvalId: snapshot.approvalId,
+        executionId: snapshot.executionId,
+      });
+      return { result: validated.output as unknown as JsonValue };
+    }
+    this.setApprovalReplyFor(delivery, {
+      state: "sent",
+      approvalId: snapshot.approvalId,
+      executionId: snapshot.executionId,
+      decision: validated.output.decision,
+    });
+    return { result: validated.output as unknown as JsonValue };
+  }
+
+  /**
+   * One reply-state transition, published only while its delivery still stands.
+   *
+   * The local reply state is a fact about the delivery this connection holds,
+   * so a continuation from a delivery that ended — or from one a newer delivery
+   * has replaced — publishes nothing: the newer delivery's state is the state.
+   */
+  private setApprovalReplyFor(delivery: ReversePending | undefined, reply: ApprovalReplyState): void {
+    if (delivery === undefined) return;
+    if (this.reversePendings.get(delivery.requestId) !== delivery) return;
+    if (this.epoch !== delivery.epoch || delivery.finished) return;
+    if (this.stream?.streamId !== delivery.streamId) return;
+    this.setApprovalReply(reply);
+  }
+
+  /** One reply-state transition, published as its own fact. */
+  private setApprovalReply(reply: ApprovalReplyState): void {
+    this.store.update({ approvalReply: reply });
+  }
+
+  // -------------------------------------------------------------------------
+  // The public reads.
+  // -------------------------------------------------------------------------
+
+  getSnapshot(): ClientSnapshot {
+    return this.store.get();
+  }
+
+  subscribe(listener: () => void): () => void {
+    return this.store.subscribe(listener);
+  }
+
+  // -------------------------------------------------------------------------
+  // Lifecycle.
+  // -------------------------------------------------------------------------
+
+  /** Resolves once this client is `ready`; merges with a connection already in flight. */
+  connect(): Promise<void> {
+    const running = this.attempt;
+    if (running !== undefined) return running.promise;
+    if (this.store.get().status === "ready") return Promise.resolve();
+    return this.beginAttempt();
+  }
+
+  /** A fresh connection, whether or not one is live. Also merges with one in flight. */
+  reconnect(): Promise<void> {
+    const running = this.attempt;
+    if (running !== undefined) return running.promise;
+    return this.beginAttempt();
+  }
+
+  /**
+   * Ends the connection: local state first, then the transport, then nothing.
+   *
+   * The presentation is kept and marked stale, no run is cancelled, and every
+   * wait that was outstanding ends as `unknown` — the host owns the work, and
+   * this client has no way to know what it did. Nothing is published until the
+   * connection can no longer be used: a listener that hears "disconnected" must
+   * not be able to send on it.
+   */
+  disconnect(): void {
+    const claim = this.claimLifecycle();
+    if (this.channel === undefined && this.attempt === undefined) {
+      // Already disconnected: only the state needs saying, and only if it does.
+      this.store.update({ status: "disconnected", stale: this.store.get().presentation !== null, error: null });
+      return;
+    }
+    const owner = this.epoch;
+    this.retireAttempt(owner, connectionLost("disconnected"));
+    // Retiring the attempt runs foreign code, and a callback that disconnected
+    // again — or reconnected — has already said what this client is now. This
+    // call's own verdict is older than that, and does not get to replace it.
+    if (!this.ownsLifecycle(claim)) return;
+    this.store.update({ status: "disconnected", stale: this.store.get().presentation !== null, error: null });
+  }
+
+  /**
+   * Re-opens the subscription on the current connection.
+   *
+   * A gap in the stream and a caller asking for a refresh are the same operation,
+   * and only one of them may be in flight: the transaction that drops the old
+   * stream is the same one that publishes the new cut, the snapshot replaces the
+   * presentation whole, and the stream restarts at one.
+   */
+  async resync(): Promise<void> {
+    if (this.channel === undefined || this.identity === undefined) throw connectionLost("disconnected");
+    await this.openStream();
+  }
+
+  /**
+   * Closes the current subscription, locally first.
+   *
+   * The moment the caller asks, the stream is no longer applicable: its frames
+   * are dropped, its reverse handlers are aborted, and the presentation is
+   * marked stale. The host's answer — `closed` true or false, early or late —
+   * cannot bring the old stream back, and cannot touch a new one either.
+   */
+  async closeSubscription(): Promise<void> {
+    const stream = this.stream;
+    if (stream === undefined) {
+      if (this.openToken !== undefined) throw clientMisuse("sync-in-flight");
+      return;
+    }
+    if (this.openToken !== undefined) throw clientMisuse("sync-in-flight");
+
+    const owner = this.epoch;
+    const streamId = stream.streamId;
+    this.stream = undefined;
+
+    // The stream is gone before the host is even told: the presentation it
+    // explained is retained and stale, and the client is `ready` for nothing.
+    // The two facts are published together, in the same synchronous step, and
+    // before any foreign code runs — the abort listeners of the handlers this
+    // ends are free to read this client, and a status that outlives the stream
+    // it describes is exactly the lie this client exists to avoid.
+    if (!this.rememberRetired(owner, streamId)) {
+      // The ledger is full: the connection it belonged to has already ended, and
+      // this close has nothing left to say.
+      throw connectionLost("disconnected");
+    }
+    this.store.update({ status: "connected", stale: this.store.get().presentation !== null });
+    this.abortReverseForStream(streamId);
+
+    await new Promise<void>((resolve, reject) => {
+      this.send<"subscriptions.close">("subscriptions.close", { streamId }, {
+        accept: () => {
+          resolve();
+        },
+        decline: (error) => {
+          reject(error);
+        },
+      });
+    });
+  }
+
+  private beginAttempt(): Promise<void> {
+    const claim = this.claimLifecycle();
+    if (this.channel !== undefined || this.attempt !== undefined) {
+      // The old connection ends here: whatever it was waiting for will never be
+      // answered, and the outcome is unknowable from this side.
+      this.retireAttempt(this.epoch, connectionLost("disconnected"));
+      // The retirement above runs foreign code, and any of it may have re-entered
+      // this client: a callback that disconnected, or that began an attempt of its
+      // own, has already decided what this client is doing. What it decided is not
+      // this call's to build a second attempt on top of.
+      if (!this.ownsLifecycle(claim)) {
+        const running = this.attempt;
+        if (running !== undefined) return running.promise;
+        return Promise.reject(connectionLost("disconnected"));
+      }
+    }
+
+    const epoch = (this.epoch += 1);
+    let settle!: { resolve(): void; reject(error: unknown): void };
+    const promise = new Promise<void>((resolve, reject) => {
+      settle = { resolve, reject };
+    });
+    const attempt: Attempt = { epoch, aborted: false, promise, settle };
+    this.attempt = attempt;
+
+    const current = this.store.get();
+    this.store.update({
+      status: "connecting",
+      error: null,
+      stale: current.presentation !== null,
+      presentationHost: current.presentation === null ? "none" : "unconfirmed",
+      // What the cache holds was read on the connection that just ended: it may
+      // still be true, and it is not claimed to be. A read clears the mark.
+      settings: markSettingsStale(current.settings),
+    });
+
+    const retire = (): void => {
+      if (this.attempt === attempt) this.attempt = undefined;
+    };
+    void this.runAttempt(attempt).then(
+      (value) => {
+        retire();
+        settle.resolve();
+        return value;
+      },
+      (error: unknown) => {
+        retire();
+        settle.reject(error);
+      },
+    );
+    return promise;
+  }
+
+  /**
+   * Whether a generation may still act on this client.
+   *
+   * Every continuation — a connector promise, a frame, a timer, a rejected wait,
+   * a cleanup after a notification — carries the epoch it belongs to, and this is
+   * the one check that lets it write state, publish a status or end a connection.
+   * A generation that is no longer current owns nothing: not the channel, not the
+   * stream, not the right to say what happened on this client.
+   */
+  private owns(owner: number): boolean {
+    return this.epoch === owner;
+  }
+
+  /** Whether an attempt still owns this client: the only thing that may act on it. */
+  private isActive(attempt: Attempt): boolean {
+    return !attempt.aborted && this.attempt === attempt && this.owns(attempt.epoch);
+  }
+
+  /** Whether a stream a continuation began on is still the one this connection holds. */
+  private holdsStream(owner: number, stream: StreamState): boolean {
+    return this.owns(owner) && this.stream === stream;
+  }
+
+  /** Takes the lifecycle: from here on, only a newer claim may publish a status. */
+  private claimLifecycle(): number {
+    this.lifecycle += 1;
+    return this.lifecycle;
+  }
+
+  /** Whether a claim is still the newest one — the only one whose transition may still publish. */
+  private ownsLifecycle(claim: number): boolean {
+    return this.lifecycle === claim;
+  }
+
+  private async runAttempt(attempt: Attempt): Promise<void> {
+    // The publication that announced this attempt ran listeners, and one of them
+    // may have ended it before the connector was asked for anything.
+    if (!this.isActive(attempt)) throw connectionLost("disconnected");
+
+    let channel: ProtocolChannel;
+    try {
+      channel = await this.options.connect();
+    } catch (error) {
+      if (this.isActive(attempt)) {
+        this.failAttempt(attempt.epoch, connectionLost("connector-failed"), "lost");
+      }
+      throw error instanceof ClientError ? error : connectionLost("connector-failed");
+    }
+
+    if (!this.isActive(attempt)) {
+      // A newer attempt owns the client now; this channel is nobody's.
+      quietly(() => {
+        channel.close();
+      });
+      throw connectionLost("disconnected");
+    }
+
+    this.channel = channel;
+    const epoch = attempt.epoch;
+    let detach: (() => void) | undefined;
+    try {
+      detach = channel.listen({
+        onFrame: (frame: string): void => {
+          if (this.owns(epoch)) this.acceptFrame(frame, epoch);
+        },
+        onClose: (): void => {
+          if (this.owns(epoch)) this.endWithLoss(epoch, "channel-closed");
+        },
+      });
+    } catch {
+      // The channel was delivered, and from here it is this attempt's — one it
+      // cannot listen on is one it cannot be synchronized on. The attempt ends
+      // through the same path every other failure takes: its ownership is
+      // invalidated, the channel is closed exactly once, every wait is settled,
+      // and the outcome is published instead of a connection left merely
+      // `connecting` over a channel nobody may use.
+      const failure = connectionLost("connector-failed");
+      this.failAttempt(epoch, failure, "lost");
+      throw failure;
+    }
+
+    if (!this.isActive(attempt)) {
+      // Installing the listener is itself a chance to hear that this generation
+      // is already over — a channel that closes before `listen` returns, say.
+      // The disposer is this generation's to run, and nothing else ever will.
+      quietly(detach);
+      throw connectionLost("disconnected");
+    }
+
+    this.detach = detach;
+    this.store.update({ status: "connected" });
+
+    try {
+      await this.bootstrap(attempt);
+    } catch (error) {
+      const failure = asClientError(error);
+      if (!this.isActive(attempt)) throw failure;
+      const status = this.store.get().status;
+      if (status !== "protocol-error" && status !== "lost") {
+        // The channel is still usable; the client simply is not synchronized on
+        // it. A caller that wants another try reconnects.
+        this.store.update({
+          status: this.channel === undefined ? "lost" : "connected",
+          stale: this.store.get().presentation !== null,
+          error: failure,
+        });
+      }
+      throw failure;
+    }
+  }
+
+  /**
+   * `describe`, then `open`, then `ready`.
+   *
+   * Every step re-checks that this attempt still owns the client: a disconnect,
+   * a failure or a reconnect during `await` — or inside the notification that
+   * announced the channel — must not be resumed into a send or a status.
+   */
+  private async bootstrap(attempt: Attempt): Promise<void> {
+    if (!this.isActive(attempt)) throw connectionLost("disconnected");
+
+    // `describe` is already part of synchronizing: the channel is up, but
+    // nothing about this client's replica is valid yet.
+    this.store.update({ status: "syncing", error: null });
+    await this.sendDescribe(attempt.epoch);
+    if (!this.isActive(attempt)) throw connectionLost("disconnected");
+    await this.openStream();
+    if (!this.isActive(attempt)) throw connectionLost("disconnected");
+  }
+
+  private sendDescribe(owner: number): Promise<HostDescription> {
+    const client = this.options.client ?? DEFAULT_CLIENT;
+    const capabilities: ClientCapabilities = Object.freeze({ reverseRequests: true });
+
+    return new Promise<HostDescription>((resolve, reject) => {
+      this.send<"host.describe">(
+        "host.describe",
+        {
+          supportedProtocolVersions: [PROTOCOL_VERSION],
+          client: { name: client.name, version: client.version },
+          capabilities,
+        },
+        {
+          accept: (description, envelope) => {
+            // The schema cannot say that the identity in the body is the identity
+            // of *this* connection, nor that the host echoed what was declared.
+            if (description.hostInstanceId !== envelope.hostInstanceId) {
+              this.protocolFailure(owner, "invalid-description");
+              reject(protocolViolation("invalid-description", "unknown"));
+              return;
+            }
+            if (description.clientCapabilities.reverseRequests !== capabilities.reverseRequests) {
+              this.protocolFailure(owner, "invalid-description");
+              reject(protocolViolation("invalid-description", "unknown"));
+              return;
+            }
+            if (!description.capabilities.subscriptions) {
+              // An honest answer to an honest description: this client cannot
+              // become ready without a subscription, and says so instead.
+              reject(clientMisuse("capability-unavailable"));
+              return;
+            }
+
+            const presentation = this.store.get().presentation;
+            const focused = this.store.get().focusedSession;
+            const directory = this.store.get().directory;
+            // Frozen before it is used at all: the object the client judges
+            // capabilities by is the same object a caller may read, and neither
+            // may change under the other.
+            const frozen = deepFreeze(description);
+            this.identity = { hostInstanceId: frozen.hostInstanceId, description: frozen };
+
+            // A settings cache records one host instance's *effective* state.
+            // Binding to a different instance drops it: another process's
+            // revision and value are not this host's facts, and a cache that
+            // outlived its host would be a claim about something that no longer
+            // exists. A reconnect to the same instance keeps it, marked stale
+            // until a read confirms it.
+            const settingsHost = this.settingsHost;
+            this.settingsHost = frozen.hostInstanceId;
+            this.store.update({
+              description: frozen,
+              presentationHost:
+                presentation === null
+                  ? "none"
+                  : presentation.hostInstanceId === frozen.hostInstanceId
+                    ? "current"
+                    : "previous",
+              ...(settingsHost !== undefined && settingsHost !== frozen.hostInstanceId
+                ? { settings: forgetSettings() }
+                : {}),
+              // The focused pin and the loaded directory pages belong to one
+              // host instance. A different instance — even one over the same
+              // storage — is a different process, and neither its selection
+              // authority nor its paged summaries are this host's facts: both
+              // are dropped rather than re-aimed at it.
+              ...(focused !== null && focused.hostInstanceId !== frozen.hostInstanceId
+                ? { focusedSession: null }
+                : {}),
+              ...(directory.hostInstanceId !== null && directory.hostInstanceId !== frozen.hostInstanceId
+                ? { directory: EMPTY_DIRECTORY }
+                : {}),
+            });
+            resolve(frozen);
+          },
+          decline: (error) => {
+            reject(error);
+          },
+        },
+      );
+    });
+  }
+
+  /**
+   * One open at a time, and one transaction per open.
+   *
+   * The token is taken *before* anything observable — before the old stream is
+   * dropped, before the status is published, before the request is sent — so the
+   * cut, the transition that describes it and the ownership of the transaction
+   * are established in one synchronous step. A listener that reacts to `syncing`,
+   * or one that re-cuts because the presentation it was reading just went stale,
+   * finds this transaction in flight and joins it instead of starting a second.
+   */
+  private openStream(): Promise<void> {
+    const running = this.sync;
+    if (running !== undefined) return running;
+
+    const owner = this.epoch;
+    const token: OpenToken = { attempt: owner, token: Symbol("open") };
+    this.openToken = token;
+
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    this.sync = promise;
+
+    const finish = (error?: ClientError): void => {
+      if (this.openToken === token) this.openToken = undefined;
+      if (this.sync === promise) this.sync = undefined;
+      if (error === undefined) {
+        resolve();
+        return;
+      }
+      reject(error);
+      // A resync that failed leaves the client online but unsynchronized, and it
+      // says so rather than staying "syncing" forever. Only the generation that
+      // cut the stream may say it: a failure arriving after a disconnect or a
+      // reconnect describes a connection that is already gone.
+      if (this.owns(owner) && this.attempt === undefined && this.store.get().status === "syncing") {
+        this.store.update({
+          status: this.channel === undefined ? "lost" : "connected",
+          stale: this.store.get().presentation !== null,
+          error,
+        });
+      }
+    };
+
+    // The stream this open replaces ends here, in the same synchronous step as
+    // the transition that publishes it: losing the stream and marking what it
+    // explained stale are one fact, and a reader never sees "ready" with nothing
+    // left to be ready about. The handlers that stream carried are aborted only
+    // *after* that publication, because their abort listeners are foreign code
+    // and are free to read this client — and what they must find is a client that
+    // has already stopped claiming to be ready on a stream it no longer holds.
+    const previous = this.stream;
+    if (previous !== undefined) {
+      this.stream = undefined;
+      if (!this.rememberRetired(owner, previous.streamId)) {
+        // The ledger is full: this connection can no longer prove which streams
+        // it has ended, and `rememberRetired` has already ended it. There is
+        // nothing left to open, and nothing this transaction may publish.
+        finish(connectionLost("disconnected"));
+        return promise;
+      }
+    }
+
+    this.store.update({ status: "syncing", stale: this.store.get().presentation !== null, error: null });
+    if (previous !== undefined) this.abortReverseForStream(previous.streamId);
+
+    this.send<"subscriptions.open">(
+      "subscriptions.open",
+      {},
+      {
+        accept: (result, envelope) => {
+          const snapshot = result.snapshot;
+          const identity = this.identity;
+          if (
+            identity === undefined ||
+            snapshot.hostInstanceId !== identity.hostInstanceId ||
+            snapshot.hostInstanceId !== envelope.hostInstanceId
+          ) {
+            // The connection ends before its caller is told: an open that
+            // answered wrongly is a protocol failure, not a subscription this
+            // client can stay online without.
+            this.protocolFailure(owner, "invalid-response");
+            finish(protocolViolation("invalid-response", "unknown"));
+            return;
+          }
+          if (this.retiredStreams.has(snapshot.watermark.streamId)) {
+            // Streams are never reused; one that comes back is a stream whose
+            // frames this client has already applied and discarded.
+            this.protocolFailure(owner, "snapshot-fence");
+            finish(protocolViolation("snapshot-fence", "unknown"));
+            return;
+          }
+
+          // Installed here, in the frame path: the frames that follow this
+          // response are already on the new stream, and this snapshot is what
+          // makes them applicable. The transaction is finished *before* the
+          // store publishes `ready`, so a listener that refreshes immediately
+          // starts a new cut instead of finding this one still open.
+          this.stream = {
+            streamId: snapshot.watermark.streamId,
+            expected: snapshot.watermark.sequence + 1,
+          };
+          this.everOpened = true;
+          // The cut this client now lives under: every history read issued from
+          // here on belongs to it, and the reads issued under the previous one
+          // are answered to their callers but no longer move the replica.
+          this.cutCount += 1;
+          // The directory traversal above this cut is over: pages read under
+          // the previous anchor belong to another window and another revision,
+          // and the loaded range starts again from the window this snapshot
+          // installs.
+          this.directoryToken += 1;
+          this.directoryLoad = undefined;
+          this.directoryRefresh = undefined;
+          finish();
+          // A cut replaces what the client knows. Live drafts and loaded
+          // history belonged to the previous cut — or to a previous host — and
+          // presenting either under a new one would claim facts nobody sent.
+          this.store.update({
+            presentation: deepFreeze(snapshot),
+            presentationHost: "current",
+            directory: anchoredDirectory(snapshot.sessions, {
+              hostInstanceId: snapshot.hostInstanceId,
+              storageId: snapshot.storage.storageId,
+            }),
+            // The pin's facts were read on the connection that just ended, and
+            // this client does not claim to stand behind them until a read on
+            // this one confirms them again. The summary stays for display.
+            focusedSession: this.staleFocus(),
+            live: Object.freeze({}),
+            history: Object.freeze({}),
+            // A cut is a new delivery world: whatever this client had in flight
+            // belonged to the previous stream, and the new one will ask again if
+            // there is still something to answer.
+            approvalReply: NO_APPROVAL_REPLY,
+            stale: false,
+            status: "ready",
+            error: null,
+          });
+          this.refreshLive(owner);
+        },
+        decline: (error) => {
+          finish(error);
+        },
+      },
+    );
+
+    return promise;
+  }
+
+  // -------------------------------------------------------------------------
+  // Operations.
+  // -------------------------------------------------------------------------
+
+  /** One typed request; `accept` runs in the frame path, `decline` wherever the wait ended. */
+  private send<M extends OperationName>(
+    method: M,
+    params: OperationMap[M]["params"],
+    handlers: SendHandlers<M>,
+  ): void {
+    const owner = this.epoch;
+    const channel = this.channel;
+    if (channel === undefined) {
+      handlers.decline(connectionLost("disconnected"));
+      return;
+    }
+
+    const identity = this.identity;
+    const hostInstanceId = identity === undefined ? undefined : identity.hostInstanceId;
+    if (method !== "host.describe") {
+      if (hostInstanceId === undefined) {
+        handlers.decline(clientMisuse("not-initialized"));
+        return;
+      }
+      const capability = CAPABILITY_OF[method];
+      if (capability !== undefined && identity?.description.capabilities[capability] !== true) {
+        handlers.decline(clientMisuse("capability-unavailable"));
+        return;
+      }
+    }
+
+    // Control traffic pays for its own capacity: a connection whose business
+    // slots are full must still be able to re-cut its subscription.
+    const control = CONTROL_METHODS.has(method);
+    const inFlight = [...this.pendings.values()];
+    const used = control
+      ? inFlight.filter((pending) => pending.control).length
+      : inFlight.filter((pending) => !pending.control).length;
+    if (used >= (control ? MAX_CONTROL_PENDING : MAX_ORDINARY_PENDING)) {
+      handlers.decline(clientMisuse("capacity"));
+      return;
+    }
+
+    this.requestCounter += 1;
+    const requestId = `client-request-${this.requestCounter}`;
+    const candidate: Record<string, unknown> = {
+      kind: "client-request",
+      protocolVersion: PROTOCOL_VERSION,
+      requestId,
+      method,
+      params,
+    };
+    if (method !== "host.describe" && hostInstanceId !== undefined) {
+      candidate["hostInstanceId"] = hostInstanceId;
+    }
+
+    // Built through the real validator and encoder: a request the contract
+    // cannot express is refused here, before anything reaches the transport.
+    const validated = validateMessage({ kind: "client-request" }, candidate);
+    if (!validated.success) {
+      handlers.decline(clientMisuse("invalid-params"));
+      return;
+    }
+    const encoded = encodeFrame({ kind: "client-request" }, validated.output);
+    if (!encoded.success) {
+      handlers.decline(clientMisuse("invalid-params"));
+      return;
+    }
+
+    // The identity a response will be checked against is the snapshot that was
+    // sent — never the caller's object, which they may edit the moment this
+    // returns (and which the wire never saw).
+    const sentParams = validated.output.params;
+    const complete = (envelope: ResponseEnvelope, frameOwner: number): void => {
+      const response = validateMessage({ kind: "host-response", method }, envelope);
+      if (!response.success) {
+        // The connection ends first — every other wait on it is settled with the
+        // violation, and nothing is published about a connection that is already
+        // over — and only then is this caller told.
+        this.protocolFailure(frameOwner, "invalid-response");
+        handlers.decline(protocolViolation("invalid-response", "unknown"));
+        return;
+      }
+      if (response.output.error !== undefined) {
+        handlers.decline(remoteError(response.output.error));
+        return;
+      }
+      const mismatch = verifyResultIdentity(method, sentParams, response.output.result);
+      if (mismatch !== undefined) {
+        this.protocolFailure(frameOwner, mismatch);
+        handlers.decline(protocolViolation(mismatch, "unknown"));
+        return;
+      }
+      // One boundary, before anything internal or external touches it: the
+      // accepted result is an immutable snapshot. A caller that mutates what it
+      // was handed — and a caller is foreign code — changes its own copy of a
+      // response, never the replica this client keeps presenting, and never a
+      // page a later read has to be compared against.
+      handlers.accept(deepFreeze(response.output.result), envelope);
+    };
+    const fail = (error: ClientError): void => {
+      handlers.decline(error);
+    };
+
+    const pending: PendingRequest = { method, control, complete, fail, timer: undefined };
+    this.pendings.set(requestId, pending);
+
+    if (control) {
+      // A control request is what makes this connection usable; one that is
+      // never answered ends the attempt rather than hanging forever. Business
+      // requests keep no default execution timeout: a plugin lifecycle may
+      // legitimately take a long time.
+      pending.timer = scheduleDeadline(Date.now() + CONTROL_DEADLINE_MS, () => {
+        if (this.pendings.get(requestId) !== pending) return;
+        this.endWithLoss(owner, "control-timeout");
+      });
+    }
+
+    try {
+      channel.send(encoded.output);
+    } catch {
+      // The transport refused the frame. Whether the host sees it is no longer
+      // knowable from here, so the connection ends and the outcome is `unknown`.
+      const rejected = this.takePending(requestId);
+      rejected?.fail(connectionLost("send-failed"));
+      this.endWithLoss(owner, "send-failed");
+    }
+  }
+
+  /**
+   * Re-reads the live timeline of whatever this snapshot says is running.
+   *
+   * A cut carries summaries, not drafts: the timeline belongs to the run, and a
+   * snapshot can only say that one exists. It is fetched here, best effort and
+   * at most one in flight per run, so a reconnected reader sees the same
+   * in-progress output it saw before, without the cut having to carry something
+   * that is not durable fact.
+   */
+  private refreshLive(owner: number): void {
+    const snapshot = this.store.get().presentation;
+    if (snapshot === null) return;
+
+    for (const session of snapshot.sessions.items) {
+      const runId = session.activeRunId;
+      if (runId === null) continue;
+      this.scheduleLiveRefresh(owner, runId);
+    }
+  }
+
+  /**
+   * Ends one unplaceable live frame without ending the connection.
+   *
+   * The frame's content is not applied — a fragment must never be presented as
+   * a timeline — but the replica says so: the draft is marked incomplete until
+   * a read replaces it with the host's own answer, which carries the host's own
+   * truncation flag. The read is scheduled only while the directory still names
+   * the run as executing, because only then is there something to repair.
+   */
+  private dropUnplaceableLive(owner: number, current: ClientSnapshot, sessionId: string, runId: string): void {
+    const draft = current.live[runId];
+    if (draft !== undefined && !draft.liveTruncated) {
+      this.store.update({
+        live: Object.freeze({
+          ...current.live,
+          [runId]: Object.freeze({ ...draft, liveTruncated: true }),
+        }),
+      });
+    }
+    if (activeRunStillHeld(this.store.get().presentation, sessionId, runId)) {
+      this.scheduleLiveRefresh(owner, runId);
+    }
+  }
+
+  /**
+   * Places one run's timeline from a fresh read, at most one read at a time.
+   *
+   * This is how a run becomes current after a cut — and how a publication that
+   * raced the cut is repaired: the frame that cannot be placed is dropped, and
+   * this read is what puts the run back where its content can follow. The
+   * answer is installed only while it still describes the directory the client
+   * holds: a run the directory has since called terminal stays terminal, and an
+   * answer that arrives after an event already placed the run loses to it.
+   */
+  private scheduleLiveRefresh(owner: number, runId: string): void {
+    if (this.liveRefreshes.has(runId)) {
+      // A read of this run is already in flight; it may have been asked for
+      // before the content that has to be repaired, so one more read is queued
+      // behind it instead of being lost with it.
+      this.liveRefreshAgain.add(runId);
+      return;
+    }
+
+    this.liveRefreshes.add(runId);
+    void this.request("runs.get", { runId })
+      .then(
+        (result) => {
+          if (!this.owns(owner)) return;
+          const run = result.run;
+          if (run.status !== "accepted" && run.status !== "running") return;
+          const current = this.store.get();
+          // A draft this client already holds may only be *extended* by the
+          // answer: a read asked for before a frame that was dropped is older
+          // knowledge, and the timeline monotonicity is the one rule that says
+          // which of the two is newer.
+          const existing = current.live[runId];
+          if (existing !== undefined && !liveRefreshExtends(existing.live, run.live)) return;
+          // A directory that has moved on — the run finished, or the session
+          // stopped pointing at it — is the newer fact, and a timeline read
+          // may not resurrect it.
+          if (!activeRunStillHeld(current.presentation, run.sessionId, runId)) return;
+          this.store.update({ live: Object.freeze({ ...current.live, [runId]: run }) });
+        },
+        () => undefined,
+      )
+      .finally(() => {
+        this.liveRefreshes.delete(runId);
+        if (this.liveRefreshAgain.delete(runId) && this.owns(owner)) {
+          this.scheduleLiveRefresh(owner, runId);
+        }
+      });
+  }
+
+  /**
+   * Reads one history page and records it as loaded.
+   *
+   * The fold happens where the answer is accepted, not where the caller is, so
+   * a page that arrives is part of the client's coverage even when the caller
+   * that asked for it has gone away. Two guards decide whether it may be: the
+   * cut the request was issued under must still be the current one — a page
+   * computed against a presentation the client has replaced is answered to its
+   * caller and changes nothing here — and the page itself is held to the
+   * directory, so a deleted session stays deleted and coverage only ever grows.
+   */
+  requestHistory(
+    params: OperationMap["sessions.history"]["params"],
+  ): Promise<OperationMap["sessions.history"]["result"]> {
+    return new Promise<OperationMap["sessions.history"]["result"]>((resolve, reject) => {
+      const cut = this.cutCount;
+      this.send("sessions.history", params, {
+        accept: (result) => {
+          // A deletion this connection has seen is final: a page that raced it
+          // is answered to its caller and never filed, so a retired session's
+          // cache cannot come back.
+          if (cut === this.cutCount && !this.deletedSessions.has(result.page.sessionId)) {
+            const presentation = this.store.get().presentation;
+            const session = presentation?.sessions.items.find(
+              (candidate) => candidate.sessionId === result.page.sessionId,
+            );
+            this.store.update({
+              history: applyHistoryPage(this.store.get().history, result.page, { session }),
+            });
+          }
+          resolve(result);
+        },
+        decline: (error) => {
+          reject(error);
+        },
+      });
+    });
+  }
+
+  /**
+   * One session deletion, with the local facts a deletion settles at once.
+   *
+   * The host's confirmation is what makes the identity final here: the ledger
+   * that keeps a page from resurrecting it is fed now rather than when the
+   * event arrives, and the pin it described is over — a session the host has
+   * deleted is not something this client keeps standing behind.
+   */
+  async deleteSession(
+    params: OperationMap["sessions.delete"]["params"],
+  ): Promise<OperationMap["sessions.delete"]["result"]> {
+    const result = await this.request("sessions.delete", params);
+    this.rememberDeleted(params.sessionId);
+    this.retireFocusFor(params.sessionId);
+    this.setFocus((current) => (current !== null && current.sessionId === params.sessionId ? null : current));
+    return result;
+  }
+
+  /** Records one deleted identity in the bounded ledger a late page is held to. */
+  private rememberDeleted(sessionId: Id): void {
+    this.deletedSessions.add(sessionId);
+    while (this.deletedSessions.size > ClientConnection.DELETED_SESSION_BUDGET) {
+      const oldest = this.deletedSessions.values().next().value;
+      if (oldest === undefined) break;
+      this.deletedSessions.delete(oldest);
+    }
+  }
+
+  /**
+   * One read of a settings namespace, filed before the caller is resolved.
+   *
+   * The answer is the host's own snapshot, and it is what the replica keeps —
+   * unless a newer revision is already held, in which case the caller still
+   * receives it and the replica does not step backwards.
+   */
+  requestSettings(
+    params: OperationMap["settings.get"]["params"],
+  ): Promise<OperationMap["settings.get"]["result"]> {
+    return new Promise<OperationMap["settings.get"]["result"]>((resolve, reject) => {
+      const owner = this.epoch;
+      const hostInstanceId = this.identity?.hostInstanceId;
+      this.send("settings.get", params, {
+        accept: (result) => {
+          // A settings cache describes one host instance. The answer is filed
+          // only while this is still the generation, and the host instance,
+          // that asked: one that arrives for a connection the client has moved
+          // past is answered to its caller and changes nothing here.
+          if (this.owns(owner) && (hostInstanceId === undefined || this.identity?.hostInstanceId === hostInstanceId)) {
+            this.store.update({ settings: applySettingsSnapshot(this.store.get().settings, result.settings) });
+          }
+          resolve(result);
+        },
+        decline: (error) => {
+          reject(error);
+        },
+      });
+    });
+  }
+
+  /**
+   * One compare-and-set settings write, filed the same way.
+   *
+   * Nothing here replays it. A write whose answer never arrives leaves the
+   * caller with an `unknown` outcome and the replica untouched; the way to find
+   * out what happened is another read, which is exactly what the contract
+   * prescribes for a lost write answer.
+   */
+  requestSettingsUpdate(
+    params: OperationMap["settings.update"]["params"],
+  ): Promise<OperationMap["settings.update"]["result"]> {
+    return new Promise<OperationMap["settings.update"]["result"]>((resolve, reject) => {
+      const owner = this.epoch;
+      const hostInstanceId = this.identity?.hostInstanceId;
+      this.send("settings.update", params, {
+        accept: (result) => {
+          if (this.owns(owner) && (hostInstanceId === undefined || this.identity?.hostInstanceId === hostInstanceId)) {
+            this.store.update({ settings: applySettingsSnapshot(this.store.get().settings, result.settings) });
+          }
+          resolve(result);
+        },
+        decline: (error) => {
+          reject(error);
+        },
+      });
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // The bounded directory and the focused session.
+  // -------------------------------------------------------------------------
+
+  /** Applies one update to the directory replica, publishing only if it changed it. */
+  private setDirectory(update: (directory: DirectoryState) => DirectoryState): void {
+    const current = this.store.get().directory;
+    const next = update(current);
+    if (next === current) return;
+    this.store.update({ directory: next });
+  }
+
+  /** Applies one update to the focused pin, publishing only if it changed it. */
+  private setFocus(update: (current: FocusedSession | null) => FocusedSession | null): void {
+    const current = this.store.get().focusedSession;
+    const next = update(current);
+    if (next === current) return;
+    this.store.update({ focusedSession: next });
+  }
+
+  /** The pin as it stands after a cut: the display facts kept, the write authority gone. */
+  private staleFocus(): FocusedSession | null {
+    const focused = this.store.get().focusedSession;
+    if (focused === null || !focused.confirmed) return focused;
+    return Object.freeze({ ...focused, confirmed: false });
+  }
+
+  /**
+   * Reads the next older page of the session directory.
+   *
+   * One traversal walks one page at a time: a second call while a read is in
+   * flight joins the first rather than stacking a second cursor on the same
+   * revision. The answer is filed only while the traversal it was issued under
+   * still stands — the same generation, the same window, the same revision —
+   * and a `STALE_CURSOR` refusal retires the traversal instead of retrying it:
+   * a new revision can only be continued from a cursor cut from it.
+   */
+  async loadOlderDirectory(): Promise<DirectoryStep> {
+    const running = this.directoryLoad;
+    if (running !== undefined) return await running;
+    const step = this.readOlderDirectoryPage();
+    this.directoryLoad = step;
+    try {
+      return await step;
+    } finally {
+      if (this.directoryLoad === step) this.directoryLoad = undefined;
+    }
+  }
+
+  private syncRequired(): { readonly owner: number; readonly token: number; readonly hostInstanceId: Id; readonly storageId: Id } {
+    const state = this.store.get();
+    const identity = this.identity;
+    if (identity === undefined || this.channel === undefined) throw connectionLost("disconnected");
+    if (state.status !== "ready" || state.presentationHost !== "current" || state.stale) {
+      throw clientMisuse("not-initialized");
+    }
+    return {
+      owner: this.epoch,
+      token: this.directoryToken,
+      hostInstanceId: identity.hostInstanceId,
+      storageId: identity.description.storage.storageId,
+    };
+  }
+
+  /**
+   * Whether a directory response may still be installed.
+   *
+   * A response is a fact about a moment, and the moment has to still be the one
+   * this client is living in when the answer is filed: the same connection
+   * generation and host, the same storage, the same traversal — not retired
+   * while the read was in flight — and a catalogue that has not moved past the
+   * revision the answer was cut from. A page computed before a deletion or an
+   * invalidation describes a directory this client has already replaced, and
+   * filing it would resurrect what the client knows is gone.
+   */
+  private directoryResponseCurrent(capture: {
+    readonly owner: number;
+    readonly token: number;
+    readonly storageId: Id;
+    /**
+     * Whether the traversal must still be live.
+     *
+     * A continuation read is issued from a live traversal, so one that was
+     * retired while the answer was in flight describes a window this client has
+     * already left. A *head* read is issued precisely to replace a retired
+     * traversal, so for it the traversal's own state is not the test — the
+     * revision is, which no retirement can hide.
+     */
+    readonly requireLiveTraversal: boolean;
+  }): boolean {
+    if (!this.owns(capture.owner)) return false;
+    if (this.directoryToken !== capture.token) return false;
+    const identity = this.identity;
+    if (identity === undefined || identity.description.storage.storageId !== capture.storageId) return false;
+    const state = this.store.get();
+    if (capture.requireLiveTraversal && state.directory.stale) return false;
+    return true;
+  }
+
+  /**
+   * The catalogue revision this client currently knows, as the pages carry it.
+   *
+   * The top-level revisions are the authority: an invalidation moves them
+   * without moving any page, so a page's own `collectionRevision` is a fact
+   * about the page while this is the fact about the client.
+   */
+  private knownSessionsRevision(): number {
+    return this.store.get().presentation?.collections.sessions ?? 0;
+  }
+
+  private async readOlderDirectoryPage(): Promise<DirectoryStep> {
+    const { owner, token, storageId } = this.syncRequired();
+    const state = this.store.get();
+    const directory = state.directory;
+    if (directory.stale) return Object.freeze({ loaded: false, stale: true });
+    const continuation = directoryContinuation(directory);
+    if (continuation.cursor === null || !continuation.hasMore) {
+      return Object.freeze({ loaded: false, stale: false });
+    }
+
+    const revision = directory.revision;
+    let page;
+    try {
+      page = (
+        await this.request("sessions.list", {
+          cursor: continuation.cursor,
+          limit: DIRECTORY_CACHE_LIMITS.listLimit,
+        })
+      ).sessions;
+    } catch (error) {
+      if (this.owns(owner) && this.directoryToken === token && error instanceof ClientError && error.code === "STALE_CURSOR") {
+        this.setDirectory((current) => invalidateDirectory(current));
+        return Object.freeze({ loaded: false, stale: true });
+      }
+      throw error;
+    }
+
+    if (!this.directoryResponseCurrent({ owner, token, storageId, requireLiveTraversal: true })) {
+      // The traversal this answer belonged to is over: it is discarded, never
+      // re-anchored, and never filed next to the facts that replaced it.
+      return Object.freeze({ loaded: false, stale: this.store.get().directory.stale });
+    }
+    if (page.collectionRevision < this.knownSessionsRevision()) {
+      // The catalogue moved past this answer while it was in flight: filing it
+      // would present a range from a revision this client has already left.
+      return Object.freeze({ loaded: false, stale: this.store.get().directory.stale });
+    }
+    if (revision !== null && page.collectionRevision !== revision) {
+      // A page cut from another version of the catalogue than the traversal's:
+      // filing it would present a range made of two revisions.
+      this.setDirectory((current) => invalidateDirectory(current));
+      return Object.freeze({ loaded: false, stale: true });
+    }
+
+    const current = this.store.get();
+    const published = current.presentation?.sessions ?? null;
+    const publishedBottomId = published === null ? null : published.items[published.items.length - 1]?.sessionId ?? null;
+    this.setDirectory((value) =>
+      applyDirectoryPage(value, directoryPageOf(page, continuation.cursor), {
+        deleted: this.deletedSessions,
+        publishedBottomId,
+        publishedIsAnchor: value.head === null,
+      }),
+    );
+    return Object.freeze({ loaded: true, stale: false });
+  }
+
+  /**
+   * Re-reads the head of the directory and anchors a fresh traversal on it.
+   *
+   * A moved collection revision takes the continuation with it, so the only way
+   * on is a new anchor: this reads the newest page from the host and starts the
+   * loaded range over from it. One at a time, and a read that a later cut or a
+   * second refresh overtook is dropped.
+   */
+  async refreshDirectoryHead(): Promise<DirectoryStep> {
+    const running = this.directoryRefresh;
+    if (running !== undefined) return await running;
+    const step = this.readDirectoryHead();
+    this.directoryRefresh = step;
+    try {
+      return await step;
+    } finally {
+      if (this.directoryRefresh === step) this.directoryRefresh = undefined;
+    }
+  }
+
+  private async readDirectoryHead(): Promise<DirectoryStep> {
+    const { owner, hostInstanceId, storageId } = this.syncRequired();
+    // The fresh anchor replaces whatever traversal was in flight: bumping the
+    // token here retires it before a single frame is sent.
+    const token = (this.directoryToken += 1);
+    const page = (
+      await this.request("sessions.list", { limit: DIRECTORY_CACHE_LIMITS.listLimit })
+    ).sessions;
+    if (!this.directoryResponseCurrent({ owner, token, storageId, requireLiveTraversal: false })) {
+      // The read is no longer the current one — a later cut or a second refresh
+      // overtook it — so it is discarded rather than installed.
+      return Object.freeze({ loaded: false, stale: this.store.get().directory.stale });
+    }
+    if (page.collectionRevision < this.knownSessionsRevision()) {
+      // A head read may be *newer* than what this client knows — that is what
+      // re-anchoring is for — but a page cut from an older revision than the
+      // one this client holds is behind it, and installing it would claim a
+      // freshness the client knows it does not have.
+      return Object.freeze({ loaded: false, stale: this.store.get().directory.stale });
+    }
+    // A deletion this connection has seen is final: the head page may not bring
+    // the summary back either.
+    const items = page.items.filter((session) => !this.deletedSessions.has(session.sessionId));
+    const filtered = items.length === page.items.length ? page : Object.freeze({ ...page, items: Object.freeze(items) });
+    this.setDirectory(() =>
+      reanchoredDirectory(directoryPageOf(filtered, null), { hostInstanceId, storageId }),
+    );
+    return Object.freeze({ loaded: true, stale: false });
+  }
+
+  /**
+   * Focuses one session: seeds the display, then confirms it against the host.
+   *
+   * The seed is what makes a selection feel immediate — the summary already in
+   * the live window, or the copy an older page holds. It is display only: a
+   * summary from a page is exactly the case that needs a read before it may
+   * authorize anything, and `confirmed` stays false until `sessions.get` has
+   * answered on this connection. The read is bound to the focus that asked for
+   * it: a later selection, a delete, a reconnect or a new host instance leaves
+   * the answer inert rather than letting it install itself.
+   */
+  async focusSession(sessionId: Id): Promise<void> {
+    const identity = this.identity;
+    if (identity === undefined || this.channel === undefined) throw connectionLost("disconnected");
+    const hostInstanceId = identity.hostInstanceId;
+    const storageId = identity.description.storage.storageId;
+    const version = (this.focusCounter += 1);
+    const owner = this.epoch;
+    // The read this call is about to make is owned by the *request*, not by the
+    // pin: a selection with nothing to seed it has no pin yet, and the answer
+    // is still the one that may install it.
+    this.focusRequest = { sessionId, version, hostInstanceId, storageId };
+
+    const seed = this.knownSummary(sessionId);
+    const seeded: FocusedSession | null =
+      seed === undefined
+        ? null
+        : Object.freeze({
+            hostInstanceId,
+            storageId,
+            sessionId,
+            focusVersion: version,
+            summary: seed.summary,
+            confirmed: seed.confirmed,
+            recentRun: null,
+          });
+    this.setFocus(() => seeded);
+
+    let answer;
+    try {
+      answer = await this.request("sessions.get", { sessionId });
+    } catch (error) {
+      // The session is not on this host — or the read failed. Either way the
+      // pin it was about is over: nothing here may keep showing a selection the
+      // host has just refused to describe.
+      if (this.focusOwns(version, owner, sessionId)) this.setFocus(() => null);
+      throw error;
+    }
+
+    if (!this.focusOwns(version, owner, sessionId)) return;
+    this.confirmFocus(version, sessionId, hostInstanceId, storageId, answer.session);
+    await this.readFocusedRun(version, owner, sessionId);
+  }
+
+  /**
+   * Retires whatever is still pending about one session's focus.
+   *
+   * A deletion is final, and a read that was asked for before it may not
+   * install itself after it: the focus request for that identity is retired, so
+   * the answer finds no owner and changes nothing. Only *that* identity is
+   * retired — a later focus on another session has its own version and is
+   * untouched.
+   */
+  private retireFocusFor(sessionId: Id): void {
+    if (this.focusRequest !== undefined && this.focusRequest.sessionId === sessionId) {
+      this.focusCounter += 1;
+      this.focusRequest = undefined;
+    }
+  }
+
+  /**
+   * Clears the focused pin when it is the given session, and nothing otherwise.
+   *
+   * This is what a write's completion uses: a delete of A that finishes after
+   * the reader has selected B must not retire B's pin, and a completion for a
+   * session nobody holds is a no-op.
+   */
+  clearFocusIf(sessionId: Id): void {
+    const focused = this.store.get().focusedSession;
+    const requested = this.focusRequest?.sessionId;
+    if (focused?.sessionId !== sessionId && requested !== sessionId) return;
+    this.focusCounter += 1;
+    if (requested === sessionId) this.focusRequest = undefined;
+    this.setFocus((current) => (current !== null && current.sessionId === sessionId ? null : current));
+  }
+
+  /** Clears the focused pin: the shell has no selection, so this client holds no focus. */
+  unfocusSession(): void {
+    this.focusCounter += 1;
+    this.focusRequest = undefined;
+    this.setFocus(() => null);
+  }
+
+  /**
+   * What this client knows beyond the published windows, derived from its own
+   * bounded state.
+   *
+   * The run window, the live drafts and the confirmed pin are every fact this
+   * replica holds about a run; the sessions window adds the sessions that point
+   * at one. The view is rebuilt on each frame and holds nothing the replica does
+   * not already hold, so it cannot outgrow the windows it comes from: a terminal
+   * retires a draft, a cut clears the live replica, a deletion clears the
+   * session's runs, and replacing a focus replaces the pin's single entry.
+   */
+  private placeabilityContext(snapshot: ClientSnapshot): PlaceabilityContext {
+    const knownRuns = new Map<Id, RunSummary>();
+    const activeRuns = new Map<Id, Id>();
+    const presentation = snapshot.presentation;
+    for (const run of presentation?.runs.items ?? []) {
+      knownRuns.set(run.runId, run);
+      if (run.status === "accepted" || run.status === "running") activeRuns.set(run.sessionId, run.runId);
+    }
+    for (const [runId, draft] of Object.entries(snapshot.live)) {
+      knownRuns.set(runId, runSummaryOf(draft));
+      if (draft.status === "accepted" || draft.status === "running") {
+        activeRuns.set(draft.sessionId, runId);
+      }
+    }
+    const focused = snapshot.focusedSession;
+    if (focused !== null && focused.confirmed) {
+      // An unconfirmed pin is what the page shows, not something this client
+      // stands behind: after a cut its facts are re-read before they count.
+      if (focused.recentRun !== null) knownRuns.set(focused.recentRun.runId, focused.recentRun);
+      if (focused.summary.activeRunId !== null) activeRuns.set(focused.sessionId, focused.summary.activeRunId);
+    }
+    for (const session of presentation?.sessions.items ?? []) {
+      // The window's own pointer: a run whose summary has left the run window
+      // is still this client's business while a session it holds names it.
+      if (session.activeRunId !== null) activeRuns.set(session.sessionId, session.activeRunId);
+    }
+    return { focusedSessionId: focused?.sessionId ?? null, knownRuns, activeRuns };
+  }
+
+  /** Whether one focus read still owns the pin it was issued for. */
+  private focusOwns(version: number, owner: number, sessionId: Id): boolean {
+    if (!this.owns(owner)) return false;
+    if (this.focusCounter !== version) return false;
+    const request = this.focusRequest;
+    return request !== undefined && request.sessionId === sessionId && request.version === version;
+  }
+
+  /** The summary this client already holds for one session, and whether it came from the live window. */
+  private knownSummary(sessionId: Id): { readonly summary: SessionSummary; readonly confirmed: boolean } | undefined {
+    const state = this.store.get();
+    const published = state.presentation?.sessions ?? null;
+    const live = state.status === "ready" && !state.stale && state.presentationHost === "current";
+    const fromWindow = published?.items.find((item) => item.sessionId === sessionId);
+    if (fromWindow !== undefined) return { summary: fromWindow, confirmed: live };
+    const view = directoryView(state.directory, published);
+    const older = view.items.find((item) => item.sessionId === sessionId);
+    if (older !== undefined) return { summary: older, confirmed: false };
+    return undefined;
+  }
+
+  /** Files one confirmed read into the pin, never walking its facts backwards. */
+  private confirmFocus(
+    version: number,
+    sessionId: Id,
+    hostInstanceId: Id,
+    storageId: Id,
+    session: SessionSummary,
+  ): void {
+    this.setFocus((current) => {
+      if (current === null || current.sessionId !== sessionId) {
+        // Nothing was known to seed this focus; the read is the first fact.
+        return Object.freeze({
+          hostInstanceId,
+          storageId,
+          sessionId,
+          focusVersion: version,
+          summary: session,
+          confirmed: true,
+          recentRun: null,
+        });
+      }
+      if (current.summary.generation !== session.generation) {
+        // The id names a different identity than the one this pin described:
+        // nothing held here is a fact about it any more.
+        return null;
+      }
+      return Object.freeze({ ...current, summary: fresherSummary(current.summary, session), confirmed: true });
+    });
+  }
+
+  /**
+   * Reads the focused session's most recent run.
+   *
+   * The bounded live window is the newest runs the host published, and a
+   * session outside it has no entry there; the run itself is still a host fact,
+   * so it is read — the active run by identity when the session points at one,
+   * otherwise the newest run of that session. What the pin holds is a summary:
+   * the timeline belongs to the live replica, and a copy held here would be a
+   * second one nothing maintains.
+   */
+  private async readFocusedRun(version: number, owner: number, sessionId: Id): Promise<void> {
+    const focused = this.store.get().focusedSession;
+    if (focused === null || focused.sessionId !== sessionId) return;
+    try {
+      const activeRunId = focused.summary.activeRunId;
+      const summary =
+        activeRunId !== null
+          ? runSummaryOf((await this.request("runs.get", { runId: activeRunId })).run)
+          : ((await this.request("runs.list", { sessionId, limit: 1 })).runs.items[0] ?? null);
+      if (summary === null || !this.focusOwns(version, owner, sessionId)) return;
+      this.setFocus((current) => {
+        if (current === null || current.sessionId !== sessionId) return current;
+        if (!newerRun(current.recentRun, summary)) return current;
+        return Object.freeze({ ...current, recentRun: summary });
+      });
+    } catch {
+      // A run read is a display fact. A session whose newest run cannot be read
+      // is still a session, and the pin is not made less true by the failure.
+    }
+  }
+
+  request<M extends OperationName>(
+    method: M,
+    params: OperationMap[M]["params"],
+  ): Promise<OperationMap[M]["result"]> {
+    return new Promise<OperationMap[M]["result"]>((resolve, reject) => {
+      this.send(method, params, {
+        accept: (result) => {
+          resolve(result);
+        },
+        decline: (error) => {
+          reject(error);
+        },
+      });
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // The frame path.
+  // -------------------------------------------------------------------------
+
+  private acceptFrame(frame: string, owner: number): void {
+    if (!this.owns(owner)) return;
+
+    const decoded = decodeFrame(frame);
+    if (!decoded.success) {
+      // Nothing that cannot be read as a protocol message has any place on a
+      // logical connection.
+      this.protocolFailure(owner, "invalid-frame");
+      return;
+    }
+
+    const envelope = decoded.output;
+    switch (envelope.kind) {
+      case "host-response":
+        this.acceptResponse(envelope, owner);
+        return;
+      case "host-event":
+        this.acceptEvent(envelope, owner);
+        return;
+      case "host-request":
+        this.acceptHostRequest(envelope, owner);
+        return;
+      case "client-request":
+      case "client-response":
+        this.protocolFailure(owner, "wrong-direction");
+        return;
+    }
+  }
+
+  /**
+   * Every response is checked against this connection's context first.
+   *
+   * The generation and — once bootstrap has bound it — the host instance are
+   * facts about the connection, not about the request, so they are checked
+   * before the request id is even looked at. Only then does the id decide
+   * whether this is an answer, a duplicate, or something never asked for.
+   */
+  private acceptResponse(envelope: ResponseEnvelope, owner: number): void {
+    if (envelope.protocolVersion !== PROTOCOL_VERSION) {
+      // The connection ends first: the request this was answering is settled
+      // with the violation rather than with a made-up outcome.
+      this.protocolFailure(owner, "unsupported-protocol");
+      return;
+    }
+
+    const identity = this.identity;
+    if (identity === undefined) {
+      // Bootstrap: the identity is what `host.describe` is about to bind, so it
+      // cannot be checked yet — but nothing else on this connection has been
+      // asked at all.
+      if (!this.pendings.has(envelope.requestId)) {
+        this.protocolFailure(owner, "invalid-response");
+        return;
+      }
+    } else if (envelope.hostInstanceId !== identity.hostInstanceId) {
+      this.protocolFailure(owner, "host-instance-mismatch");
+      return;
+    }
+
+    const pending = this.takePending(envelope.requestId);
+    if (pending === undefined) return; // A duplicate or an unknown id: read, checked, dropped.
+    pending.complete(envelope, owner);
+  }
+
+  /**
+   * How a frame on a stream that is not the current one is classified.
+   *
+   * The contract is specific about this, and the cases are not interchangeable:
+   * a stream this client has already ended is dropped wherever it appears, a
+   * never-installed stream is ordinary noise once the client is ready or after
+   * it deliberately closed its subscription, and a stream that was never
+   * explained at all — during bootstrap, or while a new cut is in flight — is
+   * the fence the contract forbids.
+   */
+  private classifyNonCurrentStream(streamId: string): "discard" | "fault" {
+    if (this.retiredStreams.has(streamId)) return "discard";
+    if (this.stream !== undefined) return "discard";
+    if (this.openToken !== undefined) return "fault";
+    return this.everOpened ? "discard" : "fault";
+  }
+
+  private acceptEvent(envelope: EventEnvelope, owner: number): void {
+    const identity = this.identity;
+    if (identity === undefined) {
+      // The snapshot is what explains a stream, and no stream has been explained
+      // on this connection yet.
+      this.protocolFailure(owner, "snapshot-fence");
+      return;
+    }
+    if (envelope.protocolVersion !== PROTOCOL_VERSION) {
+      this.protocolFailure(owner, "unsupported-protocol");
+      return;
+    }
+    if (envelope.hostInstanceId !== identity.hostInstanceId) {
+      this.protocolFailure(owner, "host-instance-mismatch");
+      return;
+    }
+
+    const stream = this.stream;
+    if (stream === undefined || envelope.streamId !== stream.streamId) {
+      if (this.classifyNonCurrentStream(envelope.streamId) === "fault") {
+        this.protocolFailure(owner, "snapshot-fence");
+      }
+      return;
+    }
+    if (envelope.sequence < stream.expected) return; // Duplicate or stale within this stream: dropped.
+    if (envelope.sequence > stream.expected) {
+      // A gap cannot be repaired from here, and guessing the missing events is
+      // exactly what the contract forbids: the stream is revoked and re-cut —
+      // and the event that revealed the gap is never applied.
+      void this.openStream().catch(() => undefined);
+      return;
+    }
+
+    const validated = validateMessage({ kind: "host-event" }, envelope);
+    if (!validated.success) {
+      this.protocolFailure(owner, validated.failure.reason === "UNKNOWN_EVENT" ? "unknown-event" : "invalid-event");
+      return;
+    }
+    const event = validated.output;
+
+    if (event.type === "approval.updated") {
+      // The Host has spoken about the approval this client answered about — or
+      // about none at all. Either way the local delivery is over, and the
+      // business snapshot is what says what was decided.
+      const current = this.store.get().approvalReply;
+      const approval = event.payload.approval;
+      if (
+        (current.state === "pending" || current.state === "sent") &&
+        (approval === null || approval.approvalId === current.approvalId)
+      ) {
+        this.setApprovalReply({ state: "closed", approvalId: current.approvalId, executionId: current.executionId });
+      }
+    }
+
+    if (event.type === "host.request.cancelled") {
+      // The host stopped waiting: the local handler must stop too, and no
+      // answer may travel for this request any more.
+      const cancelled = this.reversePendings.get(event.payload.requestId);
+      if (cancelled !== undefined) this.abandonReverse(cancelled);
+      // Aborting a handler runs its abort listener, which is foreign code and
+      // free to re-enter this client: a listener that re-cuts the subscription,
+      // or that ends the connection, has taken this stream away. The frame then
+      // belongs to a stream the client no longer holds — it is read, and dropped,
+      // before any part of it can reach a presentation it no longer describes.
+      if (!this.holdsStream(owner, stream)) return;
+    }
+
+    const current = this.store.get();
+    const presentation = current.presentation;
+    if (presentation === null) {
+      this.protocolFailure(owner, "snapshot-fence");
+      return;
+    }
+
+    if (isRunScoped(event)) {
+      const placeabilityForVerdict = this.placeabilityContext(current);
+      const verdict = liveVerdict(
+        current.live,
+        event,
+        this.liveRefreshes.has(event.scope.runId),
+        presentation,
+        placeabilityForVerdict,
+      );
+      if (verdict === "drop") {
+        // A publication that raced the cut — or content for a run this replica
+        // could not place yet — is not a peer breaking the contract. After a
+        // cut the client is already re-reading that run's timeline, and
+        // inventing a placement out of a fragment is exactly what it must not
+        // do: the frame is dropped, the draft says it is incomplete, and the
+        // read places the run so its content can follow. A frame that
+        // *contradicts* what this client knows — content scoped to another
+        // session, or a run announced as running that was never accepted — is
+        // still the violation it always was, and falls through to the fold.
+        //
+        // The stream position still moves: the frame was published on this
+        // stream, and a position left behind would turn every later frame into
+        // a gap and re-cut the subscription for nothing.
+        stream.expected = event.sequence + 1;
+        this.dropUnplaceableLive(owner, current, event.scope.sessionId, event.scope.runId);
+        return;
+      }
+    }
+
+    const watermark: Watermark = Object.freeze({
+      streamId: stream.streamId,
+      sequence: event.sequence,
+    });
+    // What this client knows beyond the published windows: the session it is
+    // focused on, and the runs it already holds (live drafts, the run window,
+    // the focused session's latest). A bounded window is not an authority on
+    // what is this client's business.
+    const placeability = this.placeabilityContext(current);
+    const folded = foldEvent(presentation, event, watermark, placeability);
+    if (!folded.ok) {
+      if (folded.unplaceable === true) {
+        // A fact about a session this replica is not presenting. The position
+        // still moves — the frame was published on this stream, and a position
+        // left behind would turn every later frame into a gap — and nothing is
+        // invented about a conversation the client is not holding.
+        stream.expected = event.sequence + 1;
+        return;
+      }
+      this.protocolFailure(owner, folded.reason);
+      return;
+    }
+    const lived = foldLiveEvent(current.live, event);
+    let live = current.live;
+    if (lived.ok) {
+      live = lived.live;
+    } else {
+      // A run this client knows but does not track as a draft — its session is
+      // outside the window, so no live timeline was ever placed for it — is a
+      // fact the directory has just filed; inventing a draft for it is exactly
+      // what the live fold refuses, and the refusal is not the peer's fault.
+      //
+      // What is tolerated is decided by the *live fold's own verdict*, never by
+      // where the windows happen to end: a publication the draft this client
+      // holds refuses (its identity, its stage, its timeline shrinking below
+      // what was already published) is the peer contradicting itself, and an
+      // eviction from a bounded window does not downgrade that to a fact that
+      // could not be placed. `unplaceable` is set only where there was no draft
+      // to contradict.
+      const tolerable =
+        lived.unplaceable === true &&
+        isRunScoped(event) &&
+        !presentation.sessions.items.some((session) => session.sessionId === event.scope.sessionId) &&
+        runIsPlaceable(presentation, event.scope.sessionId, event.scope.runId, placeability);
+      if (!tolerable) {
+        this.protocolFailure(owner, lived.reason);
+        return;
+      }
+    }
+    const history = foldHistoryEvent(current.history, event);
+    const settings = foldSettingsEvent(current.settings, event);
+    if (event.type === "session.deleted") {
+      // From here on, a page for this identity is a page for something the
+      // client knows is gone: it is answered to whoever asked and is not filed.
+      this.rememberDeleted(event.payload.sessionId);
+    }
+
+    // The directory's own two facts move with the event: a revision that moved
+    // retires the continuation the loaded pages were cut from, and a summary
+    // that changed replaces the copies the loaded pages hold.
+    let directory = this.store.get().directory;
+    let focused = this.store.get().focusedSession;
+    const collections = collectionsOf(event);
+    if (
+      collections !== undefined &&
+      directory.hostInstanceId !== null &&
+      directory.revision !== collections.sessions &&
+      continuationRetired(directory, folded.presentation.sessions)
+    ) {
+      directory = invalidateDirectory(directory);
+    }
+    switch (event.type) {
+      case "session.updated":
+        directory = updateDirectorySession(directory, event.payload.session);
+        focused = focusAfterSessionEvent(focused, event.payload.session);
+        break;
+      case "session.deleted": {
+        // The deletion also moved the window's bottom, and the boundary the
+        // pages were anchored on follows it: the summary above the deleted one
+        // is what the loaded range now continues from.
+        const remaining = folded.presentation.sessions.items;
+        const publishedBottomId = remaining[remaining.length - 1]?.sessionId ?? null;
+        directory = forgetDirectorySession(directory, event.payload.sessionId, publishedBottomId);
+        this.retireFocusFor(event.payload.sessionId);
+        if (focused !== null && focused.sessionId === event.payload.sessionId) focused = null;
+        break;
+      }
+      case "run.updated":
+      case "run.ended":
+        focused = focusAfterRunEvent(focused, event.payload.run);
+        break;
+      default:
+        break;
+    }
+    // A pin names one session, and the live window is the freshest thing this
+    // client holds about one: the pointer to the run a session is executing
+    // moves there, and a pin left standing on the facts it was confirmed with
+    // would show a session as idle while the host is running it.
+    focused = focusAfterFold(focused, folded.presentation);
+
+    // The frame is applied whole or not at all: the position moves only once the
+    // fold has accepted it, so a rejected event leaves no trace.
+    stream.expected = event.sequence + 1;
+    this.store.update({
+      presentation: folded.presentation,
+      live,
+      history,
+      settings,
+      directory,
+      focusedSession: focused,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // The reverse dispatcher.
+  // -------------------------------------------------------------------------
+
+  private acceptHostRequest(envelope: RequestEnvelope, owner: number): void {
+    const identity = this.identity;
+    if (identity === undefined) {
+      this.protocolFailure(owner, "snapshot-fence");
+      return;
+    }
+    if (envelope.protocolVersion !== PROTOCOL_VERSION) {
+      this.protocolFailure(owner, "unsupported-protocol");
+      return;
+    }
+    if (envelope.hostInstanceId !== identity.hostInstanceId) {
+      this.protocolFailure(owner, "host-instance-mismatch");
+      return;
+    }
+
+    const stream = this.stream;
+    if (stream === undefined || envelope.streamId !== stream.streamId) {
+      // A request on a stream this client ended is dropped unanswered; one on a
+      // stream that was never explained is the same fence an event would be.
+      if (this.classifyNonCurrentStream(envelope.streamId) === "fault") {
+        this.protocolFailure(owner, "snapshot-fence");
+      }
+      return;
+    }
+    if (identity.description.capabilities.reverseRequests !== true) {
+      // The host may only ask when both sides declared the capability.
+      this.protocolFailure(owner, "capability-violation");
+      return;
+    }
+
+    const validated = validateMessage({ kind: "host-request" }, envelope);
+    if (!validated.success) {
+      // Readable enough to know it is a reverse request, but not enough to know
+      // which stream it meant: there is no honest answer to send.
+      this.protocolFailure(owner, "invalid-frame");
+      return;
+    }
+    const request = validated.output;
+
+    if (this.reverseRequestIds.has(request.requestId)) {
+      this.protocolFailure(owner, "duplicate-request-id");
+      return;
+    }
+    if (this.reverseRequestIds.size >= MAX_REVERSE_HISTORY) {
+      // Uniqueness can no longer be proved on this connection, and pretending
+      // otherwise would be worse than ending it.
+      this.protocolFailure(owner, "duplicate-request-id");
+      return;
+    }
+    this.reverseRequestIds.add(request.requestId);
+
+    const handler = this.reverseTable.get(request.method);
+    if (handler === undefined) {
+      // Unknown is refused immediately and explicitly — never ignored, and never
+      // treated as an approval of anything.
+      this.replyReverse(owner, request.streamId, request.requestId, {
+        error: Object.freeze({ code: "METHOD_NOT_FOUND", message: "this client has no handler for that method" }),
+      });
+      return;
+    }
+    // The params contract is foreign code, and it is the last thing that runs
+    // before this dispatcher touches anything at all: it may reject the payload,
+    // it may re-enter this client — a `resync` or a `closeSubscription` from
+    // inside it is legal — and it may throw. Whatever it does, nothing travels
+    // for this request until the stream it arrived on is confirmed still to be
+    // this client's: a contract that re-cut the subscription, closed it, or ended
+    // the connection has taken that stream away, and the request is abandoned
+    // with it — no answer, no handler, no pending — exactly like a request that
+    // arrived on a stream this client no longer holds.
+    let accepted: boolean | undefined;
+    try {
+      accepted = handler.accepts(request.params);
+    } catch {
+      // A contract that throws has not judged the payload: the registration is
+      // broken, and that is a fact about this client, never one to blame on the
+      // payload it was handed.
+      accepted = undefined;
+    }
+    if (!this.holdsStream(owner, stream)) return;
+
+    if (accepted === false) {
+      this.replyReverse(owner, request.streamId, request.requestId, {
+        error: Object.freeze({ code: "INVALID_REQUEST", message: "the payload did not match the method's contract" }),
+      });
+      return;
+    }
+    if (accepted !== true) {
+      this.replyReverse(owner, request.streamId, request.requestId, {
+        error: Object.freeze({ code: "INTERNAL_ERROR", message: "the handler's params contract failed" }),
+      });
+      return;
+    }
+    if (this.reversePendings.size >= MAX_REVERSE_PENDING) {
+      this.replyReverse(owner, request.streamId, request.requestId, {
+        error: Object.freeze({ code: "INTERNAL_ERROR", message: "this client is at capacity for reverse requests" }),
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    const pending: ReversePending = {
+      requestId: request.requestId,
+      streamId: request.streamId,
+      epoch: this.epoch,
+      resultIsValid: handler.resultIsValid,
+      controller,
+      timer: undefined,
+      finished: false,
+    };
+    this.reversePendings.set(request.requestId, pending);
+    // The deadline belongs to this entry, not to its id: a later connection may
+    // legitimately receive the same id, and this timer must never end that one.
+    pending.timer = scheduleDeadline(Date.now() + request.timeoutMs, () => {
+      this.abandonReverse(pending);
+    });
+
+    const context: ReverseHandlerContext = {
+      requestId: request.requestId,
+      method: request.method,
+      timeoutMs: request.timeoutMs,
+      hostInstanceId: identity.hostInstanceId,
+      signal: controller.signal,
+    };
+    const params = deepFreeze(request.params);
+
+    // Detached on purpose: the frame path never waits for foreign code, so one
+    // slow handler cannot hold up the frames behind it.
+    void Promise.resolve()
+      .then(() => handler.handle(params, context))
+      .then(
+        (outcome) => {
+          this.finishReverse(pending, outcome);
+        },
+        () => {
+          this.finishReverse(pending, {
+            error: Object.freeze({ code: "INTERNAL_ERROR", message: "the handler failed" }),
+          });
+        },
+      );
+  }
+
+  /**
+   * Finishes one handler, if it still owns its request.
+   *
+   * The lookup is by identity, not by id: the same request id can legitimately
+   * arrive again on a later connection, and a handler from the previous one —
+   * which may have ignored its abort — must not answer it.
+   */
+  private finishReverse(pending: ReversePending, outcome: ReverseHandlerOutcome): void {
+    if (this.reversePendings.get(pending.requestId) !== pending) return;
+    if (this.epoch !== pending.epoch) return;
+
+    // Choosing the answer runs this profile's own result contract, which is
+    // foreign code and the last thing to run before anything travels. It may
+    // re-enter this client — a resync or a close from inside it is legal — so
+    // the same rules are checked again once it has returned: the answer belongs
+    // to the entry, the stream and the generation that still stand, and a
+    // contract that ended any of them has ended this request with it.
+    const answer = expressible(outcome, pending.resultIsValid);
+    if (this.reversePendings.get(pending.requestId) !== pending) return;
+    if (this.epoch !== pending.epoch) return;
+    if (this.stream?.streamId !== pending.streamId) return;
+
+    this.reversePendings.delete(pending.requestId);
+    pending.finished = true;
+    pending.timer?.cancel();
+    pending.timer = undefined;
+    this.replyReverse(pending.epoch, pending.streamId, pending.requestId, answer);
+  }
+
+  /**
+   * Ends one reverse request without an answer.
+   *
+   * The entry is matched by identity for the same reason its completion is: an
+   * expired deadline belongs to the request that armed it.
+   */
+  private abandonReverse(pending: ReversePending): void {
+    if (this.reversePendings.get(pending.requestId) !== pending) return;
+
+    this.reversePendings.delete(pending.requestId);
+    pending.finished = true;
+    pending.timer?.cancel();
+    pending.timer = undefined;
+    pending.controller.abort();
+    this.closeApprovalReply();
+  }
+
+  /**
+   * Marks the local delivery over, keeping the business snapshot alone.
+   *
+   * A delivery that ended — cancelled, timed out, its stream replaced — is a
+   * fact about *this client*, and it never becomes an approval or a denial:
+   * what the Host decided arrives as the Host's own approval state, and a
+   * client that turned its own closed delivery into a decision would be
+   * answering for the Host.
+   */
+  private closeApprovalReply(): void {
+    const reply = this.store.get().approvalReply;
+    if (reply.state !== "pending" && reply.state !== "sent") return;
+    this.setApprovalReply({ state: "closed", approvalId: reply.approvalId, executionId: reply.executionId });
+  }
+
+  private abortReverseForStream(streamId: string): void {
+    for (const pending of [...this.reversePendings.values()]) {
+      if (pending.streamId === streamId) this.abandonReverse(pending);
+    }
+  }
+
+  /** Answers one reverse request on the stream it arrived on, if that stream's generation still holds the channel. */
+  private replyReverse(owner: number, streamId: string, requestId: string, outcome: ReverseHandlerOutcome): void {
+    if (!this.owns(owner)) return;
+    const channel = this.channel;
+    const identity = this.identity;
+    if (channel === undefined || identity === undefined) return;
+
+    const candidate =
+      "error" in outcome
+        ? {
+            kind: "client-response",
+            protocolVersion: PROTOCOL_VERSION,
+            hostInstanceId: identity.hostInstanceId,
+            streamId,
+            requestId,
+            error: outcome.error,
+          }
+        : {
+            kind: "client-response",
+            protocolVersion: PROTOCOL_VERSION,
+            hostInstanceId: identity.hostInstanceId,
+            streamId,
+            requestId,
+            result: outcome.result,
+          };
+
+    const validated = validateMessage({ kind: "client-response" }, candidate);
+    if (!validated.success) return;
+    const encoded = encodeFrame({ kind: "client-response" }, validated.output);
+    if (!encoded.success) return;
+
+    try {
+      channel.send(encoded.output);
+    } catch {
+      this.endWithLoss(owner, "send-failed");
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Ending things.
+  // -------------------------------------------------------------------------
+
+  /** Removes one pending from the ledger and stops its wait; the caller decides what to say. */
+  private takePending(requestId: string): PendingRequest | undefined {
+    const pending = this.pendings.get(requestId);
+    if (pending === undefined) return undefined;
+    this.pendings.delete(requestId);
+    pending.timer?.cancel();
+    pending.timer = undefined;
+    return pending;
+  }
+
+  /** The channel is gone, and nothing that was in flight will ever be answered. */
+  private endWithLoss(owner: number, reason: ConnectionLostReason): void {
+    this.failAttempt(owner, connectionLost(reason), "lost");
+  }
+
+  /** The peer broke the contract. The connection cannot be used for anything else. */
+  private protocolFailure(owner: number, reason: ProtocolViolationReason): void {
+    this.failAttempt(owner, protocolViolation(reason, "unknown"), "protocol-error");
+  }
+
+  /**
+   * Ends the attempt an error belongs to, then publishes the outcome.
+   *
+   * The order is the point: by the time anything can observe the new status, the
+   * epoch is invalid, the channel and identity are gone, the control token is
+   * retired and every pending is settled — so a listener that reacts to the
+   * status cannot send on the connection that just ended, and a cleanup that
+   * arrives late cannot touch a newer one.
+   */
+  private failAttempt(owner: number, error: ClientError, status: ConnectionStatus): void {
+    if (this.epoch !== owner) return;
+    const claim = this.claimLifecycle();
+    this.retireAttempt(owner, error);
+    // Retiring runs foreign code — a disposer, an abort listener, the transport's
+    // own close — and any of it may have re-entered this client and ended or
+    // replaced the connection itself. What it established is newer than this
+    // verdict, and this verdict is about a connection that is already over.
+    if (!this.ownsLifecycle(claim)) return;
+    this.store.update({ status, stale: this.store.get().presentation !== null, error });
+  }
+
+  /** Invalidates one attempt and everything bound to it. Publishes nothing. */
+  private retireAttempt(owner: number, error: ClientError): void {
+    if (this.epoch !== owner) return;
+    this.epoch += 1;
+
+    const attempt = this.attempt;
+    this.attempt = undefined;
+    if (attempt !== undefined) attempt.aborted = true;
+
+    const detach = this.detach;
+    this.detach = undefined;
+    const channel = this.channel;
+    this.channel = undefined;
+    this.identity = undefined;
+    this.stream = undefined;
+    // The ledger of ended streams is a fact about *this* generation: a stream it
+    // revoked can still have frames in flight on its channel, so the proof has
+    // to live as long as the generation does — and no longer. Below, the
+    // listener is detached and the channel closed, and every frame of this
+    // generation is inert at the listener itself; the next generation therefore
+    // starts with its own budget instead of inheriting a spent one.
+    this.retiredStreams.clear();
+    this.openToken = undefined;
+    this.everOpened = false;
+    // The reads this generation had in flight are settled below with its other
+    // pendings; their placements belonged to a cut that no longer stands, and a
+    // deletion this generation saw is carried by the cut that follows it (the
+    // session is simply absent from the new snapshot).
+    this.liveRefreshes.clear();
+    this.liveRefreshAgain.clear();
+    this.deletedSessions.clear();
+
+    const pendings = [...this.pendings.values()];
+    this.pendings.clear();
+    const reverse = [...this.reversePendings.values()];
+    this.reversePendings.clear();
+    this.reverseRequestIds.clear();
+    this.sync = undefined;
+    // The connection this client had is gone, so its delivery is gone: the
+    // retained presentation may still show the Host's approval, and nothing
+    // here may still claim it can be answered. The focused pin keeps its
+    // facts and loses its authority for the same reason: it was confirmed by a
+    // connection that no longer exists.
+    this.store.update({ approvalReply: NO_APPROVAL_REPLY, focusedSession: this.staleFocus() });
+
+    // Everything local is finished before any foreign code runs: the attempt's
+    // waiters, then the listeners, then the transport.
+    if (attempt !== undefined) attempt.settle.reject(error);
+    for (const pending of pendings) {
+      pending.timer?.cancel();
+      pending.timer = undefined;
+      pending.fail(error);
+    }
+    for (const pending of reverse) {
+      if (pending.finished) continue;
+      pending.finished = true;
+      pending.timer?.cancel();
+      pending.timer = undefined;
+      pending.controller.abort();
+    }
+    if (detach !== undefined) quietly(detach);
+    if (channel !== undefined) quietly(() => {
+      channel.close();
+    });
+  }
+
+  /**
+   * Remembers one ended stream, or ends the connection when the budget is spent.
+   *
+   * The alternative — forgetting ids — would make an already-ended stream look
+   * like a new one, and its frames would be applied to a presentation that has
+   * moved on.
+   *
+   * @returns false when the ledger was already full: the connection has ended,
+   *   and its caller has nothing left to publish or send.
+   */
+  private rememberRetired(owner: number, streamId: string): boolean {
+    if (this.retiredStreams.has(streamId)) return true;
+    if (this.retiredStreams.size >= RETIRED_STREAM_BUDGET) {
+      this.protocolFailure(owner, "stream-identity-budget");
+      return false;
+    }
+    this.retiredStreams.add(streamId);
+    return true;
+  }
+}
+
+/** A run-scoped event: its scope is the run whose placement the client has to hold. */
+type RunScopedEvent = Extract<HostEvent, { scope: { kind: "run" } }>;
+
+/**
+ * One directory page read's outcome, in the shell's own vocabulary.
+ *
+ * `loaded` says a page moved into the loaded range; `stale` says the traversal
+ * was retired and cannot continue until the head is read again. Both false means
+ * there was nothing more to read.
+ */
+export interface DirectoryStep {
+  readonly loaded: boolean;
+  readonly stale: boolean;
+}
+
+/** The collection revisions one event carries, when it carries any. */
+function collectionsOf(event: HostEvent): CollectionRevisions | undefined {
+  switch (event.type) {
+    case "session.created":
+    case "session.updated":
+    case "session.deleted":
+    case "run.ended":
+    case "collection.invalidated":
+      return event.payload.collections;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * The fresher of two readings of one session's summary.
+ *
+ * Revisions and the committed high-water only move forward, so a reading that
+ * is behind what the client already holds is a late answer rather than new
+ * news: it may confirm the session's existence, and it may not walk its facts
+ * back.
+ */
+function fresherSummary(held: SessionSummary, incoming: SessionSummary): SessionSummary {
+  if (incoming.metadataRevision < held.metadataRevision) return held;
+  if (incoming.committedSeq < held.committedSeq) return held;
+  return incoming;
+}
+
+/** Applies one session summary to the focused pin, keeping its facts monotone. */
+function focusAfterSessionEvent(focused: FocusedSession | null, session: SessionSummary): FocusedSession | null {
+  if (focused === null || focused.sessionId !== session.sessionId) return focused;
+  if (focused.summary.generation !== session.generation) return null;
+  const summary = fresherSummary(focused.summary, session);
+  if (summary === focused.summary) return focused;
+  return Object.freeze({ ...focused, summary });
+}
+
+/**
+ * Re-aims the pin at the live window's copy of its session, when the window
+ * holds one.
+ *
+ * A pin's summary is what the shell shows for the selection, so it has to keep
+ * up with the same facts the window does — above all the active-run pointer,
+ * which moves with a run's admission rather than with the session's own
+ * publication. The window is the live replica of exactly those summaries, and
+ * the same monotonicity applies: a copy that is behind what the pin holds is
+ * not news.
+ */
+function focusAfterFold(focused: FocusedSession | null, published: HostSnapshot): FocusedSession | null {
+  if (focused === null) return focused;
+  const copy = published.sessions.items.find((item) => item.sessionId === focused.sessionId);
+  if (copy === undefined) return focused;
+  if (copy.generation !== focused.summary.generation) return null;
+  const summary = fresherSummary(focused.summary, copy);
+  if (summary === focused.summary) return focused;
+  return Object.freeze({ ...focused, summary });
+}
+
+/**
+ * Applies one run publication to the focused pin.
+ *
+ * Two facts travel with it. The *most recent run* is what the strip shows when
+ * the directory holds no newer one, and the *active-run pointer* is what makes
+ * the run's live timeline reachable at all: a focused session outside the
+ * directory window has no live window entry of its own, and the pin is the only
+ * thing that can say "this session is executing that run".
+ */
+function focusAfterRunEvent(focused: FocusedSession | null, run: RunSnapshot): FocusedSession | null {
+  if (focused === null || run.sessionId !== focused.sessionId) return focused;
+  const summary = runSummaryOf(run);
+  const active = run.status === "accepted" || run.status === "running";
+  const activeRunId = active
+    ? run.runId
+    : focused.summary.activeRunId === run.runId
+      ? null
+      : focused.summary.activeRunId;
+  const recentRun = newerRun(focused.recentRun, summary) ? summary : focused.recentRun;
+  if (recentRun === focused.recentRun && activeRunId === focused.summary.activeRunId) return focused;
+  return Object.freeze({
+    ...focused,
+    summary: Object.freeze({ ...focused.summary, activeRunId }),
+    recentRun,
+  });
+}
+
+/** The narrowing the fold needs: `scope.kind` is nested, so the union member is picked by predicate. */
+function isRunScoped(event: HostEvent): event is RunScopedEvent {
+  return event.scope.kind === "run";
+}
+
+/**
+ * What one run-scoped event means for this replica.
+ *
+ * `place` is the ordinary path — the fold applies it under its own rules.
+ * `drop` is the frame this replica cannot place yet without inventing state: a
+ * chunk that arrives before the run it belongs to has been placed, or while
+ * this client is re-reading that run after a cut. Those are dropped and
+ * repaired, never fatal, because the client already knows it is catching up.
+ * `fault` is everything a client can check and find contradictory: content
+ * scoped to a session the run does not belong to, or a run announced as already
+ * running that this client was never told was accepted.
+ */
+type LiveVerdict = "place" | "drop" | "fault";
+
+function liveVerdict(
+  live: ClientSnapshot["live"],
+  event: RunScopedEvent,
+  refreshing: boolean,
+  published: HostSnapshot,
+  placeability: PlaceabilityContext,
+): LiveVerdict {
+  const draft = live[event.scope.runId];
+
+  if (event.type === "run.updated") {
+    if (draft !== undefined) {
+      // A run this client holds is folded under the fold's own rules: stage
+      // moves, identity and timeline continuity are all checked there.
+      return "place";
+    }
+    if (
+      !published.sessions.items.some((session) => session.sessionId === event.scope.sessionId)
+    ) {
+      // The session is outside the window, so nothing here may invent a draft
+      // for it. A run this client knows is still filed in the run window (the
+      // fold places it); a run it has never heard of is dropped.
+      return runIsPlaceable(published, event.scope.sessionId, event.scope.runId, placeability) ? "place" : "drop";
+    }
+    if (event.payload.run.status === "accepted") return "place";
+    // A run this client has never seen can only be announced as accepted; a
+    // publication that raced a cut the client is already repairing is dropped
+    // instead of ending the connection.
+    return refreshing ? "drop" : "fault";
+  }
+
+  if (!isLiveContent(event.type)) {
+    // A terminal correction is not display content: whether it can follow from
+    // what was published is the fold's own contract, and this replica never
+    // invents a run to receive one.
+    return "place";
+  }
+
+  if (draft !== undefined && draft.sessionId !== event.scope.sessionId) return "fault";
+  if (draft !== undefined && draft.status === "running" && !draft.liveTruncated) return "place";
+  // Not placed yet, or placed but not running: content this replica cannot
+  // safely put anywhere — dropped, marked, and re-read.
+  return "drop";
+}
+
+/** The events that carry live content, which is only ever placed into a running draft. */
+function isLiveContent(type: HostEvent["type"]): boolean {
+  return type === "run.output.delta" || type === "run.tool.call" || type === "run.tool.result";
+}
+
+/**
+ * Whether the directory this client holds still says the run is executing.
+ *
+ * The directory — never the draft, never an answer in flight — is the authority
+ * on a run's stage: once it says terminal, nothing may re-open a draft for it.
+ * A run outside the bounded run window is still executing when the session the
+ * client holds points at it.
+ */
+function activeRunStillHeld(presentation: HostSnapshot | null, sessionId: string, runId: string): boolean {
+  if (presentation === null) return false;
+  const known = presentation.runs.items.find((run) => run.runId === runId);
+  if (known !== undefined) return known.status === "accepted" || known.status === "running";
+  const session = presentation.sessions.items.find((candidate) => candidate.sessionId === sessionId);
+  return session !== undefined && session.activeRunId === runId;
+}
+
+/**
+ * A handler's answer, reduced to something this profile promised.
+ *
+ * Two rejections, one answer: a value the wire cannot carry at all, and a value
+ * that is perfectly good JSON but not what this method's contract says. Neither
+ * is a success, and neither is allowed to travel as one.
+ */
+function expressible(
+  outcome: ReverseHandlerOutcome,
+  resultIsValid: (result: JsonValue) => boolean,
+): ReverseHandlerOutcome {
+  if ("error" in outcome) return outcome;
+  const validated = validateJsonValue(outcome.result);
+  if (!validated.success) {
+    return {
+      error: Object.freeze({ code: "INTERNAL_ERROR", message: "the handler produced a value the wire cannot carry" }),
+    };
+  }
+  // The contract is foreign code on the answer's way out: it may refuse the
+  // result, and it may throw. A contract that throws has not judged anything,
+  // so its result is refused as well — and nothing it said travels: the answer
+  // is this client's own sentence about a result it will not vouch for.
+  let acceptable: boolean;
+  try {
+    acceptable = resultIsValid(validated.output);
+  } catch {
+    acceptable = false;
+  }
+  if (!acceptable) {
+    return {
+      error: Object.freeze({ code: "INTERNAL_ERROR", message: "the handler produced a result this method does not define" }),
+    };
+  }
+  return { result: validated.output };
+}

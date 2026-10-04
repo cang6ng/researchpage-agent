@@ -1,0 +1,14 @@
+node_modules/
+*.tsbuildinfo
+/apps/web/dist/
+
+# local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# coding-agent local context
+.zcode/
+.zcodeignore

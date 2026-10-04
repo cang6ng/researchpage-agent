@@ -1,0 +1,283 @@
+import type { ModelMessage } from "../model/message.js";
+import type { SessionEvent, SessionEventInput } from "./session-event.js";
+
+/**
+ * The session is the factual record of a conversation; the model context is a
+ * derivation of it. Persistence stays out of this interface: a SessionStore is built
+ * on top of it (`restoreSession` is the way back in) rather than inside it.
+ */
+export interface Session {
+  readonly id: string;
+  /**
+   * Records an event and returns it as stored.
+   *
+   * `seq` and `time` are assigned by the Session, so a caller cannot forge log
+   * ordering. `turnId` is assigned by the caller (the AgentLoop / Runtime).
+   */
+  append(event: SessionEventInput): SessionEvent;
+  /** A frozen snapshot; the internal log is never exposed. */
+  events(): readonly SessionEvent[];
+  /**
+   * Projects the log into model messages, preserving log order.
+   *
+   * It does not repair, synthesize or reorder history. A tool result carries its
+   * own `callId`; keeping the tool call/result lifecycle complete is the
+   * AgentLoop's responsibility, not this projection's.
+   */
+  deriveMessages(): ModelMessage[];
+}
+
+export function createSession(id: string): Session {
+  return new EventLogSession(id);
+}
+
+/**
+ * Rebuilds a session from events it recorded earlier.
+ *
+ * Separate from `createSession` because the two do different things with an event's
+ * envelope: `append` assigns `seq` and `time`, while a restored session carries the
+ * ones already written — a stored log is a record of what happened, and nothing here
+ * may renumber or re-stamp it.
+ *
+ * The events are expected to be that session's own and to be all of them, which is
+ * the caller's obligation: the envelope carries no session id, and a log that does
+ * not run from `seq` 0 to the end is either a window onto part of a conversation or a
+ * corrupt log. Either way it is refused, because quietly repairing a broken record
+ * would turn one bug into a wrong history.
+ */
+export function restoreSession(id: string, events: readonly SessionEvent[]): Session {
+  const recorded: SessionEvent[] = [];
+
+  for (let seq = 0; seq < events.length; seq++) {
+    const event = events[seq];
+    if (event === undefined) {
+      throw new Error(`session "${id}" cannot be restored: its log has a hole at seq ${seq}`);
+    }
+    if (event.seq !== seq) {
+      throw new Error(
+        `session "${id}" cannot be restored: expected seq ${seq}, found seq ${event.seq}`,
+      );
+    }
+    recorded.push(freezeEvent(event));
+  }
+
+  return new EventLogSession(id, recorded, events.length);
+}
+
+/**
+ * A bounded, contiguous window onto a session's committed log.
+ *
+ * A window exists because a long conversation must not be loaded whole to continue
+ * it. It carries the two positions a caller cannot derive from the array — where the
+ * window starts and where the session's committed log ends — so that `events()` is
+ * honestly "these recent turns" and `append` continues the real numbering rather than
+ * restarting from the array's length.
+ *
+ * The window must be a suffix of committed history: contiguous, in order, and ending
+ * exactly at `nextSeq`. `baseSeq === nextSeq` is the legal empty window (no turns
+ * loaded yet). Loading one is the caller's obligation — the array carries no session
+ * id — and a window that does not fit these rules is refused rather than repaired.
+ */
+export interface SessionWindow {
+  /** The seq of the window's first event. */
+  readonly baseSeq: number;
+  /** The session's committed next seq: the window covers exactly `[baseSeq, nextSeq)`. */
+  readonly nextSeq: number;
+  readonly events: readonly SessionEvent[];
+}
+
+/**
+ * Rebuilds a session from a bounded window of its committed log.
+ *
+ * Same immutability and numbering discipline as `restoreSession`, with two
+ * differences that are the whole point of the window: the log starts at `baseSeq`
+ * rather than 0, and the next `append` continues from `nextSeq` rather than from the
+ * number of loaded events. A window is a view, never a rewrite: nothing here removes,
+ * renumbers or re-stamps an event that is still in storage.
+ *
+ * What a window claims is deliberately narrow. `events()` and `deriveMessages()` speak
+ * for the loaded window only — they never assert the whole session — and a window that
+ * is not a contiguous, turn-complete suffix of committed history is refused, because a
+ * half-loaded turn would present a broken conversation as a whole one.
+ */
+export function restoreSessionWindow(id: string, window: SessionWindow): Session {
+  const { baseSeq, nextSeq, events } = window;
+  if (!Number.isSafeInteger(baseSeq) || !Number.isSafeInteger(nextSeq) || baseSeq < 0 || nextSeq < baseSeq) {
+    throw new Error(`session "${id}" cannot be windowed: [${baseSeq}, ${nextSeq}) is not a position range`);
+  }
+  if (events.length !== nextSeq - baseSeq) {
+    throw new Error(
+      `session "${id}" cannot be windowed: [${baseSeq}, ${nextSeq}) needs ${nextSeq - baseSeq} events, found ${events.length}`,
+    );
+  }
+
+  assertWindowShape(id, baseSeq, events);
+  return new EventLogSession(id, events.map(freezeEvent), nextSeq);
+}
+
+/**
+ * One event, frozen the way `append` freezes: the envelope and the payload are
+ * copied, and the arrays the payload owns are copied with it, so a restored event
+ * is no more mutable than a recorded one.
+ *
+ * One cast, as in `append`: the correlated union cannot be re-derived from a spread
+ * even though every branch is structurally identical here.
+ */
+function freezeEvent(event: SessionEvent): SessionEvent {
+  return Object.freeze({
+    ...event,
+    data: Object.freeze(ownedPayload({ ...event.data })),
+  }) as SessionEvent;
+}
+
+/**
+ * One window's shape, checked against what a committed log can contain.
+ *
+ * Three things are proven here and nothing else: the seqs run unbroken from
+ * `baseSeq`; every turn the window holds is closed inside it; and every event
+ * inside a turn carries that turn's own id, including the `turn/end` that closes
+ * it. The last is not bookkeeping: a window whose closing record belongs to a
+ * different turn is a window whose boundary is a different turn's, and presenting
+ * it as complete history would hand a caller two turns welded into one turn's
+ * shape. A window that opens or closes inside a turn, that nests one turn inside
+ * another, or that mixes turn ids is refused rather than repaired.
+ */
+function assertWindowShape(id: string, baseSeq: number, events: readonly SessionEvent[]): void {
+  let openTurn: string | undefined;
+
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
+    if (event === undefined) {
+      throw new Error(`session "${id}" cannot be windowed: its window has a hole at index ${index}`);
+    }
+    if (event.seq !== baseSeq + index) {
+      throw new Error(
+        `session "${id}" cannot be windowed: expected seq ${baseSeq + index}, found seq ${event.seq}`,
+      );
+    }
+
+    if (event.type === "turn/start") {
+      if (openTurn !== undefined) {
+        throw new Error(`session "${id}" cannot be windowed: turn "${openTurn}" is still open at seq ${event.seq}`);
+      }
+      openTurn = event.turnId;
+      continue;
+    }
+    if (openTurn === undefined) {
+      throw new Error(`session "${id}" cannot be windowed: ${event.type} at seq ${event.seq} has no open turn`);
+    }
+    if (event.turnId !== openTurn) {
+      throw new Error(
+        `session "${id}" cannot be windowed: ${event.type} at seq ${event.seq} belongs to turn "${event.turnId}", not the open turn "${openTurn}"`,
+      );
+    }
+    if (event.type === "turn/end") openTurn = undefined;
+  }
+
+  if (openTurn !== undefined) {
+    throw new Error(`session "${id}" cannot be windowed: the window ends inside turn "${openTurn}"`);
+  }
+}
+
+/**
+ * Copies the arrays an event's own payload owns, one level deep.
+ *
+ * The envelope and `data` are copied already, but a shallow copy would still hand the
+ * caller's `toolCalls` array to the log — and the log is a record nobody may edit
+ * afterwards. The calls themselves are copied too; their `input` stays by reference,
+ * which is the isolation boundary the rest of the Core uses.
+ */
+function ownedPayload<T extends object>(data: T): T {
+  const toolCalls = (data as { toolCalls?: unknown }).toolCalls;
+  if (!Array.isArray(toolCalls)) return data;
+
+  return {
+    ...data,
+    toolCalls: Object.freeze(toolCalls.map((call) => ({ ...(call as object) }))),
+  } as T;
+}
+
+class EventLogSession implements Session {
+  readonly id: string;
+  private readonly log: SessionEvent[];
+  /**
+   * The seq the next `append` will use.
+   *
+   * It is a number of its own, not `log.length`: a windowed session holds part of a
+   * longer log, and continuing the conversation must continue the real numbering
+   * rather than restart from the number of events this process happens to hold.
+   */
+  private nextSeq: number;
+
+  constructor(id: string, recorded: readonly SessionEvent[] = [], nextSeq: number = recorded.length) {
+    this.id = id;
+    this.log = [...recorded];
+    this.nextSeq = nextSeq;
+  }
+
+  append(input: SessionEventInput): SessionEvent {
+    // One cast: the correlated union cannot be re-derived from a widened `type`,
+    // even though every branch is structurally identical at this point.
+    const event = Object.freeze({
+      type: input.type,
+      turnId: input.turnId,
+      seq: this.nextSeq,
+      time: Date.now(),
+      data: Object.freeze(ownedPayload({ ...input.data })),
+    }) as SessionEvent;
+
+    this.nextSeq += 1;
+    this.log.push(event);
+    return event;
+  }
+
+  events(): readonly SessionEvent[] {
+    return Object.freeze([...this.log]);
+  }
+
+  deriveMessages(): ModelMessage[] {
+    const messages: ModelMessage[] = [];
+
+    for (const event of this.log) {
+      switch (event.type) {
+        case "message/user":
+          messages.push({ role: "user", text: event.data.text });
+          break;
+
+        case "message/assistant":
+          // Fresh array holding fresh ToolCall objects, so a caller mutating the
+          // derived messages cannot reach back into the log. `input` is kept by
+          // reference: P1.1 guarantees structural shallow isolation only, never
+          // deep immutability of an unknown payload.
+          messages.push({
+            role: "assistant",
+            text: event.data.text,
+            toolCalls: event.data.toolCalls.map((call) => ({ ...call })),
+          });
+          break;
+
+        case "tool/result":
+          // The event already carries its own callId. The projection stays in log
+          // order and never searches for a matching tool/call.
+          messages.push({
+            role: "tool",
+            results: [
+              {
+                callId: event.data.callId,
+                name: event.data.name,
+                ok: event.data.ok,
+                content: event.data.content,
+              },
+            ],
+          });
+          break;
+
+        default:
+          // turn/start, tool/call and turn/end are session facts, not model input.
+          break;
+      }
+    }
+
+    return messages;
+  }
+}
