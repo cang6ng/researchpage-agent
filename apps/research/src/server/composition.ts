@@ -229,6 +229,7 @@ export async function startResearchApp(options: ResearchAppOptions): Promise<Res
         return created.session.sessionId;
       },
       reportDir,
+      model: modelSettings,
       ...(options.browserPath === undefined ? {} : { browserPath: options.browserPath }),
       log,
     },

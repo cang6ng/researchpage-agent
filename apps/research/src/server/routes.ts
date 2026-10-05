@@ -17,8 +17,24 @@
 import { createReadStream, existsSync, statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import type { AssistantIntent, ResearchService } from "@every-dagent/plugin-research";
-import { classifyIntent, needsAttention } from "@every-dagent/plugin-research";
+import type {
+  AssistantIntent,
+  Report,
+  ReportClaim,
+  ReportFrame,
+  ReportSection,
+  ResearchService,
+  SupportAssessment,
+} from "@every-dagent/plugin-research";
+import {
+  DEFAULT_BUDGET,
+  buildCitations,
+  findPdfBrowser,
+  classifyIntent,
+  deriveClaimAdequacy,
+  needsAttention,
+  reportContentOf,
+} from "@every-dagent/plugin-research";
 import { exportRevisionPdf, exportTaskReportPdf, renderHtmlOf, revisionHtmlOf } from "./export.js";
 import type { ResearchRunner } from "./runner.js";
 
@@ -31,6 +47,8 @@ export interface ResearchRoutesOptions {
   readonly createSession: () => Promise<string>;
   readonly reportDir: string;
   readonly browserPath?: string;
+  /** The model this instance runs with, for the workspace's own status line. */
+  readonly model?: { readonly provider: string; readonly model: string };
   readonly log?: (message: string) => void;
 }
 
@@ -158,6 +176,7 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
       url: source.url,
       doi: source.doi,
       abstract: source.abstract.slice(0, 900),
+      role: source.role ?? null,
       readStatus: source.readStatus,
       readScope: source.readScope,
       readAt: source.readAt,
@@ -261,6 +280,124 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
 
 let options: ResearchRoutesOptions;
 let pendingTopics = new Map<string, string>();
+
+/**
+ * A report as a document the page can render itself.
+ *
+ * The workspace draws the report natively rather than framing a rendered HTML
+ * page, so the structured content — sections, blocks, claims with their
+ * conditions — has to reach the page as it is, together with the citation
+ * numbering the renderer mints and the adequacy verdict each claim's evidence
+ * was given. Nothing here is recomputed: the numbering comes from
+ * `buildCitations`, the verdicts from `deriveClaimAdequacy`, and the validation
+ * stamp is the one the report was saved with. This is a read of facts the
+ * application already holds, in the shape the page reads.
+ */
+/** `ReportEvidenceScope` names the read scopes a citation can carry. */
+type ReportEvidenceScope = "metadata" | "abstract" | "body_excerpt" | "full_text";
+
+interface DocumentSource {
+  readonly id: string;
+  readonly title: string;
+  readonly authors: readonly string[];
+  readonly org: string;
+  readonly venue: string;
+  readonly publishedAt: string | null;
+  readonly url: string;
+  readonly doi: string | null;
+  readonly readScope: ReportEvidenceScope | null;
+}
+
+interface DocumentEvidence {
+  readonly id: string;
+  readonly sourceId: string;
+  readonly excerpt: string;
+  readonly readScope: ReportEvidenceScope;
+  readonly locator: { readonly headingPath: readonly string[]; readonly paragraphIndex: number };
+  readonly cells: readonly { readonly sectionId: string; readonly subjectId: string; readonly dimensionId: string }[];
+}
+
+function documentOf(input: {
+  readonly reportId: string;
+  readonly content: {
+    readonly title: string;
+    readonly summary: string;
+    readonly frame?: ReportFrame;
+    readonly sections: readonly ReportSection[];
+    readonly claims: readonly ReportClaim[];
+  };
+  readonly validation?: Report["validation"];
+  readonly revision?: number;
+  readonly themeId?: string;
+  readonly contentHash?: string | null;
+  readonly sources: readonly DocumentSource[];
+  readonly evidence: readonly DocumentEvidence[];
+  readonly assessments: readonly SupportAssessment[];
+  readonly subjectNames: ReadonlyMap<string, string>;
+  readonly dimensionNames: ReadonlyMap<string, string>;
+}): unknown {
+  const content = input.content;
+  const citations = buildCitations({
+    draft: { title: content.title, summary: content.summary, sections: content.sections, claims: content.claims },
+    sources: input.sources,
+    evidence: input.evidence,
+  });
+  // The adequacy verdict is derived from evidence that still carries its cells
+  // and scope; the sources argument is not read by the derivation.
+  const adequacyContext = {
+    evidence: input.evidence,
+    sources: [],
+    assessments: input.assessments,
+    subjectNames: input.subjectNames,
+  } as unknown as Parameters<typeof deriveClaimAdequacy>[1];
+  return {
+    reportId: input.reportId,
+    revision: input.revision ?? null,
+    themeId: input.themeId ?? null,
+    contentHash: input.contentHash ?? null,
+    title: content.title,
+    summary: content.summary,
+    frame: content.frame ?? null,
+    sections: content.sections,
+    claims: content.claims.map((claim) => ({
+      id: claim.id,
+      text: claim.text,
+      kind: claim.kind,
+      claimType: claim.claimType ?? "fact",
+      synthesis: claim.synthesis === true,
+      evidenceIds: claim.evidenceIds,
+      subjects: (claim.subjects ?? []).map((id) => ({ id, name: input.subjectNames.get(id) ?? id })),
+      dimensions: (claim.dimensions ?? []).map((id) => ({ id, name: input.dimensionNames.get(id) ?? id })),
+      conditions: claim.conditions ?? null,
+      adequacy: deriveClaimAdequacy(claim, adequacyContext),
+    })),
+    citations: {
+      references: citations.references.map((reference) => ({
+        number: reference.number,
+        sourceId: reference.sourceId,
+        title: reference.source.title,
+        authors: reference.source.authors,
+        venue: reference.source.venue,
+        publishedAt: reference.source.publishedAt,
+        url: reference.source.url,
+        doi: reference.source.doi,
+        readScope: reference.source.readScope,
+      })),
+      evidenceIndex: citations.evidenceIndex,
+      numbersByClaim: Object.fromEntries(citations.numbersForClaim),
+    },
+    validation:
+      input.validation === undefined
+        ? null
+        : {
+            ok: input.validation.ok,
+            problems: input.validation.problems,
+            warnings: input.validation.warnings ?? [],
+            checks: input.validation.checks ?? [],
+            checkedAt: input.validation.checkedAt,
+          },
+  };
+}
 
 /** The handler the page server calls before it serves a file. */
 export function createResearchRouter(
@@ -732,6 +869,138 @@ export function createResearchRouter(
         return;
       }
       sendText(response, 200, html, "text/html; charset=utf-8");
+      return;
+    }
+
+    // GET /api/research/runtime — what this instance is running with. The page
+    // prints it in Settings and in its own status line; none of it is a secret.
+    if (path === "/api/research/runtime" && method === "GET") {
+      sendJson(response, 200, {
+        model: routeOptions.model ?? null,
+        // Whether an export can be rendered: a PDF needs a browser on this
+        // machine, and the page says so instead of offering a button that
+        // fails. The effective path is what an export would really use, which
+        // is the configured one when there is one and otherwise the browser
+        // this machine has.
+        pdfRenderer: routeOptions.browserPath ?? findPdfBrowser() ?? null,
+        budget: DEFAULT_BUDGET,
+        dataDir: routeOptions.reportDir,
+        busy: busyState() || runner.busy || runner.queued > 0,
+      });
+      return;
+    }
+
+    // GET /api/research/tasks/:id/answers — the Ask answers of this project.
+    // An Ask writes nothing, so its answer is read back from the session's own
+    // committed history: the assistant turn of that action's run.
+    const answersId = taskIdOf(path, "/answers");
+    if (answersId !== undefined && method === "GET") {
+      const task = service.getTask(answersId);
+      if (task === undefined) {
+        sendJson(response, 404, { error: "任务不存在" });
+        return;
+      }
+      const asks = service
+        .runsOf(task.id)
+        .filter((run) => run.stage === "ask" && run.runId !== null)
+        .slice(-5);
+      const answers: { runId: string; question: string; status: string; text: string | null }[] = [];
+      for (const run of asks) {
+        let text: string | null = null;
+        if (run.status === "completed") {
+          try {
+            text = (await runner.answerOf(run.runId as string)) ?? null;
+          } catch (error) {
+            // An unreadable answer is not a page failure, but the operator
+            // should be able to see why one is missing.
+            log(`[api] answer of ${run.runId as string} could not be read: ${error instanceof Error ? error.message : String(error)}`);
+            text = null;
+          }
+        }
+        answers.push({ runId: run.runId as string, question: runner.questionOf(run.runId as string) ?? "", status: run.status, text });
+      }
+      sendJson(response, 200, { answers });
+      return;
+    }
+
+    // GET /api/research/reports/:reportId/document — the structured report.
+    const documentMatch = /^\/api\/research\/reports\/([^/]+)\/document$/.exec(path);
+    if (documentMatch !== null && method === "GET") {
+      const task = service.listTasks().find((candidate) => service.reportsOf(candidate.id).some((report) => report.id === documentMatch[1]));
+      const report = task === undefined ? undefined : service.reportsOf(task.id).find((candidate) => candidate.id === documentMatch[1]);
+      if (task === undefined || report === undefined) {
+        sendJson(response, 404, { error: "报告不存在" });
+        return;
+      }
+      sendJson(
+        response,
+        200,
+        documentOf({
+          reportId: report.id,
+          content: reportContentOf(report),
+          validation: report.validation,
+          contentHash: report.contentHash ?? null,
+          sources: service.sourcesOf(task.id),
+          evidence: service.evidenceOf(task.id).map((item) => ({
+            id: item.id,
+            sourceId: item.sourceId,
+            excerpt: item.excerpt,
+            readScope: item.readScope,
+            locator: item.locator,
+            cells: item.cells,
+          })),
+          assessments: service.assessmentsOf(task.id),
+          subjectNames: new Map(task.subjects.map((subject) => [subject.id, subject.name])),
+          dimensionNames: new Map(task.dimensions.map((dimension) => [dimension.id, dimension.name])),
+        }),
+      );
+      return;
+    }
+
+    // GET /api/research/revisions/:revisionId/document — the frozen document.
+    // Read from the bundle alone: it is what a frozen revision means.
+    const frozenDocumentMatch = /^\/api\/research\/revisions\/([^/]+)\/document$/.exec(path);
+    if (frozenDocumentMatch !== null && method === "GET") {
+      const revision = service.revisionById(frozenDocumentMatch[1] ?? "");
+      if (revision === undefined) {
+        sendJson(response, 404, { error: "冻结版本不存在" });
+        return;
+      }
+      const task = service.getTask(revision.taskId);
+      sendJson(
+        response,
+        200,
+        documentOf({
+          reportId: revision.reportId,
+          revision: revision.revision,
+          themeId: revision.themeId,
+          contentHash: revision.contentHash,
+          content: reportContentOf(revision.report),
+          validation: revision.report.validation,
+          sources: revision.sourceRefs.map((ref) => ({
+            id: ref.sourceId,
+            title: ref.title,
+            authors: ref.authors,
+            org: ref.org,
+            venue: ref.venue,
+            publishedAt: ref.publishedAt,
+            url: ref.url,
+            doi: ref.doi,
+            readScope: ref.readScope,
+          })),
+          evidence: revision.evidenceRefs.map((ref) => ({
+            id: ref.evidenceId,
+            sourceId: ref.sourceId,
+            excerpt: ref.excerpt,
+            readScope: ref.readScope,
+            locator: ref.locator,
+            cells: ref.cells,
+          })),
+          assessments: revision.assessments,
+          subjectNames: new Map((task?.subjects ?? revision.frame.subjects).map((subject) => [subject.id, subject.name])),
+          dimensionNames: new Map((task?.dimensions ?? revision.frame.dimensions).map((dimension) => [dimension.id, dimension.name])),
+        }),
+      );
       return;
     }
 

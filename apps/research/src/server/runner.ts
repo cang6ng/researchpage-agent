@@ -97,6 +97,18 @@ export interface ResearchRunner {
   ): { readonly intent: "research"; readonly scope: string; readonly gapRoundsRemaining: number } | undefined;
   /** Marks records left `running` by a previous process as interrupted. */
   reconcileInterrupted(): void;
+  /**
+   * The answer an Ask run produced, read from the session's committed history.
+   *
+   * An Ask writes nothing, by design, so its answer is not in any store: it is
+   * the assistant turn of the run's own turn id, and the session's history is
+   * the one place it is kept. Reading it needs the run, so this is async and
+   * memoized — the read is bounded and the answer of a settled run never
+   * changes.
+   */
+  answerOf(runId: string): Promise<string | undefined>;
+  /** The question an Ask action was started with, by the run it produced. */
+  questionOf(runId: string): string | undefined;
   readonly busy: boolean;
   readonly queued: number;
   /** Resolves when nothing is queued and no stage is executing. */
@@ -121,6 +133,8 @@ interface StageRequest {
   };
   /** Set for an Edit: the section the proposal must be limited to. */
   readonly targetSectionId?: string | null;
+  /** Set for an Ask: the user's own question, for the action log. */
+  readonly question?: string;
 }
 
 const STAGE_LABELS: Readonly<Record<ResearchStage, string>> = Object.freeze({
@@ -344,6 +358,13 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
   let idleResolvers: (() => void)[] = [];
   /** Card stages have no task yet, so their one retry is counted here. */
   const cardAttempts = new Map<string, number>();
+  /** Ask answers already read back, keyed by the host run they belong to. */
+  const answers = new Map<string, string>();
+  /** How far back an Ask answer is looked for, in history pages. */
+  const ANSWER_PAGES = 4;
+  const ANSWER_PAGE_ITEMS = 30;
+  /** The question each Ask run was started with, kept for the action log. */
+  const questions = new Map<string, string>();
 
   function settleIdle(): void {
     if (active === undefined && queue.length === 0) {
@@ -391,6 +412,58 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       entries.push({ name: item.name, detail, ok, at });
     }
     return entries;
+  }
+
+  /**
+   * The text an Ask run has written so far.
+   *
+   * Only the model's own words are read — never a tool's — and only for the
+   * Ask stage, whose answer *is* its text. A research or edit stage narrates
+   * around its tool calls, and that narration is thinking, not a result.
+   */
+  function answerTextOf(runId: string): string | undefined {
+    const snapshot = client.getSnapshot();
+    const live: readonly LiveItem[] = snapshot.live[runId]?.live ?? [];
+    const parts = live.flatMap((item) => (item.kind === "text" ? [item.text] : []));
+    const text = parts.join("\n").trim();
+    return text.length === 0 ? undefined : text;
+  }
+
+  async function readAnswer(runId: string): Promise<string | undefined> {
+    const cached = answers.get(runId);
+    if (cached !== undefined) return cached;
+    // A running ask has no committed turn yet; the live timeline is how it is
+    // read while it is still being written.
+    const live = answerTextOf(runId);
+    const run = await client.runs.get({ runId });
+    const turnId = run.run.turnId;
+    if (turnId === null || run.run.status === "accepted" || run.run.status === "running") {
+      if (live !== undefined) answers.set(runId, live);
+      return live;
+    }
+    // The answer is the assistant turn of the run's own turn id, and a session
+    // holds many turns: the page carrying it may be several pages back, so the
+    // read walks backwards until the turn is found or the history runs out. It
+    // is bounded on purpose — an answer nobody can find in four pages is not
+    // worth an unbounded read of a whole session.
+    let cursor: string | undefined;
+    let text = "";
+    for (let page = 0; page < ANSWER_PAGES && text.length === 0; page += 1) {
+      const result = await client.sessions.history({
+        sessionId: run.run.sessionId,
+        limit: ANSWER_PAGE_ITEMS,
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+      text = result.page.items
+        .flatMap((item) => (item.kind === "assistant" && item.turnId === turnId ? [item.text.trim()] : []))
+        .filter((part) => part.length > 0)
+        .join("\n");
+      cursor = result.page.nextCursor ?? undefined;
+      if (cursor === undefined) break;
+    }
+    const answer = text.length === 0 ? live : text;
+    if (answer !== undefined) answers.set(runId, answer);
+    return answer;
   }
 
   function runSettled(runId: string): { readonly settled: boolean; readonly status: string; readonly error: string | null } {
@@ -459,6 +532,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         text: request.instruction,
       });
       runId = started.run.runId;
+      if (request.question !== undefined) questions.set(runId, request.question);
       if (record !== undefined) {
         record = { ...record, runId };
         service.recordRun(record);
@@ -879,6 +953,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         stage: "ask",
         instruction: stageInstruction({ stage: "ask", task, question: input.text }),
         grant: { intent: "ask", allowResearch: false, targetType: "project", targetId: null, scope: view.scope },
+        question: input.text,
       });
       return view;
     },
@@ -930,6 +1005,8 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     get queued() {
       return queue.length;
     },
+    answerOf: readAnswer,
+    questionOf: (runId) => questions.get(runId),
     idle(): Promise<void> {
       if (active === undefined && queue.length === 0) return Promise.resolve();
       return new Promise((resolve) => {
