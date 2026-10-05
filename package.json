@@ -9,10 +9,11 @@
   },
   "packageManager": "pnpm@11.8.0",
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p apps/web/tsconfig.browser.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p apps/web/tsconfig.browser.json && tsc --noEmit -p apps/research/tsconfig.browser.json",
     "test": "vitest run",
     "build:web": "pnpm --filter @every-dagent/web run build",
-    "test:web:browser": "node apps/web/scripts/verify-browser.mjs"
+    "test:web:browser": "node apps/web/scripts/verify-browser.mjs",
+    "build:research": "pnpm --filter @every-dagent/research-app run build"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.87.1",
@@ -21,8 +22,10 @@
     "@every-dagent/host": "workspace:*",
     "@every-dagent/model-pi-ai": "workspace:*",
     "@every-dagent/plugin-calculator": "workspace:*",
+    "@every-dagent/plugin-research": "workspace:*",
     "@every-dagent/plugin-system": "workspace:*",
     "@every-dagent/protocol": "workspace:*",
+    "@every-dagent/research-app": "workspace:*",
     "@every-dagent/web": "workspace:*",
     "@types/node": "^24.0.0",
     "@types/react": "19.3.0",

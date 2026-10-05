@@ -26,12 +26,18 @@ importers:
       '@every-dagent/plugin-calculator':
         specifier: workspace:*
         version: link:packages/plugin-calculator
+      '@every-dagent/plugin-research':
+        specifier: workspace:*
+        version: link:packages/plugin-research
       '@every-dagent/plugin-system':
         specifier: workspace:*
         version: link:packages/plugin-system
       '@every-dagent/protocol':
         specifier: workspace:*
         version: link:packages/protocol
+      '@every-dagent/research-app':
+        specifier: workspace:*
+        version: link:apps/research
       '@every-dagent/web':
         specifier: workspace:*
         version: link:apps/web
@@ -53,6 +59,36 @@ importers:
       vitest:
         specifier: ^3.2.0
         version: 3.2.7(@types/node@24.19.0)
+
+  apps/research:
+    dependencies:
+      '@earendil-works/pi-ai':
+        specifier: 0.87.1
+        version: 0.87.1(ws@8.22.0)
+      '@every-dagent/client':
+        specifier: workspace:*
+        version: link:../../packages/client
+      '@every-dagent/host':
+        specifier: workspace:*
+        version: link:../../packages/host
+      '@every-dagent/model-pi-ai':
+        specifier: workspace:*
+        version: link:../../packages/model-pi-ai
+      '@every-dagent/plugin-research':
+        specifier: workspace:*
+        version: link:../../packages/plugin-research
+      '@every-dagent/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@every-dagent/web':
+        specifier: workspace:*
+        version: link:../web
+      react:
+        specifier: 19.3.0
+        version: 19.3.0
+      react-dom:
+        specifier: 19.3.0
+        version: 19.3.0(react@19.3.0)
 
   apps/web:
     dependencies:
@@ -102,6 +138,15 @@ importers:
         version: link:../agent-core
 
   packages/plugin-calculator:
+    dependencies:
+      '@every-dagent/agent-core':
+        specifier: workspace:*
+        version: link:../agent-core
+      '@every-dagent/plugin-system':
+        specifier: workspace:*
+        version: link:../plugin-system
+
+  packages/plugin-research:
     dependencies:
       '@every-dagent/agent-core':
         specifier: workspace:*

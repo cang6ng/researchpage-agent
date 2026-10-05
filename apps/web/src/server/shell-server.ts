@@ -17,6 +17,7 @@
 
 import type { Host } from "@every-dagent/host";
 import type { ProtocolChannel } from "@every-dagent/protocol";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { startHttpBinding, type HttpBinding } from "./http-binding.js";
 import { startStaticServer, type StaticServer } from "./static-server.js";
@@ -34,6 +35,11 @@ export interface ShellServerOptions {
   readonly bindingPort?: number;
   /** How a binding channel reaches the host. The default is the channel itself. */
   readonly wrapChannel?: (channel: ProtocolChannel) => ProtocolChannel;
+  /**
+   * An application's own routes on the page origin, tried before the files.
+   * `true` means the handler answered; `false` falls through to the page.
+   */
+  readonly onRequest?: (request: IncomingMessage, response: ServerResponse) => boolean;
 }
 
 export interface ShellServer {
@@ -54,6 +60,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
     root: options.staticRoot,
     ...(options.address === undefined ? {} : { address: options.address }),
     ...(options.port === undefined ? {} : { port: options.port }),
+    ...(options.onRequest === undefined ? {} : { onRequest: options.onRequest }),
   });
 
   // The page server answers under two loopback spellings, and a browser treats

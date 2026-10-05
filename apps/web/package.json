@@ -29,6 +29,10 @@
     "./server": {
       "types": "./src/server/http-binding.ts",
       "default": "./src/server/http-binding.ts"
+    },
+    "./shell": {
+      "types": "./src/server/shell-server.ts",
+      "default": "./src/server/shell-server.ts"
     }
   }
 }

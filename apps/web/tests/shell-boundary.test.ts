@@ -245,11 +245,14 @@ describe("the package manifest", () => {
     expect(manifest.type).toBe("module");
     expect(manifest.main).toBe("./src/index.ts");
     expect(manifest.types).toBe("./src/index.ts");
-    // Three entries, and the two halves are separable: a browser imports
-    // `@every-dagent/web/client` and never sees the server's modules.
-    expect(Object.keys(manifest.exports ?? {}).sort()).toEqual([".", "./client", "./server"]);
+    // The entries are separable: a browser imports `@every-dagent/web/client`
+    // and never sees the server's modules. `./shell` is the page-server
+    // composition an application (the research app) builds its routes on top
+    // of; it adds no dependency and no rendering to this package.
+    expect(Object.keys(manifest.exports ?? {}).sort()).toEqual([".", "./client", "./server", "./shell"]);
     expect(manifest.exports?.["./client"]?.default).toBe("./src/client/http-channel.ts");
     expect(manifest.exports?.["./server"]?.default).toBe("./src/server/http-binding.ts");
+    expect(manifest.exports?.["./shell"]?.default).toBe("./src/server/shell-server.ts");
     // The approved P3.4 set: the transport's protocol dependency plus the
     // shell's own — the client entry for the page, the host for the server
     // composition, and React for rendering. Nothing else, in either direction.

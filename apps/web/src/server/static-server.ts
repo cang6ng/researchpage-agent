@@ -25,6 +25,17 @@ export interface StaticServerOptions {
   /** The loopback address to listen on. Anything else is refused. */
   readonly address?: string;
   readonly port?: number;
+  /**
+   * An application's own request handler, tried before the static files.
+   *
+   * It returns `true` when it answered the request itself — an API route, a
+   * download — and `false` to let the page server handle it as a file. The
+   * transport rules above (loopback peer, expected host) still apply to it, so
+   * a route can never be reached from off the machine or through a foreign
+   * Host header. This is composition, not protocol: the page server learns
+   * nothing about what a route means.
+   */
+  readonly onRequest?: (request: IncomingMessage, response: ServerResponse) => boolean;
 }
 
 export interface StaticServer {
@@ -191,6 +202,12 @@ export async function startStaticServer(options: StaticServerOptions): Promise<S
     }
     if (!isLoopbackPeer(request.socket.remoteAddress)) {
       respond(request, response, 403, "loopback only");
+      return;
+    }
+    // The application's own routes come first, and they decide their own
+    // methods: a route that answers a POST must see it before the static
+    // server's GET/HEAD rule would turn it away.
+    if (options.onRequest !== undefined && options.onRequest(request, response)) {
       return;
     }
     if (request.method !== "GET" && request.method !== "HEAD") {

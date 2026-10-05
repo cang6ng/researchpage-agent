@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": [],
+    "jsx": "react-jsx"
+  },
+  "include": ["src/browser"],
+  "//": "The root exclude (which keeps the browser half out of the Node project) is inherited and would silently drop this project's whole include; overriding it here is what makes the include real.",
+  "exclude": ["dist"]
+}

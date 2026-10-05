@@ -1,0 +1,24 @@
+{
+  "name": "@every-dagent/research-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ResearchPage: the research workspace application — its own server composition (host + research plugin + business API) and the React workspace it serves.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node dist/research-server.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.87.1",
+    "@every-dagent/client": "workspace:*",
+    "@every-dagent/host": "workspace:*",
+    "@every-dagent/model-pi-ai": "workspace:*",
+    "@every-dagent/plugin-research": "workspace:*",
+    "@every-dagent/protocol": "workspace:*",
+    "@every-dagent/web": "workspace:*",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  }
+}
