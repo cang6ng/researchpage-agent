@@ -10,6 +10,8 @@
 
 ## Current Status（2026-10-05）
 
+- **Step 3（Frontend Product Redesign）已完成**：产品前端从「最小兼容」重写为 desktop-grade 研究工具——统一设计系统、Start/Library、Research Brief、Evidence Matrix、统一 Context Dock、原生 Report Studio（Editorial / Swiss 两套文档主题）、Source Workspace、Template Gallery、Settings；全部界面连接真实 API，浏览器 gate 逐项验收。
+
 - **Step 2（Research Artifact Quality）已完成**：Technical Comparison v2 成为一个真实可执行的 Blueprint；报告由认知主线（问题 → 概念坐标 → 机制 → 条件化比较 → 综合 → 缺口）组织，六类 Claim Contract、可比性判断、维度覆盖与 Q01–Q12 质量契约都在程序侧可校验。
 - 真实产物：GraphRAG 与 LoRA/QLoRA/DoRA 两个主题各用真实模型 + 真实 arXiv + 真实 Chrome PDF 各跑通一次（v2 报告 8/11 页、10–11 条 claim、6 条综合判断，Q01–Q12 全部 pass，仅有 informational warning）。
 
@@ -35,6 +37,35 @@
 - 校验失败与警告分开：`validation.checks` 记录每条 Q 规则的 result（pass/fail/warning/not_applicable），`problems` 阻止发布，`warnings` 随报告保存并显示在工作台。
 - 旧报告与新规则解耦：没有 `blueprintId` 的任务沿用 v1 的「必需章节 + 引用真实」规则，老数据不会因为新义务而无法编辑或导出。
 - 页数不是硬约束：card 的 lengthTarget 与各节 budget 作为写作预算写进阶段指令（实测把同一主题从 15 页收到 11 页），但 validator 不会因为页数拒绝报告。
+## Step 3 新增（本次工作产物）
+
+- **技术栈**：React 19 + Mantine 9（`@mantine/core` / `@mantine/hooks` 9.7.0，负责 Button / Input / Select / SegmentedControl / Menu / Popover / Tooltip / Modal / Drawer / ScrollArea 等 primitive）+ lucide-react 图标 + 既有 esbuild 管线；未引入第二套组件系统。依赖只加在 `apps/research`。
+- **两套视觉语法**（`apps/research/public/`）：`app.css` 由 bundle 输出（Mantine），`styles.css` 是 ResearchPage 的 application UI 设计系统（tokens / shell / 矩阵 / Dock / 各视图），`document.css` 是 research artifact 的独立 renderer 样式（Editorial 衬线期刊 / Swiss 编号分析出版）。两者只共享品牌色与语义状态色；报告 HTML/PDF 仍由 plugin 的 semantic renderer 输出。
+- **产品外壳**：Global Bar（身份、当前项目、项目切换、运行状态、设置）+ Project Nav（研究 / 报告 / 来源 / 研究任务 / 模板）；hash 路由 `#/`、`#/settings`、`#/p/<taskId>/<view>`，刷新与直达链接都能重开同一个项目与视图。
+- **Start / Library**：第一焦点是 research composer（大输入 + 建议 + 真实约束说明）；项目以行呈现（标题 / 状态摘要 / 比较对象 / 更新时间），不是卡片墙。
+- **Research Brief**：任务卡是主体，字段标「助手建议」并在进入时轻微高亮；比较对象为行、维度为带问题的编号项、关注点为 chip；确认前的调整走真实路径（改主题重新建立任务卡）。
+- **Research View**：证据矩阵是视觉中心——行标题写研究问题、单元格写「中文状态词 + 短判断 + 证据摘要（n 条证据 · m 条一手）」，弱化纵向边框，选中态为 inset accent；运行中只显示「正在核对的问题 / 为什么研究 / 下一步」，不展示思维链、不显示假百分比。
+- **Context Dock（统一）**：同一面板承载证据片段、来源详情、论断检查器、修改建议与助手动作日志；宽度 372px，可用宽度 ≥1400px 时 push，否则 overlay；overlay 时 sticky chrome 让出面板宽度，工具栏控件不会被盖住；Esc 关闭、切换目标自动回到顶部。
+- **Report Studio**：原生 Document Canvas（`max-width` 920 / 正文 720，比较表允许更宽），彻底移除 iframe-as-product；Read / Verify 两种模式（Read 隐藏引用标记与校验提醒，正文一字不变）；对象选择（章节 / 论断 / 比较表）后工具栏出现统一动作（检查 / 补查 / 修改 / 更多）；Evidence Inspector 同时回答两个问题——「引用有效」（报告保存时逐条校验）与「证据是否足以支持」（claim adequacy + 条件 + 支持评估 + 片段 + 定位 + 读取范围）。
+- **修改建议**：显示目标、理由、「现在的正文 / 修改后」两栏与原样渲染的区块、受影响论断（新增 / 替换）、证据变化；接受前正文 hash 不变，接受后只有目标章节变化（gate 逐节比对）。
+- **版本与主题**：工具栏显示「工作稿 / R# · 已冻结」；冻结版本从冻结包单独渲染、只读；`reportNeedsReview` 显示为「1 处待复核 · 正文未变」；主题切换只改排版（标题、正文与引用编号逐字不变），冻结时把 themeId 写入版本。
+- **Sources**：editorial list/table hybrid——Title 列承担主要信息（标题 / 作者 / 年份 / id），其余为角色、读取范围、解析状态、证据数与被引用数；行点击打开同一个 Dock。
+- **Template Gallery**：Editorial 与 Swiss 用同一份真实报告并排预览（缩放的真实文档，不是缩略图或用下拉框）；页面明确「内容不变 / 引用不变」。
+- **Settings**：通用 / 模型 / 研究 / 来源与集成 / 导出；未实现的能力标「未接入」，不提供假开关；模型与 PDF 渲染能力来自新的 runtime 只读接口。
+- **后端改动（全部在 `apps/research` 范围内的 presentation adapter，未触碰语义）**：
+  - `GET /api/research/runtime`：模型、PDF 渲染器（`browserPath ?? findPdfBrowser()`）、预算、数据目录、忙闲。
+  - `GET /api/research/reports/:reportId/document` 与 `GET /api/research/revisions/:revisionId/document`：结构化报告 DTO——sections/blocks/claims（含 claimType、conditions、subjects/dimensions）、`buildCitations` 生成的引用编号、`deriveClaimAdequacy` 逐条推导的 adequacy、validation；revision 版本完全从冻结包构造。
+  - `GET /api/research/tasks/:id/answers`：Ask 的回答从会话 committed history 读回（run → turnId → assistant item），`runner.questionOf/answerOf` 提供映射与记忆化；Ask 仍然不写入任何正式数据。
+  - task bundle 的 sources 增加 `role`。
+- **构建**：browser bundle 增加 `define: { "process.env": "{}" }`，页面产物不再包含任何环境读取；`apps/research/tests/bundle.test.ts` 把断言改为「产物中每一处 process.env 提及都必须是 esbuild 的 define 标记，且不存在 `process.env.` 形式的读取」。
+- **测试**：`apps/research/tests/frontend-logic.test.ts`（11 例：路由解析与回退、引用编号映射、综合判断标记、提案 claim 增删判定）；浏览器 gate `apps/research/scripts/verify-workspace.mjs` 重写为 30 例真实 CDP 输入用例（含 1366/1440/1920 截图、Read/Verify、Dock、主题、设置、Ask / Research / Edit→接受闭环）。
+
+## Step 3 的验证入口
+
+- 浏览器 gate（真实输入，非 DOM stub）：`node apps/research/scripts/verify-workspace.mjs --url <product url> [--task <id>] [--shots <dir>] [--model]`；不带 `--model` 时跳过需要真实模型的动作（Ask / Research / Edit）。
+- 前端纯逻辑：`npx vitest run apps/research/tests/frontend-logic.test.ts apps/research/tests/bundle.test.ts`。
+- 离线全量与类型检查同 Step 2：`pnpm typecheck`、`pnpm build:research`、`EVERY_DAGENT_NO_BROWSER=1 npx vitest run --exclude ...`。
+
 ## Step 1 新增（本次工作产物）
 
 - **权限与意图**（`packages/plugin-research/src/semantics.ts`）：`ask | research | edit` 三个正式意图 + 程序自用授权 `draft | card`；`ActionGrant` 表达 actionId、intent、task、targetType/targetId、scope、baseReportId/baseContentHash、allowResearch、capabilities、budget；`classifyIntent` 只做可读的关键词识别，识别不出即按 Ask（不写入）。
@@ -73,12 +104,11 @@
 - 机制块没有图形渲染：本轮只输出结构化的 input/intermediate/steps/output/tradeoff/failure，Mermaid/DiagramSpec 渲染属于后续步骤。
 - 前端仍是最小兼容：报告 iframe + claim 类型标签 + frame/警告提示；四层阅读、Context Dock、Report Studio 属于 Step 3。
 
+- 前端（Step 3 后仍存在的限制）：任务卡字段不能在界面里直接编辑——后端没有该路由，改结构的方式是改主题重新生成任务卡（会产生新项目，原项目保留）；Ask 的回答只从会话历史读回最近 5 次，界面不提供完整对话列表；PDF 仍只有 Editorial 版式（Swiss 的 PDF 适配属 Step 4）；切主题不产生 Revision，只记录在冻结版本的 themeId 上；1366 窗口下 Dock 为 overlay，会覆盖矩阵最右一列（可 Esc 关闭，Dock 标题与选中态仍表明当前目标）。
+
 ## Next Action
 
-**STEP 3 — Frontend Product Redesign**（前端；不在本轮范围）：
-
-1. 按 `ResearchPage_Product_Redesign.md` 实现 Research Workspace / Report Studio：四层阅读、Context Dock 核验、认知组件的版式（本轮的组件数据已经就位：frame、mental-model、机制块、比较表列映射、综合标记、缺口分型）。
-2. 目前前端只是最小兼容（报告 iframe + claim 类型标签 + frame/警告提示）；模板 Gallery、第二 Theme、Mermaid、File Upload 仍属后续步骤。
+**STEP 4**（后续步骤，本轮未做）：PDF 双主题适配（把 ThemeSpec 映射到 plugin 的 HTML/PDF renderer，使 Editorial/Swiss 在导出文件里也成立）、Mermaid / DiagramSpec 机制图、File Upload 作为来源、第二 Blueprint、MCP 集成。第 3 轮已经把这些位置留好：主题在版本里记录 themeId，机制块保留结构化数据，Source Workspace 与 Settings 对未接入能力如实标注。
 
 ## Step 2 的验证入口
 
