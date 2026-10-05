@@ -8,9 +8,10 @@
  * came from a model or a source is escaped on the way in.
  */
 
-import type { Evidence, MatrixCell, Report, ReportTask, Source } from "./domain.js";
+import type { MatrixCell, Report, ReportBlock, ReportGapNote, ReportTask } from "./domain.js";
 import { scopeLabel } from "./evidence.js";
-import { buildCitations, locatorLabel, type Citations } from "./report.js";
+import { buildCitations, locatorLabel, type CitationEvidence, type CitationSource, type Citations } from "./report.js";
+import type { FrozenRevision } from "./revision.js";
 
 export function escapeHtml(text: string): string {
   return text
@@ -22,12 +23,13 @@ export function escapeHtml(text: string): string {
 }
 
 export interface RenderInput {
-  readonly task: ReportTask;
-  readonly report: Report;
-  readonly sources: readonly Source[];
-  readonly evidence: readonly Evidence[];
-  /** The cells still missing or partial, appended as a program-written section. */
-  readonly gaps: readonly MatrixCell[];
+  /** Only the frame lines the document shows; a revision has no live task. */
+  readonly task: Pick<ReportTask, "topic" | "audience">;
+  readonly report: Pick<Report, "id" | "title" | "summary" | "sections" | "claims">;
+  readonly sources: readonly CitationSource[];
+  readonly evidence: readonly CitationEvidence[];
+  /** The cells still needing work, appended as a program-written section. */
+  readonly gaps: readonly ReportGapNote[] | readonly MatrixCell[];
   readonly subjectNames: ReadonlyMap<string, string>;
   readonly dimensionNames: ReadonlyMap<string, string>;
   readonly generatedAt: string;
@@ -106,7 +108,7 @@ function citationSup(numbers: readonly number[]): string {
 }
 
 function renderBlocks(
-  blocks: Report["sections"][number]["blocks"],
+  blocks: readonly ReportBlock[],
   citations: Citations,
 ): string {
   const parts: string[] = [];
@@ -162,20 +164,45 @@ function numbersOf(citations: Citations, claimIds: readonly string[]): readonly 
   return numbers;
 }
 
-/** The gap appendix: program-written from the matrix, never from the model. */
+/** A gap, as either the live matrix or a frozen snapshot describes it. */
+function gapFields(cell: MatrixCell | ReportGapNote, input: RenderInput): { subject: string; dimension: string; status: string; detail: string } {
+  const frozen = "subjectName" in cell;
+  const status = cell.status === "reviewed" ? "已核对" : statusLabel(cell.status);
+  return {
+    subject: frozen ? cell.subjectName : (input.subjectNames.get(cell.subjectId) ?? cell.subjectId),
+    dimension: frozen ? cell.dimensionName : (input.dimensionNames.get(cell.dimensionId) ?? cell.dimensionId),
+    status,
+    detail: cell.gap.length > 0 ? cell.gap : cell.reason,
+  };
+}
+
+function statusLabel(status: MatrixCell["status"]): string {
+  switch (status) {
+    case "missing":
+      return "缺少依据";
+    case "unassessed":
+      return "有片段，待核对";
+    case "limited":
+      return "有限支持";
+    case "conflict":
+      return "冲突/不可比";
+    case "reviewed":
+      return "已核对";
+  }
+}
+
+/** The gap appendix: program-written from the report's own gap snapshot. */
 function renderGapAppendix(input: RenderInput): string {
   if (input.gaps.length === 0) return "";
   const items = input.gaps
     .map((cell) => {
-      const subject = input.subjectNames.get(cell.subjectId) ?? cell.subjectId;
-      const dimension = input.dimensionNames.get(cell.dimensionId) ?? cell.dimensionId;
-      const status = cell.status === "partial" ? "部分依据" : "缺少依据";
-      return `<li><b>${escapeHtml(subject)} × ${escapeHtml(dimension)}</b>（${status}）：${escapeHtml(
-        cell.gap.length > 0 ? cell.gap : cell.reason,
-      )}</li>`;
+      const fields = gapFields(cell, input);
+      return `<li><b>${escapeHtml(fields.subject)} × ${escapeHtml(fields.dimension)}</b>（${escapeHtml(
+        fields.status,
+      )}）：${escapeHtml(fields.detail)}</li>`;
     })
     .join("");
-  return `<h2 class="section">证据缺口清单（程序生成）</h2><div class="callout callout--gap">以下比较项在本次材料中没有找到足够公开依据，报告不对其作结论：<ul class="list">${items}</ul></div>`;
+  return `<h2 class="section">证据缺口清单（程序生成）</h2><div class="callout callout--gap">以下比较项在本次材料中没有取得已核对的依据，报告不对其作结论：<ul class="list">${items}</ul></div>`;
 }
 
 function renderReferences(citations: Citations): string {
@@ -197,7 +224,7 @@ function renderReferences(citations: Citations): string {
   return `<h2 class="section">参考来源</h2><ol class="references">${items}</ol>`;
 }
 
-function renderEvidenceIndex(citations: Citations, sources: readonly Source[]): string {
+function renderEvidenceIndex(citations: Citations, sources: readonly CitationSource[]): string {
   if (citations.evidenceIndex.length === 0) return "";
   const bySource = new Map(sources.map((source) => [source.id, source]));
   const items = citations.evidenceIndex
@@ -208,7 +235,7 @@ function renderEvidenceIndex(citations: Citations, sources: readonly Source[]): 
       // the only thing this renderer asks of it.
       return `<li id="ev-${entry.number}"><b>[${entry.number}]</b> ${escapeHtml(source?.title ?? entry.sourceId)} · ${escapeHtml(
         locatorLabel(entry.headingPath, entry.paragraphIndex, source?.title),
-      )} · ${escapeHtml(scopeLabel(entry.scope as never))}<div class="excerpt">${escapeHtml(excerpt)}</div>${
+      )} · ${escapeHtml(scopeLabel(entry.scope))}<div class="excerpt">${escapeHtml(excerpt)}</div>${
         source === undefined ? "" : `<div class="excerpt-source">来源：<a href="${escapeHtml(source.url)}">${escapeHtml(source.url)}</a></div>`
       }</li>`;
     })
@@ -258,4 +285,67 @@ ${renderEvidenceIndex(citations, input.sources)}
 </article>
 </body>
 </html>`;
+}
+
+/**
+ * Renders a frozen revision — and only what the revision contains.
+ *
+ * This is the export path, and it is deliberately unable to reach the task:
+ * every value it prints comes from the bundle that was frozen with the report,
+ * so the same revision produces the same document today, next week, and after
+ * the research has moved on. Even the document's "generated" line is the
+ * revision's own timestamp rather than the moment of rendering: a file that
+ * called itself different because it was printed later would not be a frozen
+ * version at all. The footer names the revision and the renderer that produced
+ * it, so the document can state its own provenance.
+ */
+export function renderRevisionHtml(input: { readonly revision: FrozenRevision; readonly generatedAt?: string }): string {
+  void input.generatedAt;
+  const revision = input.revision;
+  const subjectNames = new Map(revision.frame.subjects.map((subject) => [subject.id, subject.name]));
+  const dimensionNames = new Map(revision.frame.dimensions.map((dimension) => [dimension.id, dimension.name]));
+  const html = renderReportHtml({
+    task: { topic: revision.frame.topic, audience: revision.frame.audience },
+    report: {
+      id: revision.report.id,
+      title: revision.report.title,
+      summary: revision.report.summary,
+      sections: revision.report.sections,
+      claims: revision.report.claims,
+    },
+    sources: revision.sourceRefs.map((source) => ({
+      id: source.sourceId,
+      title: source.title,
+      authors: source.authors,
+      org: source.org,
+      venue: source.venue,
+      publishedAt: source.publishedAt,
+      url: source.url,
+      doi: source.doi,
+      readScope: source.readScope,
+    })),
+    evidence: revision.evidenceRefs.map((ref) => ({
+      id: ref.evidenceId,
+      sourceId: ref.sourceId,
+      excerpt: ref.excerpt,
+      readScope: ref.readScope,
+      locator: ref.locator,
+    })),
+    gaps: revision.gaps,
+    subjectNames,
+    dimensionNames,
+    generatedAt: revision.createdAt,
+  });
+  const stamp = [
+    `冻结版本 R${revision.revision}`,
+    `内容 hash ${revision.contentHash.slice(0, 19)}…`,
+    revision.gapsCaptured ? "缺口快照：已记录" : "缺口快照：本版本未记录（旧版记录）",
+    `渲染器 ${revision.renderer.name}@${revision.renderer.version}`,
+    `主题 ${revision.themeId}`,
+    `冻结时间 ${revision.createdAt}`,
+  ].join(" · ");
+  return html.replace(
+    `<div class="legend">`,
+    `<div class="legend" data-revision-id="${escapeHtml(revision.id)}">${escapeHtml(stamp)}</div>\n<div class="legend">`,
+  );
 }

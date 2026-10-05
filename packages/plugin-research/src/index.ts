@@ -5,6 +5,8 @@
  */
 
 export type {
+  AssessmentDirectness,
+  AssessmentRelationship,
   CellRef,
   CellStatus,
   Dimension,
@@ -19,6 +21,8 @@ export type {
   ReportBlock,
   ReportClaim,
   ReportDraftState,
+  ReportGapNote,
+  ReportReviewFlag,
   ReportSection,
   ReportTask,
   ResearchBudget,
@@ -28,9 +32,63 @@ export type {
   ResearchUsage,
   Source,
   Subject,
+  SupportAssessment,
   TaskStatus,
 } from "./domain.js";
-export { DEFAULT_BUDGET, deriveCellCoverage, emptyUsage, ID_PREFIX, isCellRef } from "./domain.js";
+export {
+  DEFAULT_BUDGET,
+  deriveCellCoverage,
+  emptyUsage,
+  ID_PREFIX,
+  isCellRef,
+  isCovered,
+  needsAttention,
+} from "./domain.js";
+
+export { canonicalJson, hashOf } from "./hash.js";
+
+export {
+  capabilitiesFor,
+  classifyIntent,
+  createGrant,
+  grantHasCapability,
+  type ActionCapability,
+  type ActionGrant,
+  type ActionIntent,
+  type AssistantIntent,
+  type GrantBudget,
+  type GrantInput,
+  type GrantTargetType,
+  type IntentReading,
+} from "./semantics.js";
+
+export {
+  applyProposal,
+  checkProposalFreshness,
+  contentOf,
+  createProposal,
+  sectionHash,
+  type Proposal,
+  type ProposalBase,
+  type ProposalSection,
+  type ProposalStatus,
+  type ProposalTarget,
+} from "./proposal.js";
+
+export {
+  blockText,
+  buildRevisionBundle,
+  DEFAULT_THEME_ID,
+  isFrozenRevision,
+  RENDERER,
+  reportContentOf,
+  type FrozenEvidenceRef,
+  type FrozenFrame,
+  type FrozenGap,
+  type FrozenRevision,
+  type FrozenSourceRef,
+  type RevisionBundleInput,
+} from "./revision.js";
 
 export { openResearchRepository, newId, type ResearchRepository } from "./repository.js";
 
@@ -73,21 +131,27 @@ export {
 
 export {
   buildCitations,
+  evidenceUsedBy,
+  gapNotesOf,
   locatorLabel,
   missingCells,
+  reportContentHash,
   sealReport,
   validateReport,
+  type CitationEvidence,
   type Citations,
+  type CitationSource,
   type ReportDraft,
   type ValidationResult,
 } from "./report.js";
 
-export { escapeHtml, renderReportHtml, REPORT_CSS, type RenderInput } from "./render.js";
+export { escapeHtml, renderReportHtml, renderRevisionHtml, REPORT_CSS, type RenderInput } from "./render.js";
 export { exportHtmlToPdf, findPdfBrowser, type PdfExportOptions, type PdfExportResult } from "./pdf.js";
 
 export {
   createResearchService,
   SECTION_IDS,
+  type AcceptProposalResult,
   type AssessResult,
   type CellView,
   type ReadResult,

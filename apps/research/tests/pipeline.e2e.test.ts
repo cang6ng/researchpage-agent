@@ -271,6 +271,9 @@ function scriptedResearchModel(): { readonly client: ModelClient; readonly calls
             evidenceIds: reads
               .filter((result) => String(result.value["sourceId"]) === sources[index]?.sourceId)
               .flatMap((result) => ((result.value["evidence"] ?? []) as { evidenceId: string }[]).map((item) => item.evidenceId)),
+            relationship: "supports",
+            directness: "direct",
+            scope: `${subject.name} 的构建步骤有正文片段直接描述。`,
             note: `${subject.name} 的构建步骤有正文片段支持。`,
           }));
           return next(call("assess_coverage", { proposals }));
@@ -325,7 +328,13 @@ function scriptedResearchModel(): { readonly client: ModelClient; readonly calls
             evidenceIds: reads
               .flatMap((result) => ((result.value["evidence"] ?? []) as { evidenceId: string }[]).map((item) => item.evidenceId))
               .slice(0, 2),
-            note: `${subject.name} 的检索机制说明。`,
+            // A real model reading a passage about evaluation settings cannot
+            // claim those settings answer the retrieval question: this cell is
+            // recorded as indirect support, and stays "limited" because of it.
+            relationship: "supports",
+            directness: "indirect",
+            scope: "片段描述的是评测设置，与检索机制只是间接相关。",
+            note: `${subject.name} 的检索机制说明（间接）。`,
           }));
           return next(call("assess_coverage", { proposals, gapRound: true }));
         }
@@ -527,6 +536,7 @@ interface Bundle {
   readonly subjects: readonly { readonly id: string; readonly name: string }[];
   readonly dimensions: readonly { readonly id: string; readonly name: string }[];
   readonly matrix: readonly { readonly status: string; readonly evidenceIds: readonly string[]; readonly subjectName: string; readonly dimensionName: string }[];
+  readonly assessments: readonly { readonly assessmentId: string; readonly relationship: string; readonly directness: string }[];
   readonly sources: readonly {
     readonly sourceId: string;
     readonly readStatus: string;
@@ -617,6 +627,11 @@ describe("the product, end to end, offline", () => {
 
     // 5. Evidence exists, is bound to cells, and the matrix was derived from it.
     expect(bundle.evidence.length).toBeGreaterThan(0);
+    // Every judgement the run recorded is stored as its own object, with the
+    // relationship and directness a reader can check.
+    expect(bundle.assessments.length).toBeGreaterThan(0);
+    expect(bundle.assessments.some((entry) => entry.directness === "direct")).toBe(true);
+    expect(bundle.assessments.some((entry) => entry.directness === "indirect")).toBe(true);
     for (const item of bundle.evidence) {
       const text = app.service.snapshotTextOf(
         app.service.evidenceOf(taskId).find((candidate) => candidate.id === item.evidenceId)!.readId,
@@ -625,11 +640,15 @@ describe("the product, end to end, offline", () => {
       const stored = app.service.evidenceOf(taskId).find((candidate) => candidate.id === item.evidenceId)!;
       expect(text!.slice(stored.locator.charStart, stored.locator.charEnd)).toBe(item.excerpt);
     }
-    const sufficient = bundle.matrix.filter((cell) => cell.status === "sufficient");
-    expect(sufficient.length).toBeGreaterThan(0);
-    expect(sufficient.every((cell) => cell.evidenceIds.length > 0)).toBe(true);
+    const reviewed = bundle.matrix.filter((cell) => cell.status === "reviewed");
+    expect(reviewed.length, "a directly assessed cell must reach reviewed").toBeGreaterThan(0);
+    expect(reviewed.every((cell) => cell.evidenceIds.length > 0)).toBe(true);
     // The cells nobody read for stay missing — no optimistic green.
     expect(bundle.matrix.some((cell) => cell.status === "missing")).toBe(true);
+    // And a cell with an indirect judgement is not green either.
+    expect(bundle.matrix.some((cell) => cell.status === "limited")).toBe(true);
+    const LEGACY_STATUSES = ["sufficient", "partial", "evaluating"];
+    expect(bundle.matrix.every((cell) => !LEGACY_STATUSES.includes(cell.status))).toBe(true);
 
     // 6. The report is validated, its claims point at real evidence only.
     const current = bundle.reports.find((report) => report.isCurrent);
@@ -670,6 +689,10 @@ describe("the product, end to end, offline", () => {
   it("refuses a report that cites evidence which does not exist", async () => {
     const tasks = JSON.parse((await get("/api/research/tasks")).text) as { tasks: readonly { id: string }[] };
     const taskId = tasks.tasks[0]!.id;
+    // An authorized report action, so what refuses this draft is the citation
+    // rule and not the permission check in front of it.
+    const task = app.service.getTask(taskId)!;
+    app.service.issueGrant({ sessionId: task.sessionId, intent: "draft", taskId, allowResearch: false });
     const result = app.service.saveReport(taskId, {
       title: "伪造引用测试",
       summary: "这份报告引用了不存在的证据。",

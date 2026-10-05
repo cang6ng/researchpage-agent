@@ -14,7 +14,20 @@
  * program's business — the same numbers serve the screen and the PDF.
  */
 
-import type { Evidence, MatrixCell, Report, ReportBlock, ReportClaim, ReportSection, ReportTask, Source } from "./domain.js";
+import type {
+  Evidence,
+  MatrixCell,
+  ReadScope,
+  Report,
+  ReportBlock,
+  ReportClaim,
+  ReportGapNote,
+  ReportSection,
+  ReportTask,
+  Source,
+} from "./domain.js";
+import { hashOf } from "./hash.js";
+import { needsAttention } from "./domain.js";
 
 export interface ReportDraft {
   readonly title: string;
@@ -129,10 +142,107 @@ export function validateReport(input: ValidationInput): ValidationResult {
   return { ok: problems.length === 0, problems, now: input.now } as ValidationResult;
 }
 
+/**
+ * The hash a proposal pins and a revision records.
+ *
+ * It covers the report's own content — wording, claims, their evidence ids —
+ * and deliberately not its validation stamp or timestamps, so "the text is
+ * unchanged" means exactly that.
+ */
+export function reportContentHash(report: {
+  readonly title: string;
+  readonly summary: string;
+  readonly sections: readonly ReportSection[];
+  readonly claims: readonly ReportClaim[];
+}): string {
+  return hashOf({
+    title: report.title,
+    summary: report.summary,
+    sections: report.sections,
+    claims: report.claims,
+  });
+}
+
+/**
+ * The evidence a report's text actually stands on, in order of first use.
+ *
+ * Only evidence a block's claim cites counts: material that was found but never
+ * quoted is not part of the document, and must not reach a reference list or a
+ * frozen dependency bundle.
+ */
+export function evidenceUsedBy(draft: {
+  readonly sections: readonly ReportSection[];
+  readonly claims: readonly ReportClaim[];
+}): readonly string[] {
+  const claimById = new Map(draft.claims.map((claim) => [claim.id, claim]));
+  const used: string[] = [];
+  const seen = new Set<string>();
+  for (const section of draft.sections) {
+    for (const block of blocksOf(section)) {
+      for (const claimId of blockClaimIds(block)) {
+        const claim = claimById.get(claimId);
+        if (claim === undefined) continue;
+        for (const evidenceId of claim.evidenceIds) {
+          if (seen.has(evidenceId)) continue;
+          seen.add(evidenceId);
+          used.push(evidenceId);
+        }
+      }
+    }
+  }
+  return used;
+}
+
+/** The gap appendix as it stood at save time, with reader-facing names copied in. */
+export function gapNotesOf(task: ReportTask): readonly ReportGapNote[] {
+  const subjectNames = new Map(task.subjects.map((subject) => [subject.id, subject.name]));
+  const dimensionNames = new Map(task.dimensions.map((dimension) => [dimension.id, dimension.name]));
+  return task.matrix
+    .filter((cell) => cell.status !== "reviewed")
+    .map((cell) => ({
+      sectionId: cell.sectionId,
+      subjectId: cell.subjectId,
+      subjectName: subjectNames.get(cell.subjectId) ?? cell.subjectId,
+      dimensionId: cell.dimensionId,
+      dimensionName: dimensionNames.get(cell.dimensionId) ?? cell.dimensionId,
+      status: cell.status,
+      reason: cell.reason,
+      gap: cell.gap.length > 0 ? cell.gap : cell.reason,
+    }));
+}
+
+/**
+ * The source fields a citation needs.
+ *
+ * Deliberately narrower than `Source`: a source read back from the business
+ * database and a source copied into a frozen revision both satisfy it, which is
+ * what lets one renderer serve the live preview and an archived export.
+ */
+export interface CitationSource {
+  readonly id: string;
+  readonly title: string;
+  readonly authors: readonly string[];
+  readonly org: string;
+  readonly venue: string;
+  readonly publishedAt: string | null;
+  readonly url: string;
+  readonly doi: string | null;
+  readonly readScope: ReadScope | null;
+}
+
+/** The evidence fields a citation needs, for the same reason. */
+export interface CitationEvidence {
+  readonly id: string;
+  readonly sourceId: string;
+  readonly excerpt: string;
+  readonly readScope: ReadScope;
+  readonly locator: { readonly headingPath: readonly string[]; readonly paragraphIndex: number };
+}
+
 export interface CitationReference {
   readonly number: number;
   readonly sourceId: string;
-  readonly source: Source;
+  readonly source: CitationSource;
 }
 
 export interface EvidenceIndexEntry {
@@ -140,7 +250,7 @@ export interface EvidenceIndexEntry {
   readonly evidenceId: string;
   readonly sourceId: string;
   readonly excerpt: string;
-  readonly scope: string;
+  readonly scope: ReadScope;
   readonly headingPath: readonly string[];
   readonly paragraphIndex: number;
 }
@@ -163,28 +273,13 @@ export interface Citations {
  */
 export function buildCitations(input: {
   readonly draft: ReportDraft;
-  readonly sources: readonly Source[];
-  readonly evidence: readonly Evidence[];
+  readonly sources: readonly CitationSource[];
+  readonly evidence: readonly CitationEvidence[];
 }): Citations {
   const sourceById = new Map(input.sources.map((source) => [source.id, source]));
   const evidenceById = new Map(input.evidence.map((item) => [item.id, item]));
-  const claimById = new Map(input.draft.claims.map((claim) => [claim.id, claim]));
 
-  const usedEvidenceIds: string[] = [];
-  const usedEvidenceSeen = new Set<string>();
-  for (const section of input.draft.sections) {
-    for (const block of blocksOf(section)) {
-      for (const claimId of blockClaimIds(block)) {
-        const claim = claimById.get(claimId);
-        if (claim === undefined) continue;
-        for (const evidenceId of claim.evidenceIds) {
-          if (usedEvidenceSeen.has(evidenceId)) continue;
-          usedEvidenceSeen.add(evidenceId);
-          usedEvidenceIds.push(evidenceId);
-        }
-      }
-    }
-  }
+  const usedEvidenceIds = evidenceUsedBy(input.draft);
 
   const numberBySource = new Map<string, number>();
   const references: CitationReference[] = [];
@@ -229,7 +324,7 @@ export function buildCitations(input: {
 
 /** The cells a report still owes an answer for, as the reader should see them. */
 export function missingCells(task: ReportTask): readonly MatrixCell[] {
-  return task.matrix.filter((cell) => cell.status === "missing" || cell.status === "partial");
+  return task.matrix.filter((cell) => needsAttention(cell.status));
 }
 
 /**
@@ -276,8 +371,13 @@ export function sealReport(input: {
   readonly draft: ReportDraft;
   readonly validation: ValidationResult;
   readonly now: string;
+  /**
+   * The task's matrix at this moment. Its outstanding cells become the report's
+   * own gap appendix, so a document never shows gaps that were found later.
+   */
+  readonly task?: ReportTask;
 }): Report {
-  return {
+  const report: Report = {
     id: input.id,
     taskId: input.taskId,
     title: input.draft.title,
@@ -286,5 +386,7 @@ export function sealReport(input: {
     claims: input.draft.claims,
     validation: { ok: input.validation.ok, problems: input.validation.problems, checkedAt: input.now },
     createdAt: input.now,
+    contentHash: reportContentHash(input.draft),
   };
+  return input.task === undefined ? report : { ...report, gapsAtSave: gapNotesOf(input.task) };
 }

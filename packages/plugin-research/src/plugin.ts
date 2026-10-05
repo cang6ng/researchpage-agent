@@ -43,7 +43,7 @@ export function createResearchPlugin(options: ResearchPluginOptions): ResearchPl
       name: "ResearchPage 研究插件",
       version: "0.1.0",
       description:
-        "结构驱动的研究工具：真实检索（arXiv）、真实读取与证据、证据矩阵、缺口补查与结构化报告。" +
+        "结构驱动的研究工具：真实检索（arXiv）、真实读取与证据、支持评估与证据矩阵、缺口补查、结构化报告与局部修改提案。" +
         "Writing a report only from really read excerpts.",
     },
     activate(context) {

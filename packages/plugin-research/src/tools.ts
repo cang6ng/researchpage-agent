@@ -81,6 +81,15 @@ function asCellRef(value: unknown, fallbackSection?: string): CellRef | undefine
   return { sectionId, subjectId, dimensionId };
 }
 
+/** Reads a relationship, keeping unknown values out rather than guessing one. */
+function asRelationship(value: unknown): "supports" | "contradicts" | "contextual" | undefined {
+  return value === "supports" || value === "contradicts" || value === "contextual" ? value : undefined;
+}
+
+function asDirectness(value: unknown): "direct" | "indirect" | "contextual" | "unassessed" | undefined {
+  return value === "direct" || value === "indirect" || value === "contextual" || value === "unassessed" ? value : undefined;
+}
+
 function refuse(message: string, guidance: string): string {
   return boundedJson({ ok: false, problem: message, guidance });
 }
@@ -304,9 +313,12 @@ export function createResearchTools(service: ResearchService): ResearchTools {
   const assessCoverage: Tool = {
     name: "assess_coverage",
     description:
-      "评估证据矩阵覆盖情况：提交每个单元格的支持理由（可把已有 evidenceId 绑定到该单元格），工具校验后保存矩阵。" +
-      "单元格状态由程序根据真实证据的读取范围推导（正文级 → sufficient，仅摘要 → partial，无证据 → missing），模型不能直接指定状态。" +
-      "返回尚未覆盖的格子，用于决定是否定向补查（gapRound=true 表示开始一轮定向补查，受轮次预算限制）。",
+      "保存对证据矩阵的支持评估：对每个单元格说明「已有片段如何支持/反对/仅作为背景」，并给出直接性与适用条件。" +
+      "必须分别提交 relationship（supports/contradicts/contextual）与 directness（direct/indirect/contextual/unassessed）：" +
+      "只有「supports + direct + 正文级片段」才会把单元格推进到 reviewed（已核对，不表示结论已被证明为真）；" +
+      "只绑定证据而不给评估，单元格停留在 unassessed（有片段，待核对）。" +
+      "单元格状态始终由程序根据真实证据与已保存评估推导，模型不能直接指定状态。" +
+      "返回尚未达到 reviewed 的格子，用于决定是否定向补查（gapRound=true 表示开始一轮定向补查，受轮次预算限制）。",
     inputSchema: {
       type: "object",
       properties: {
@@ -325,10 +337,21 @@ export function createResearchTools(service: ResearchService): ResearchTools {
                 },
                 required: ["subjectId", "dimensionId"],
               },
-              evidenceIds: { type: "array", items: { type: "string" }, description: "支持该单元格的 evidenceId" },
-              note: { type: "string", description: "你的判断说明（不影响状态推导）" },
+              evidenceIds: { type: "array", items: { type: "string" }, description: "支持/反对该单元格的 evidenceId" },
+              relationship: {
+                type: "string",
+                enum: ["supports", "contradicts", "contextual"],
+                description: "该片段与这个单元格问题的关系",
+              },
+              directness: {
+                type: "string",
+                enum: ["direct", "indirect", "contextual", "unassessed"],
+                description: "该片段是否直接涉及所问的对象、关系和条件；不确定就写 unassessed",
+              },
+              scope: { type: "string", description: "支持成立的适用范围与条件（例如「仅作者自报，未与共同口径对比」）" },
+              note: { type: "string", description: "理由，会作为评估的 rationale 保存" },
             },
-            required: ["cell"],
+            required: ["cell", "evidenceIds", "relationship", "directness"],
           },
         },
         gapRound: { type: "boolean", description: "这一轮是否算作定向补查轮" },
@@ -340,17 +363,32 @@ export function createResearchTools(service: ResearchService): ResearchTools {
       if (binding === undefined) return noTask();
       const record = asRecord(input);
       const rawProposals = record === undefined ? undefined : record["proposals"];
-      const proposals: { cell: CellRef; evidenceIds: readonly string[]; note?: string }[] = [];
+      const proposals: {
+        cell: CellRef;
+        evidenceIds: readonly string[];
+        note?: string;
+        relationship?: "supports" | "contradicts" | "contextual";
+        directness?: "direct" | "indirect" | "contextual" | "unassessed";
+        scope?: string;
+        rationale?: string;
+      }[] = [];
       if (Array.isArray(rawProposals)) {
         for (const item of rawProposals) {
           const entry = asRecord(item) ?? {};
           const cell = asCellRef(entry["cell"]);
           if (cell === undefined) continue;
           const note = asString(entry["note"]);
+          const relationship = asRelationship(entry["relationship"]);
+          const directness = asDirectness(entry["directness"]);
+          const scope = asString(entry["scope"]);
           proposals.push({
             cell,
             evidenceIds: asStringArray(entry["evidenceIds"]),
             ...(note === undefined ? {} : { note }),
+            ...(relationship === undefined ? {} : { relationship }),
+            ...(directness === undefined ? {} : { directness }),
+            ...(scope === undefined ? {} : { scope }),
+            ...(note === undefined ? {} : { rationale: note }),
           });
         }
       }
@@ -387,6 +425,7 @@ export function createResearchTools(service: ResearchService): ResearchTools {
     name: "save_report",
     description:
       "保存结构化研究报告（不是 HTML）。报告 = title + summary + sections（blocks：paragraph/list/table/callout）+ claims（每条 claim 绑定真实 evidenceId）。" +
+      "只能在被授权撰写报告的阶段调用（生成报告）；Research 动作只有补查权限，Edit 动作只能提交修改提案。" +
       "单次调用的输出有限（约 4096 tokens），长报告请分次提交：" +
       '先 {part:"start", title, summary}，再 {part:"write", claims:[...]}，' +
       '然后每节一次 {part:"write", section:{...}}（必需章节 overview/representative/comparison/limitations，可选 background/conditions/reading），' +
@@ -528,7 +567,94 @@ export function createResearchTools(service: ResearchService): ResearchTools {
     },
   };
 
-  const tools = [proposeTask, searchSources, readSource, assessCoverage, loadResearchState, saveReport];
+  const proposeSectionEdit: Tool = {
+    name: "propose_section_edit",
+    description:
+      "对报告的一个章节生成修改提案（Edit）。本工具不会修改报告正文：它保存旧内容 hash、目标章节、替换内容与理由，" +
+      "由用户在界面上接受后才产生新的报告版本。只在被授权 Edit 的动作中可用；目标章节必须与本次授权的目标一致。" +
+      "如果需要改动摘要，必须额外提供 summary 字段（摘要会被显式列为目标，不会因为改动一个章节而被顺手重写）。" +
+      "新引入的论断必须引用真实存在的 evidenceId。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        section: {
+          type: "object",
+          description: "目标章节的替换内容 {id, title, blocks}，block 形状与 save_report 相同",
+          properties: {
+            id: { type: "string" },
+            title: { type: "string" },
+            blocks: { type: "array", items: { type: "object" } },
+          },
+          required: ["id", "title", "blocks"],
+        },
+        claims: {
+          type: "array",
+          description: "提案新增或替换的 claim（其余 claim 保持不变）",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              text: { type: "string" },
+              evidenceIds: { type: "array", items: { type: "string" } },
+              kind: { type: "string", enum: ["fact", "comparison", "inference"] },
+            },
+            required: ["id", "text", "evidenceIds"],
+          },
+        },
+        summary: { type: "string", description: "仅当需要同步修改摘要时提供" },
+        reason: { type: "string", description: "为什么提出这次修改（一两句话）" },
+      },
+      required: ["section", "reason"],
+    },
+    async execute(input, context) {
+      const binding = taskFor(context.sessionId);
+      if (binding === undefined) return noTask();
+      const grant = service.activeGrant(context.sessionId);
+      if (grant === undefined || !grant.capabilities.includes("proposal")) {
+        return refuse(
+          "本次动作没有修改授权（Edit）。",
+          "Ask 只回答问题，Research 只增加材料；要修改报告请由用户在界面发起 Edit 动作并指定目标章节。",
+        );
+      }
+      const record = asRecord(input);
+      const sectionRecord = asRecord(record?.["section"]);
+      if (sectionRecord === undefined) return refuse("缺少 section", "请给出目标章节 {id,title,blocks}。");
+      const reason = asString(record?.["reason"]);
+      if (reason === undefined) return refuse("缺少 reason", "请说明这次修改的理由。");
+
+      const section = {
+        id: asString(sectionRecord["id"]) ?? "",
+        title: asString(sectionRecord["title"]) ?? "",
+        blocks: (Array.isArray(sectionRecord["blocks"]) ? sectionRecord["blocks"] : []).map((block) => normalizeBlock(block)),
+      };
+      if (section.id === "" || section.blocks.length === 0) {
+        return refuse("section 不完整", "请提供章节 id 与至少一个 block。");
+      }
+      const claims = Array.isArray(record?.["claims"]) ? record!["claims"].map(readClaim) : [];
+      const summary = asString(record?.["summary"]);
+
+      const result = service.createProposal(binding.taskId, {
+        actionId: grant.id,
+        sections: [section],
+        claims,
+        ...(summary === undefined ? {} : { summary }),
+        reason,
+      });
+      if (!result.ok) return boundedJson({ ok: false, problems: result.problems, guidance: result.guidance });
+      const proposal = result.proposal;
+      return boundedJson({
+        ok: true,
+        proposalId: proposal.id,
+        status: proposal.status,
+        baseReportId: proposal.baseReportId,
+        targets: proposal.targets.map((target) => target.targetId),
+        note: "修改提案已保存，报告正文未改变。请在界面上选择「接受」或「放弃」。",
+        next: "不要再次提交同一章节的提案；等待用户决定。",
+      });
+    },
+  };
+
+  const tools = [proposeTask, searchSources, readSource, assessCoverage, loadResearchState, saveReport, proposeSectionEdit];
   const byName: Record<string, Tool> = {};
   for (const tool of tools) byName[tool.name] = tool;
   return { tools, byName };

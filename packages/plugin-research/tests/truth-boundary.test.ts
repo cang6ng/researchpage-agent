@@ -50,17 +50,75 @@ describe("coverage derivation", () => {
     expect(verdict.evidenceIds).toEqual([]);
   });
 
-  it("is partial when only an abstract was read", () => {
-    const verdict = deriveCellCoverage(cell, [evidenceAt({ id: "ev_abs", scope: "abstract", cells: [cell] })]);
-    expect(verdict.status).toBe("partial");
-    expect(verdict.reason).toContain("摘要");
+  it("does not call a body passage an answer: material without a judgement is unassessed", () => {
+    const verdict = deriveCellCoverage(cell, [evidenceAt({ id: "ev_body", scope: "body_excerpt", cells: [cell] })]);
+    expect(verdict.status).toBe("unassessed");
+    expect(verdict.evidenceIds).toEqual(["ev_body"]);
     expect(verdict.gap.length).toBeGreaterThan(0);
   });
 
-  it("is sufficient only when body text was read for this cell", () => {
-    const verdict = deriveCellCoverage(cell, [evidenceAt({ id: "ev_body", scope: "body_excerpt", cells: [cell] })]);
-    expect(verdict.status).toBe("sufficient");
+  it("does not call an abstract an answer either", () => {
+    const verdict = deriveCellCoverage(cell, [evidenceAt({ id: "ev_abs", scope: "abstract", cells: [cell] })]);
+    expect(verdict.status).toBe("unassessed");
+  });
+
+  it("becomes limited when the judgement is indirect or only contextual", () => {
+    const indirect = deriveCellCoverage(
+      cell,
+      [evidenceAt({ id: "ev_body", scope: "full_text", cells: [cell] })],
+      [{ target: cell, evidenceIds: ["ev_body"], relationship: "supports", directness: "indirect" }],
+    );
+    expect(indirect.status).toBe("limited");
+    expect(indirect.reason).toContain("间接");
+
+    const unjudged = deriveCellCoverage(
+      cell,
+      [evidenceAt({ id: "ev_body", scope: "full_text", cells: [cell] })],
+      [{ target: cell, evidenceIds: ["ev_body"], relationship: "supports", directness: "unassessed" }],
+    );
+    expect(unjudged.status).toBe("limited");
+  });
+
+  it("stays limited when only an abstract was judged", () => {
+    const verdict = deriveCellCoverage(
+      cell,
+      [evidenceAt({ id: "ev_abs", scope: "abstract", cells: [cell] })],
+      [{ target: cell, evidenceIds: ["ev_abs"], relationship: "supports", directness: "direct" }],
+    );
+    expect(verdict.status).toBe("limited");
+    expect(verdict.reason).toContain("摘要");
+  });
+
+  it("is reviewed only for a direct, supportive judgement about body text", () => {
+    const verdict = deriveCellCoverage(
+      cell,
+      [evidenceAt({ id: "ev_body", scope: "body_excerpt", cells: [cell] })],
+      [{ target: cell, evidenceIds: ["ev_body"], relationship: "supports", directness: "direct" }],
+    );
+    expect(verdict.status).toBe("reviewed");
     expect(verdict.evidenceIds).toEqual(["ev_body"]);
+  });
+
+  it("reports a contradiction as conflict rather than averaging it away", () => {
+    const verdict = deriveCellCoverage(
+      cell,
+      [evidenceAt({ id: "ev_body", scope: "full_text", cells: [cell] })],
+      [
+        { target: cell, evidenceIds: ["ev_body"], relationship: "supports", directness: "direct" },
+        { target: cell, evidenceIds: ["ev_body"], relationship: "contradicts", directness: "direct" },
+      ],
+    );
+    expect(verdict.status).toBe("conflict");
+    expect(verdict.gap.length).toBeGreaterThan(0);
+  });
+
+  it("ignores a judgement that names evidence belonging to another cell", () => {
+    const verdict = deriveCellCoverage(
+      cell,
+      [evidenceAt({ id: "ev_body", scope: "full_text", cells: [cell] })],
+      [{ target: cell, evidenceIds: ["ev_somewhere_else"], relationship: "supports", directness: "direct" }],
+    );
+    expect(verdict.status).toBe("unassessed");
   });
 });
 

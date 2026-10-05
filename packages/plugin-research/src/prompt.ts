@@ -13,14 +13,27 @@ import type { ResearchService } from "./service.js";
 
 export const RESEARCH_SYSTEM_PROMPT = `你是 ResearchPage 的研究助手：把模糊的研究主题变成可执行的研究结构，围绕证据缺口主动补查，产出关键结论可以回到实际来源片段的中文研究报告。
 
+每一次动作都有明确的意图与授权，由应用签发，不由你选择：
+- Ask（问一问）：只读取当前项目材料回答，不写入任何正式数据；如果只读查询发现相关材料，说明「发现相关材料，是否转为 Research？」，不要悄悄加入来源。
+- Research（补查）：可以检索、读取、保存来源与证据、保存支持评估；不能修改报告正文。
+- Edit（修改）：只能针对指定目标提交修改提案，不能直接改写报告；被授权时可以先做目标相关的有界补查（见「检索与读取」描述）。
+- 生成报告：只有该阶段被授权调用 save_report。
+
 工作顺序（严格遵守）：
 1. 用户给出主题后，先调用 propose_task 建立任务卡（比较对象 2–4 个、研究维度 3–6 个）。任务卡未确认前不要检索。
 2. 确认后，用 search_sources 检索真实候选（英文技术关键词）。搜索结果只是 metadata 候选，不是证据，绝不能据此下结论。
 3. 用 read_source 逐个真实读取候选。只有 read_source 返回的 evidenceId 才能引用。读取范围会如实记录：full_text/body_excerpt 是正文级，abstract 是摘要级。
-4. 读取若干来源后调用 assess_coverage，提交每个单元格的支持理由，并查看仍缺少依据的格子。
+4. 读取若干来源后调用 assess_coverage：对每个单元格给出 relationship（supports/contradicts/contextual）、directness（direct/indirect/contextual/unassessed）、适用条件与理由。
+   只绑定证据而不给评估，单元格停在 unassessed；只有「supports + direct + 正文级片段」才会变成 reviewed（已核对，不等于证明为真）；
+   只支持部分范围、间接相关或只有摘要级片段时如实写成 limited/indirect；来源互相矛盾时写 contradicts，保留冲突而不是选一个。
 5. 对最重要的缺口做定向补查（gapRound=true），最多两轮；每轮只处理少数关键缺口。补查后重新 assess_coverage。
 6. 最后调用 save_report 提交结构化报告。报告是数据，不是 HTML：sections + blocks（paragraph/list/table/callout）+ claims，每个 block 用 claimIds 关联 claim，每条 claim 用 evidenceIds 关联真实证据。
    单次输出预算有限（约 4096 tokens）：长报告请分次提交 —— 先 part="start"（title/summary），再 part="write"（claims），然后每节一次 part="write"（section），最后 part="finalize" 校验发布。
+
+修改已有报告（Edit）：
+- 只处理被指定的目标章节；如果新证据会影响摘要，必须把 summary 一并显式提交，不要顺手改写其他章节。
+- 用 propose_section_edit 提交替换内容与理由。提案在用户接受前不改变任何正文；基线已变化时会被拒绝，此时应重新读取当前报告再生成。
+- 不要重复提交同一提案，也不要试图用 save_report 覆盖已有报告。
 
 真实性要求：
 - 只使用工具返回的 id（sourceId / evidenceId）。不要编造 id、页码、引用或结论。
@@ -55,12 +68,12 @@ export function researchTaskBrief(service: ResearchService, sessionId: string, m
   lines.push(`研究维度：${state.dimensions.map((dimension) => `${dimension.name}(${dimension.id})`).join("、") || "（无）"}`);
   lines.push(`报告结构章节：${state.structure.map((section) => `${section.id}=${section.title}`).join("；")}`);
 
-  const counts = { sufficient: 0, partial: 0, missing: 0 };
-  for (const cell of state.cells) counts[cell.status === "evaluating" ? "missing" : cell.status] += 1;
+  const counts = { reviewed: 0, limited: 0, unassessed: 0, conflict: 0, missing: 0 };
+  for (const cell of state.cells) counts[cell.status] += 1;
   lines.push(
-    `矩阵覆盖：sufficient ${counts.sufficient} / partial ${counts.partial} / missing ${counts.missing}（共 ${state.cells.length} 格）`,
+    `矩阵支持状态：reviewed ${counts.reviewed} / limited ${counts.limited} / unassessed ${counts.unassessed} / conflict ${counts.conflict} / missing ${counts.missing}（共 ${state.cells.length} 格）`,
   );
-  const gaps = state.cells.filter((cell) => cell.status !== "sufficient").slice(0, 8);
+  const gaps = state.cells.filter((cell) => cell.status !== "reviewed").slice(0, 8);
   if (gaps.length > 0) {
     lines.push(
       `待补缺口（示例）：${gaps
@@ -78,7 +91,12 @@ export function researchTaskBrief(service: ResearchService, sessionId: string, m
   lines.push(
     `预算：搜索 ${state.usage.searches}/${state.budget.maxSearches}，读取 ${state.usage.reads}/${state.budget.maxReads}，补查轮 ${state.usage.gapRounds}/${state.budget.maxGapRounds}`,
   );
-  if (state.currentReportId !== null) lines.push(`已保存报告：${state.currentReportId}（如需修订可重新 save_report）`);
+  if (state.currentReportId !== null) {
+    lines.push(`已保存报告：${state.currentReportId}（如需修订请走 Modify 提案，不要覆盖保存）`);
+    if (state.reportNeedsReview !== null && state.reportNeedsReview !== undefined) {
+      lines.push(`报告提示：${state.reportNeedsReview.reason}（正文与版本未改变）`);
+    }
+  }
 
   const text = lines.join("\n");
   return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;

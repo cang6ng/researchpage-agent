@@ -28,7 +28,10 @@ import type {
   ReadSnapshot,
   ResearchRunRecord,
   Source,
+  SupportAssessment,
 } from "./domain.js";
+import type { Proposal } from "./proposal.js";
+import type { FrozenRevision } from "./revision.js";
 
 export function newId(prefix: string): string {
   return `${prefix}_${randomBytes(8).toString("hex")}`;
@@ -61,11 +64,32 @@ export interface ResearchRepository {
   getReport(reportId: string): Report | undefined;
   listReports(taskId: string): readonly Report[];
 
+  addAssessment(assessment: SupportAssessment): void;
+  listAssessments(taskId: string): readonly SupportAssessment[];
+
+  saveProposal(proposal: Proposal): void;
+  getProposal(proposalId: string): Proposal | undefined;
+  listProposals(taskId: string): readonly Proposal[];
+
+  saveRevision(revision: FrozenRevision): void;
+  getRevision(revisionId: string): FrozenRevision | undefined;
+  listRevisions(taskId: string): readonly FrozenRevision[];
+
   saveExport(artifact: ExportArtifact): void;
   listExports(taskId: string): readonly ExportArtifact[];
 
   recordRun(record: ResearchRunRecord): void;
   listRuns(taskId: string): readonly ResearchRunRecord[];
+
+  /**
+   * Runs several writes as one unit.
+   *
+   * The one place this product needs it is accepting a proposal, which writes
+   * a report, advances the task and closes the proposal: a crash halfway
+   * through would otherwise leave a task pointing at a report that was never
+   * validated against it. Either every statement lands or none does.
+   */
+  transact<T>(work: () => T): T;
 
   close(): void;
 }
@@ -125,6 +149,29 @@ CREATE TABLE IF NOT EXISTS research_runs (
   started_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS research_runs_task ON research_runs (task_id);
+CREATE TABLE IF NOT EXISTS support_assessments (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS support_assessments_task ON support_assessments (task_id);
+CREATE TABLE IF NOT EXISTS proposals (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS proposals_task ON proposals (task_id);
+CREATE TABLE IF NOT EXISTS report_revisions (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  report_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS report_revisions_task ON report_revisions (task_id);
 `;
 
 export function openResearchRepository(options: { readonly location: string }): ResearchRepository {
@@ -236,7 +283,10 @@ export function openResearchRepository(options: { readonly location: string }): 
 
     saveReport(report: Report): void {
       database
-        .prepare("INSERT INTO reports (id, task_id, payload, created_at) VALUES (?, ?, ?, ?)")
+        .prepare(
+          "INSERT INTO reports (id, task_id, payload, created_at) VALUES (?, ?, ?, ?)" +
+            " ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
+        )
         .run(report.id, report.taskId, JSON.stringify(report), report.createdAt);
     },
     getReport(reportId: string): Report | undefined {
@@ -250,6 +300,57 @@ export function openResearchRepository(options: { readonly location: string }): 
         .prepare("SELECT payload FROM reports WHERE task_id = ? ORDER BY created_at ASC")
         .all(taskId) as { payload: string }[];
       return rows.map((row) => readJson<Report>(row.payload));
+    },
+
+    addAssessment(assessment: SupportAssessment): void {
+      database
+        .prepare("INSERT INTO support_assessments (id, task_id, payload, created_at) VALUES (?, ?, ?, ?)")
+        .run(assessment.id, assessment.taskId, JSON.stringify(assessment), assessment.createdAt);
+    },
+    listAssessments(taskId: string): readonly SupportAssessment[] {
+      const rows = database
+        .prepare("SELECT payload FROM support_assessments WHERE task_id = ? ORDER BY rowid ASC")
+        .all(taskId) as { payload: string }[];
+      return rows.map((row) => readJson<SupportAssessment>(row.payload));
+    },
+
+    saveProposal(proposal: Proposal): void {
+      database
+        .prepare(
+          "INSERT INTO proposals (id, task_id, status, payload, created_at) VALUES (?, ?, ?, ?, ?)" +
+            " ON CONFLICT(id) DO UPDATE SET status = excluded.status, payload = excluded.payload",
+        )
+        .run(proposal.id, proposal.taskId, proposal.status, JSON.stringify(proposal), proposal.createdAt);
+    },
+    getProposal(proposalId: string): Proposal | undefined {
+      const row = database.prepare("SELECT payload FROM proposals WHERE id = ?").get(proposalId) as
+        | { payload: string }
+        | undefined;
+      return row === undefined ? undefined : readJson<Proposal>(row.payload);
+    },
+    listProposals(taskId: string): readonly Proposal[] {
+      const rows = database
+        .prepare("SELECT payload FROM proposals WHERE task_id = ? ORDER BY rowid ASC")
+        .all(taskId) as { payload: string }[];
+      return rows.map((row) => readJson<Proposal>(row.payload));
+    },
+
+    saveRevision(revision: FrozenRevision): void {
+      database
+        .prepare("INSERT INTO report_revisions (id, task_id, report_id, payload, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(revision.id, revision.taskId, revision.reportId, JSON.stringify(revision), revision.createdAt);
+    },
+    getRevision(revisionId: string): FrozenRevision | undefined {
+      const row = database.prepare("SELECT payload FROM report_revisions WHERE id = ?").get(revisionId) as
+        | { payload: string }
+        | undefined;
+      return row === undefined ? undefined : readJson<FrozenRevision>(row.payload);
+    },
+    listRevisions(taskId: string): readonly FrozenRevision[] {
+      const rows = database
+        .prepare("SELECT payload FROM report_revisions WHERE task_id = ? ORDER BY rowid ASC")
+        .all(taskId) as { payload: string }[];
+      return rows.map((row) => readJson<FrozenRevision>(row.payload));
     },
 
     saveExport(artifact: ExportArtifact): void {
@@ -278,6 +379,18 @@ export function openResearchRepository(options: { readonly location: string }): 
         .prepare("SELECT payload FROM research_runs WHERE task_id = ? ORDER BY started_at ASC")
         .all(taskId) as { payload: string }[];
       return rows.map((row) => readJson<ResearchRunRecord>(row.payload));
+    },
+
+    transact<T>(work: () => T): T {
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        const result = work();
+        database.exec("COMMIT");
+        return result;
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
     },
 
     close(): void {

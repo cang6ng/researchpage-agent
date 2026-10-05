@@ -17,8 +17,9 @@
 import { createReadStream, existsSync, statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import type { ResearchService } from "@every-dagent/plugin-research";
-import { exportTaskReportPdf, renderHtmlOf } from "./export.js";
+import type { AssistantIntent, ResearchService } from "@every-dagent/plugin-research";
+import { classifyIntent, needsAttention } from "@every-dagent/plugin-research";
+import { exportRevisionPdf, exportTaskReportPdf, renderHtmlOf, revisionHtmlOf } from "./export.js";
 import type { ResearchRunner } from "./runner.js";
 
 const MAX_BODY_BYTES = 32 * 1024;
@@ -101,6 +102,8 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
   const cells = service.cellsOf(taskId);
   const reports = service.reportsOf(taskId);
   const current = task.currentReportId === null ? undefined : reports.find((report) => report.id === task.currentReportId);
+  const revisions = service.revisionsOf(taskId);
+  const proposals = service.proposalsOf(taskId);
   return {
     task: {
       id: task.id,
@@ -117,6 +120,7 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
       error: task.error,
       createdAt: task.createdAt,
       updatedAt: task.updatedAt,
+      reportNeedsReview: task.reportNeedsReview ?? null,
     },
     structure: task.structure.sections,
     subjects: task.subjects,
@@ -133,7 +137,18 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
       evidenceIds: cell.evidenceIds,
       note: cell.note,
     })),
-    gaps: cells.filter((cell) => cell.status !== "sufficient"),
+    gaps: cells.filter((cell) => needsAttention(cell.status)),
+    assessments: service.assessmentsOf(taskId).map((entry) => ({
+      assessmentId: entry.id,
+      target: entry.target,
+      evidenceIds: entry.evidenceIds,
+      relationship: entry.relationship,
+      directness: entry.directness,
+      scope: entry.scope,
+      rationale: entry.rationale,
+      assessor: entry.assessor,
+      createdAt: entry.createdAt,
+    })),
     sources: service.sourcesOf(taskId).map((source) => ({
       sourceId: source.id,
       title: source.title,
@@ -166,6 +181,8 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
       summary: report.summary,
       createdAt: report.createdAt,
       validation: report.validation,
+      contentHash: report.contentHash ?? null,
+      gapsCaptured: report.gapsAtSave !== undefined,
       isCurrent: report.id === task.currentReportId,
       sections: report.sections.map((section) => ({ id: section.id, title: section.title })),
       claims: report.claims.map((claim) => ({
@@ -175,9 +192,39 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
         evidenceIds: claim.evidenceIds,
       })),
     })),
+    proposals: proposals.map((proposal) => ({
+      proposalId: proposal.id,
+      actionId: proposal.actionId,
+      status: proposal.status,
+      baseReportId: proposal.baseReportId,
+      baseContentHash: proposal.baseContentHash,
+      targets: proposal.targets.map((target) => target.targetId),
+      sections: proposal.sections.map((section) => ({ id: section.id, title: section.title })),
+      reason: proposal.reason,
+      evidenceIds: proposal.evidenceIds,
+      researchAdded: proposal.researchAdded,
+      acceptedReportId: proposal.acceptedReportId,
+      createdAt: proposal.createdAt,
+      decidedAt: proposal.decidedAt,
+    })),
+    revisions: revisions.map((revision) => ({
+      revisionId: revision.id,
+      reportId: revision.reportId,
+      revision: revision.revision,
+      contentHash: revision.contentHash,
+      themeId: revision.themeId,
+      evidenceCount: revision.evidenceRefs.length,
+      sourceCount: revision.sourceRefs.length,
+      gapsCaptured: revision.gapsCaptured,
+      renderer: `${revision.renderer.name}@${revision.renderer.version}`,
+      createdAt: revision.createdAt,
+      isCurrentReport: revision.reportId === task.currentReportId,
+    })),
     exports: service.exportsOf(taskId).map((artifact) => ({
       exportId: artifact.id,
       reportId: artifact.reportId,
+      revisionId: artifact.revisionId ?? null,
+      themeId: artifact.themeId ?? null,
       status: artifact.status,
       bytes: artifact.bytes,
       failure: artifact.failure,
@@ -196,6 +243,8 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
     budget: task.budget,
     usage: task.usage,
     currentReportId: task.currentReportId,
+    currentReportHash: current === undefined ? null : service.contentHashOf(taskId),
+    currentReportFrozen: current !== undefined && revisions.some((revision) => revision.reportId === current.id),
     hasReport: current !== undefined,
     busy,
   };
@@ -320,19 +369,79 @@ export function createResearchRouter(
       return;
     }
 
-    const followId = taskIdOf(path, "/followup");
-    if (followId !== undefined && method === "POST") {
+    // POST /api/research/tasks/:id/assistant {text, intent, targetSectionId} —
+    // one assistant action: Ask answers, Research adds material, Edit proposes.
+    const assistantId = taskIdOf(path, "/assistant");
+    if (assistantId !== undefined && method === "POST") {
       const body = asRecord(await readBody(request));
       const text = typeof body["text"] === "string" ? body["text"].trim() : "";
       if (text.length === 0) {
-        sendJson(response, 400, { error: "追加指令为空" });
+        sendJson(response, 400, { error: "指令为空" });
         return;
       }
-      runner.startFollowUp(followId, text);
-      sendJson(response, 202, { ok: true, started: "followup" });
+      const task = service.getTask(assistantId);
+      if (task === undefined) {
+        sendJson(response, 404, { error: "任务不存在" });
+        return;
+      }
+      const requested = typeof body["intent"] === "string" ? body["intent"] : "auto";
+      const reading =
+        requested === "ask" || requested === "research" || requested === "edit"
+          ? { intent: requested as AssistantIntent, explicit: true, reason: `用户显式选择 ${requested}` }
+          : classifyIntent(text);
+
+      const targetSectionId =
+        typeof body["targetSectionId"] === "string" && body["targetSectionId"].trim().length > 0
+          ? body["targetSectionId"].trim()
+          : null;
+      const report =
+        task.currentReportId === null ? undefined : service.reportsOf(task.id).find((candidate) => candidate.id === task.currentReportId);
+
+      if (reading.intent === "edit" && (report === undefined || targetSectionId === null)) {
+        sendJson(response, 409, {
+          error:
+            report === undefined
+              ? "当前任务还没有报告，无法提出修改"
+              : "请指定要修改的章节（targetSectionId）后再发起 Edit",
+          sections: report?.sections.map((section) => ({ id: section.id, title: section.title })) ?? [],
+        });
+        return;
+      }
+
+      if (reading.intent === "research") {
+        const view = runner.startResearchAction(task.id, {
+          text,
+          reading: reading.reason,
+          allowResearch: true,
+        });
+        if (view === undefined) {
+          sendJson(response, 409, {
+            error: "补查轮次预算已用完，无法开始新的补查；请在报告中如实标注缺口",
+            gapRounds: task.usage.gapRounds,
+            maxGapRounds: task.budget.maxGapRounds,
+          });
+          return;
+        }
+        sendJson(response, 202, { ok: true, started: "research", ...view, reading: reading.reason });
+        return;
+      }
+
+      const view = runner.startAssistant(task.id, {
+        intent: reading.intent,
+        text,
+        targetSectionId,
+        allowResearch: reading.intent === "edit",
+        reading: reading.reason,
+      });
+      if (view === undefined) {
+        sendJson(response, 409, { error: "无法开始该动作（任务或目标章节不存在）" });
+        return;
+      }
+      sendJson(response, 202, { ok: true, started: view.intent, intent: view.intent, scope: view.scope, reading: reading.reason });
       return;
     }
 
+    // POST /api/research/tasks/:id/export — a PDF of the current report, frozen first.
     const exportId = taskIdOf(path, "/export");
     if (exportId !== undefined && method === "POST") {
       const outcome = await exportTaskReportPdf({
@@ -345,7 +454,228 @@ export function createResearchRouter(
         ok: outcome.ok,
         failure: outcome.failure,
         exportId: outcome.artifact?.id,
+        revisionId: outcome.revisionId ?? null,
         bytes: outcome.artifact?.bytes ?? 0,
+      });
+      return;
+    }
+
+    // POST /api/research/tasks/:id/revisions — freeze the report's dependencies.
+    const freezeId = taskIdOf(path, "/revisions");
+    if (freezeId !== undefined && method === "POST") {
+      const body = asRecord(await readBody(request));
+      const task = service.getTask(freezeId);
+      if (task === undefined) {
+        sendJson(response, 404, { error: "任务不存在" });
+        return;
+      }
+      const result = service.freezeRevision({
+        taskId: task.id,
+        ...(typeof body["reportId"] === "string" && body["reportId"].length > 0 ? { reportId: body["reportId"] } : {}),
+        ...(typeof body["expectedContentHash"] === "string" && body["expectedContentHash"].length > 0
+          ? { expectedContentHash: body["expectedContentHash"] }
+          : {}),
+        ...(typeof body["themeId"] === "string" && body["themeId"].length > 0 ? { themeId: body["themeId"] } : {}),
+      });
+      if (!result.ok) {
+        sendJson(response, 409, { error: result.problems.join("；"), guidance: result.guidance, failure: true });
+        return;
+      }
+      sendJson(response, 200, {
+        ok: true,
+        existing: result.existing,
+        revision: {
+          revisionId: result.revision.id,
+          revision: result.revision.revision,
+          reportId: result.revision.reportId,
+          contentHash: result.revision.contentHash,
+          themeId: result.revision.themeId,
+          gapsCaptured: result.revision.gapsCaptured,
+          createdAt: result.revision.createdAt,
+        },
+      });
+      return;
+    }
+
+    // GET /api/research/tasks/:id/assessments — the saved support judgements.
+    const assessId = taskIdOf(path, "/assessments");
+    if (assessId !== undefined && method === "GET") {
+      if (service.getTask(assessId) === undefined) {
+        sendJson(response, 404, { error: "任务不存在" });
+        return;
+      }
+      sendJson(response, 200, {
+        assessments: service.assessmentsOf(assessId).map((entry) => ({
+          assessmentId: entry.id,
+          target: entry.target,
+          evidenceIds: entry.evidenceIds,
+          relationship: entry.relationship,
+          directness: entry.directness,
+          scope: entry.scope,
+          rationale: entry.rationale,
+          assessor: entry.assessor,
+          createdAt: entry.createdAt,
+        })),
+      });
+      return;
+    }
+
+    // POST /api/research/tasks/:id/assessments — a person's own judgement.
+    if (assessId !== undefined && method === "POST") {
+      const body = asRecord(await readBody(request));
+      const cell = asRecord(body["cell"]);
+      const subjectId = typeof cell["subjectId"] === "string" ? cell["subjectId"] : "";
+      const dimensionId = typeof cell["dimensionId"] === "string" ? cell["dimensionId"] : "";
+      const sectionId = typeof cell["sectionId"] === "string" ? cell["sectionId"] : "comparison";
+      if (subjectId === "" || dimensionId === "") {
+        sendJson(response, 400, { error: "缺少单元格坐标（subjectId/dimensionId）" });
+        return;
+      }
+      const recorded = service.recordAssessment(assessId, {
+        target: { sectionId, subjectId, dimensionId },
+        evidenceIds: Array.isArray(body["evidenceIds"]) ? (body["evidenceIds"] as string[]).filter((id) => typeof id === "string") : [],
+        ...(typeof body["relationship"] === "string" ? { relationship: body["relationship"] as never } : {}),
+        ...(typeof body["directness"] === "string" ? { directness: body["directness"] as never } : {}),
+        ...(typeof body["scope"] === "string" ? { scope: body["scope"] } : {}),
+        ...(typeof body["rationale"] === "string" ? { rationale: body["rationale"] } : {}),
+        assessor: "user",
+      });
+      if ("ok" in recorded) {
+        sendJson(response, 409, { error: recorded.problems.join("；"), guidance: recorded.guidance });
+        return;
+      }
+      sendJson(response, 200, { ok: true, assessmentId: recorded.id, relationship: recorded.relationship, directness: recorded.directness });
+      return;
+    }
+
+    // GET /api/research/revisions/:revisionId — the frozen bundle's summary.
+    const revisionMatch = /^\/api\/research\/revisions\/([^/]+)$/.exec(path);
+    if (revisionMatch !== null && method === "GET") {
+      const revision = service.revisionById(revisionMatch[1] ?? "");
+      if (revision === undefined) {
+        sendJson(response, 404, { error: "冻结版本不存在" });
+        return;
+      }
+      sendJson(response, 200, {
+        revision: {
+          revisionId: revision.id,
+          revision: revision.revision,
+          taskId: revision.taskId,
+          reportId: revision.reportId,
+          contentHash: revision.contentHash,
+          themeId: revision.themeId,
+          createdAt: revision.createdAt,
+          renderer: `${revision.renderer.name}@${revision.renderer.version}`,
+          gapsCaptured: revision.gapsCaptured,
+          claimCount: revision.claimsUsed.length,
+          evidenceIds: revision.evidenceRefs.map((ref) => ref.evidenceId),
+          readIds: revision.readIds,
+          sourceIds: revision.sourceRefs.map((ref) => ref.sourceId),
+          assessmentCount: revision.assessments.length,
+        },
+      });
+      return;
+    }
+
+    // GET /api/research/revisions/:revisionId/html — the frozen document.
+    const revisionHtmlMatch = /^\/api\/research\/revisions\/([^/]+)\/html$/.exec(path);
+    if (revisionHtmlMatch !== null && method === "GET") {
+      const revision = service.revisionById(revisionHtmlMatch[1] ?? "");
+      if (revision === undefined) {
+        sendJson(response, 404, { error: "冻结版本不存在" });
+        return;
+      }
+      sendText(response, 200, revisionHtmlOf(service, revision), "text/html; charset=utf-8");
+      return;
+    }
+
+    // POST /api/research/revisions/:revisionId/export — a PDF from the frozen bundle.
+    const revisionExportMatch = /^\/api\/research\/revisions\/([^/]+)\/export$/.exec(path);
+    if (revisionExportMatch !== null && method === "POST") {
+      const revision = service.revisionById(revisionExportMatch[1] ?? "");
+      if (revision === undefined) {
+        sendJson(response, 404, { error: "冻结版本不存在" });
+        return;
+      }
+      const outcome = await exportRevisionPdf({
+        service,
+        reportDir: routeOptions.reportDir,
+        revision,
+        ...(routeOptions.browserPath === undefined ? {} : { browserPath: routeOptions.browserPath }),
+      });
+      sendJson(response, outcome.ok ? 200 : 500, {
+        ok: outcome.ok,
+        failure: outcome.failure,
+        exportId: outcome.artifact?.id,
+        revisionId: revision.id,
+        bytes: outcome.artifact?.bytes ?? 0,
+      });
+      return;
+    }
+
+    // POST /api/research/proposals/:proposalId/accept — apply, exactly once.
+    const acceptMatch = /^\/api\/research\/proposals\/([^/]+)\/accept$/.exec(path);
+    if (acceptMatch !== null && method === "POST") {
+      const body = asRecord(await readBody(request));
+      const result = service.acceptProposal(acceptMatch[1] ?? "", {
+        ...(typeof body["expectedBaseReportId"] === "string" && body["expectedBaseReportId"].length > 0
+          ? { expectedBaseReportId: body["expectedBaseReportId"] }
+          : {}),
+        ...(typeof body["expectedBaseContentHash"] === "string" && body["expectedBaseContentHash"].length > 0
+          ? { expectedBaseContentHash: body["expectedBaseContentHash"] }
+          : {}),
+      });
+      if (!result.ok) {
+        sendJson(response, 409, { ok: false, error: result.problems.join("；"), guidance: result.guidance });
+        return;
+      }
+      sendJson(response, 200, {
+        ok: true,
+        alreadyApplied: result.alreadyApplied,
+        proposalId: result.proposalId,
+        reportId: result.reportId,
+        contentHash: result.contentHash,
+      });
+      return;
+    }
+
+    // POST /api/research/proposals/:proposalId/discard — close it, keep the material.
+    const discardMatch = /^\/api\/research\/proposals\/([^/]+)\/discard$/.exec(path);
+    if (discardMatch !== null && method === "POST") {
+      const result = service.discardProposal(discardMatch[1] ?? "");
+      if (!result.ok) {
+        sendJson(response, 409, { ok: false, error: result.problems.join("；"), guidance: result.guidance });
+        return;
+      }
+      sendJson(response, 200, { ok: true, proposalId: result.proposal.id, status: result.proposal.status });
+      return;
+    }
+
+    // GET /api/research/proposals/:proposalId — one proposal, with its targets.
+    const proposalMatch = /^\/api\/research\/proposals\/([^/]+)$/.exec(path);
+    if (proposalMatch !== null && method === "GET") {
+      const proposal = service.proposalById(proposalMatch[1] ?? "");
+      if (proposal === undefined) {
+        sendJson(response, 404, { error: "修改提案不存在" });
+        return;
+      }
+      sendJson(response, 200, {
+        proposal: {
+          proposalId: proposal.id,
+          actionId: proposal.actionId,
+          taskId: proposal.taskId,
+          status: proposal.status,
+          baseReportId: proposal.baseReportId,
+          baseContentHash: proposal.baseContentHash,
+          targets: proposal.targets,
+          sections: proposal.sections,
+          claims: proposal.claims,
+          reason: proposal.reason,
+          evidenceIds: proposal.evidenceIds,
+          acceptedReportId: proposal.acceptedReportId,
+          createdAt: proposal.createdAt,
+          decidedAt: proposal.decidedAt,
+        },
       });
       return;
     }

@@ -54,6 +54,11 @@ export function Workspace() {
   const [notice, setNotice] = useState<string | null>(null);
   const [topic, setTopic] = useState("");
   const [followUp, setFollowUp] = useState("");
+  // The assistant's entry: which intent the user is asking for, and — for an
+  // Edit — which section it targets. The application turns these into the
+  // action grant the run acts under; the text never carries the permission.
+  const [intent, setIntent] = useState<"auto" | "ask" | "research" | "edit">("auto");
+  const [targetSectionId, setTargetSectionId] = useState<string>("");
   const [working, setWorking] = useState(false);
   const inFlight = useRef(false);
   // The last values the page rendered. Polling is how the workspace stays
@@ -344,6 +349,18 @@ export function Workspace() {
         </section>
 
         <aside className="col col--right">
+          <ProposalPanel
+            bundle={bundle}
+            working={working}
+            onAccept={(proposalId) => void act(() => api.acceptProposal(proposalId), "接受提案")}
+            onDiscard={(proposalId) => void act(() => api.discardProposal(proposalId), "放弃提案")}
+          />
+          <RevisionPanel
+            bundle={bundle}
+            working={working}
+            onFreeze={() => void act(() => api.freeze(bundle!.task.id), "冻结版本")}
+            onExport={(revisionId) => void act(() => api.exportRevision(revisionId), "导出冻结版本")}
+          />
           <InspectorPanel
             bundle={bundle}
             cell={cell}
@@ -361,29 +378,75 @@ export function Workspace() {
 
       {bundle !== null && (
         <footer className="footer">
-          <form
-            className="followup"
-            onSubmit={(event) => {
-              event.preventDefault();
-              const text = followUp.trim();
-              if (text.length === 0) return;
-              setFollowUp("");
-              void act(() => api.followUp(bundle.task.id, text), "追加指令");
-            }}
-          >
-            <input
-              className="followup__input"
-              value={followUp}
-              placeholder="追加指令（例如：把部署成本维度补全；或：重写局限章节）"
+          <div className="followup">
+            <select
+              className="followup__intent"
+              value={intent}
               onChange={(event) => {
-                setFollowUp(event.target.value);
+                setIntent(event.target.value as "auto" | "ask" | "research" | "edit");
               }}
-              data-testid="followup-input"
-            />
-            <button className="btn" type="submit" disabled={working} data-testid="followup-submit">
-              发送指令
-            </button>
-          </form>
+              data-testid="intent-select"
+            >
+              <option value="auto">Auto</option>
+              <option value="ask">Ask</option>
+              <option value="research">Research</option>
+              <option value="edit">Edit</option>
+            </select>
+            {intent === "edit" && (
+              <select
+                className="followup__intent"
+                value={targetSectionId}
+                onChange={(event) => {
+                  setTargetSectionId(event.target.value);
+                }}
+                data-testid="target-select"
+              >
+                <option value="">选择目标章节…</option>
+                {(bundle.reports.find((report) => report.isCurrent)?.sections ?? []).map((section) => (
+                  <option key={section.id} value={section.id}>
+                    {section.title}
+                  </option>
+                ))}
+              </select>
+            )}
+            <form
+              className="followup__form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                const text = followUp.trim();
+                if (text.length === 0) return;
+                setFollowUp("");
+                void act(
+                  () =>
+                    api.assistant(bundle.task.id, {
+                      text,
+                      intent,
+                      ...(intent === "edit" && targetSectionId.length > 0 ? { targetSectionId } : {}),
+                    }),
+                  intent === "ask" ? "提问" : intent === "edit" ? "修改提案" : intent === "research" ? "补查" : "指令",
+                );
+              }}
+            >
+              <input
+                className="followup__input"
+                value={followUp}
+                placeholder={
+                  intent === "ask"
+                    ? "问一个问题（例如：这份材料里 GraphRAG 的检索机制是什么？）"
+                    : intent === "edit"
+                      ? "说明要怎么改这个章节（例如：给本科生讲清楚，简化术语）"
+                      : "追加指令（例如：把部署成本维度补全）"
+                }
+                onChange={(event) => {
+                  setFollowUp(event.target.value);
+                }}
+                data-testid="followup-input"
+              />
+              <button className="btn" type="submit" disabled={working} data-testid="followup-submit">
+                {intent === "ask" ? "提问" : intent === "edit" ? "生成修改建议" : intent === "research" ? "补查" : "发送指令"}
+              </button>
+            </form>
+          </div>
         </footer>
       )}
     </div>
@@ -493,17 +556,19 @@ function CoveragePanel({
   readonly onSelectCell: (cell: { readonly subjectId: string; readonly dimensionId: string }) => void;
 }) {
   if (bundle === null) return null;
-  const counts = { sufficient: 0, partial: 0, missing: 0 };
-  for (const cell of bundle.matrix) counts[cell.status === "evaluating" ? "missing" : cell.status] += 1;
+  const counts = { reviewed: 0, limited: 0, unassessed: 0, conflict: 0, missing: 0 };
+  for (const cell of bundle.matrix) counts[cell.status] += 1;
   const gapRoundsLeft = bundle.budget.maxGapRounds - bundle.usage.gapRounds;
   const canGap = gapRoundsLeft > 0 && bundle.gaps.length > 0 && bundle.task.confirmed && !bundle.busy;
   return (
     <section className="panel">
       <h2 className="panel__title">证据覆盖</h2>
       <div className="coverage">
-        <span className="mark mark--sufficient">● 充分 {counts.sufficient}</span>
-        <span className="mark mark--partial">◐ 部分 {counts.partial}</span>
-        <span className="mark mark--missing">○ 缺失 {counts.missing}</span>
+        <span className="mark mark--sufficient">● 已核对 {counts.reviewed}</span>
+        <span className="mark mark--partial">◐ 有限支持 {counts.limited}</span>
+        <span className="mark mark--partial">◑ 待核对 {counts.unassessed}</span>
+        {counts.conflict > 0 && <span className="mark mark--partial">◆ 冲突 {counts.conflict}</span>}
+        <span className="mark mark--missing">○ 待查 {counts.missing}</span>
       </div>
       {bundle.gaps.length > 0 ? (
         <ul className="gaps">
@@ -676,7 +741,8 @@ function ProgressPanel({
           </tbody>
         </table>
         <p className="legend">
-          ● 有正文级证据（sufficient）｜◐ 仅摘要或部分依据（partial）｜○ 无依据（missing）｜数字为该单元格的证据条数。状态由真实读取范围推导。
+          ● 已核对（reviewed，有直接支持该问题的正文级评估）｜◐ 有限支持（limited）｜◑ 有片段待核对（unassessed）｜◆ 冲突/不可比（conflict）｜○
+          待查（missing）｜数字为该单元格的证据条数。状态由真实证据与已保存的支持评估推导：有片段不等于已核对，reviewed 也不表示结论已被证明为真。
         </p>
       </section>
 
@@ -710,6 +776,144 @@ function ProgressPanel({
         </section>
       )}
     </div>
+  );
+}
+
+/**
+ * The pending modification proposal, if there is one.
+ *
+ * Deliberately small: this round's job is to make the editing contract
+ * reachable from the page — see the proposal, see its target and reason, accept
+ * or discard it. The Report Studio that surrounds it is a later step.
+ */
+function ProposalPanel({
+  bundle,
+  working,
+  onAccept,
+  onDiscard,
+}: {
+  readonly bundle: TaskBundle | null;
+  readonly working: boolean;
+  readonly onAccept: (proposalId: string) => void;
+  readonly onDiscard: (proposalId: string) => void;
+}) {
+  if (bundle === null) return null;
+  const pending = bundle.proposals.filter((proposal) => proposal.status === "pending");
+  if (bundle.proposals.length === 0) return null;
+  return (
+    <section className="panel">
+      <h2 className="panel__title">修改提案</h2>
+      {pending.length === 0 ? (
+        <p className="hint">
+          没有待处理的提案；最近一次：
+          {bundle.proposals.slice(-1)[0]?.status ?? "-"}（{bundle.proposals.slice(-1)[0]?.targets.join("、") ?? "-"}）
+        </p>
+      ) : (
+        pending.map((proposal) => (
+          <div key={proposal.proposalId} className="proposal" data-testid="proposal">
+            <div className="proposal__head">
+              待接受 · 目标 {proposal.sections.map((section) => section.title).join("、") || proposal.targets.join("、")}
+            </div>
+            <p className="hint">{proposal.reason}</p>
+            <p className="hint">
+              基线 {proposal.baseReportId}（hash {proposal.baseContentHash.slice(7, 15)}…）· 引用 {proposal.evidenceIds.length} 条证据
+            </p>
+            <div className="proposal__actions">
+              <button
+                className="btn btn--primary"
+                type="button"
+                disabled={working}
+                onClick={() => {
+                  onAccept(proposal.proposalId);
+                }}
+                data-testid="accept-proposal"
+              >
+                接受修改
+              </button>
+              <button
+                className="btn"
+                type="button"
+                disabled={working}
+                onClick={() => {
+                  onDiscard(proposal.proposalId);
+                }}
+                data-testid="discard-proposal"
+              >
+                放弃
+              </button>
+            </div>
+            <p className="hint">接受只改变上面列出的目标；已获取的来源与证据不会因为放弃而删除。</p>
+          </div>
+        ))
+      )}
+    </section>
+  );
+}
+
+/**
+ * Frozen revisions: the exportable versions of this report.
+ *
+ * A frozen revision is the only thing an export may be rendered from, so the
+ * panel's job is to say which versions exist and hand out their files.
+ */
+function RevisionPanel({
+  bundle,
+  working,
+  onFreeze,
+  onExport,
+}: {
+  readonly bundle: TaskBundle | null;
+  readonly working: boolean;
+  readonly onFreeze: () => void;
+  readonly onExport: (revisionId: string) => void;
+}) {
+  if (bundle === null || bundle.currentReportId === null) return null;
+  const forCurrent = bundle.revisions.filter((revision) => revision.isCurrentReport);
+  return (
+    <section className="panel">
+      <h2 className="panel__title">报告版本</h2>
+      <p className="hint">
+        当前报告 {bundle.currentReportId}
+        {bundle.currentReportHash === null ? "" : `（hash ${bundle.currentReportHash.slice(7, 15)}…）`}
+        {bundle.currentReportFrozen ? " · 已冻结" : " · 尚未冻结"}
+      </p>
+      {bundle.task.reportNeedsReview !== null && (
+        <p className="hint hint--warn">{bundle.task.reportNeedsReview.reason}（正文未改变）</p>
+      )}
+      <button
+        className="btn"
+        type="button"
+        disabled={working}
+        onClick={() => {
+          onFreeze();
+        }}
+        data-testid="freeze-revision"
+      >
+        冻结当前版本
+      </button>
+      <ul className="gaps">
+        {forCurrent.map((revision) => (
+          <li key={revision.revisionId}>
+            R{revision.revision} · {revision.evidenceCount} 条证据 · 主题 {revision.themeId}
+            {revision.gapsCaptured ? "" : " · 未记录缺口快照"}{" "}
+            <button
+              className="linklike"
+              type="button"
+              disabled={working}
+              onClick={() => {
+                onExport(revision.revisionId);
+              }}
+              data-testid={`export-revision-${revision.revision}`}
+            >
+              导出 PDF
+            </button>{" "}
+            <a className="linklike" href={api.revisionHtmlUrl(revision.revisionId)} target="_blank" rel="noreferrer">
+              查看冻结版本
+            </a>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

@@ -19,13 +19,15 @@
 import type { Client } from "@every-dagent/client";
 import type { LiveItem } from "@every-dagent/protocol";
 import type {
+  ActionGrant,
+  AssistantIntent,
   MatrixCell,
   ReportTask,
   ResearchRunRecord,
   ResearchService,
   ResearchStage,
 } from "@every-dagent/plugin-research";
-import { ID_PREFIX, newId } from "@every-dagent/plugin-research";
+import { ID_PREFIX, needsAttention, newId } from "@every-dagent/plugin-research";
 
 export interface ResearchRunnerOptions {
   readonly client: Client;
@@ -35,6 +37,26 @@ export interface ResearchRunnerOptions {
   /** Called when the runner wants to export the report the moment it exists. */
   readonly exportPdf?: (taskId: string) => Promise<{ readonly ok: boolean; readonly failure?: string }>;
   readonly log?: (message: string) => void;
+}
+
+/** What the application decided about one user instruction, before it runs. */
+export interface AssistantActionInput {
+  readonly intent: AssistantIntent;
+  readonly text: string;
+  /** The section an Edit is aimed at; required for Edit, ignored otherwise. */
+  readonly targetSectionId?: string | null;
+  /** Whether this action may search and read. Ask never does. */
+  readonly allowResearch?: boolean;
+  /** Why the application read the instruction that way. */
+  readonly reading: string;
+}
+
+export interface AssistantActionView {
+  readonly intent: AssistantIntent;
+  readonly targetType: "project" | "section";
+  readonly targetId: string | null;
+  readonly scope: string;
+  readonly allowResearch: boolean;
 }
 
 export interface ResearchRunner {
@@ -52,8 +74,27 @@ export interface ResearchRunner {
   startGapRound(taskId: string): void;
   /** Write and save the report. */
   startReport(taskId: string): void;
-  /** A user's follow-up instruction, run against the existing task. */
-  startFollowUp(taskId: string, text: string): void;
+  /**
+   * Asks the assistant something, or asks it for a scoped edit.
+   *
+   * The application has already decided the intent and, for an Edit, the
+   * target; this issues the grant those permissions turn into and starts the
+   * run under it. A caller cannot ask for an intent the product does not have,
+   * because the intent decides which writes the service will accept.
+   */
+  startAssistant(taskId: string, input: AssistantActionInput): AssistantActionView | undefined;
+  /**
+   * A user-asked research action on a task that already exists.
+   *
+   * It runs under the same budget a gap round does, and — critically — a task
+   * that already has a report does not get a new one written at the end: the
+   * material changes, the report is marked for review, and its text and hash
+   * stay exactly as they were.
+   */
+  startResearchAction(
+    taskId: string,
+    input: { readonly text: string; readonly reading: string; readonly allowResearch?: boolean },
+  ): { readonly intent: "research"; readonly scope: string; readonly gapRoundsRemaining: number } | undefined;
   /** Marks records left `running` by a previous process as interrupted. */
   reconcileInterrupted(): void;
   readonly busy: boolean;
@@ -70,6 +111,16 @@ interface StageRequest {
   readonly sessionId: string;
   readonly stage: ResearchStage;
   readonly instruction: string;
+  /** What the application authorized for this run; issued right before it starts. */
+  readonly grant: {
+    readonly intent: "ask" | "research" | "edit" | "draft" | "card";
+    readonly allowResearch: boolean;
+    readonly targetType: "none" | "project" | "section" | "report";
+    readonly targetId: string | null;
+    readonly scope: string;
+  };
+  /** Set for an Edit: the section the proposal must be limited to. */
+  readonly targetSectionId?: string | null;
 }
 
 const STAGE_LABELS: Readonly<Record<ResearchStage, string>> = Object.freeze({
@@ -77,17 +128,27 @@ const STAGE_LABELS: Readonly<Record<ResearchStage, string>> = Object.freeze({
   research: "检索与读取",
   gap: "定向补查",
   report: "生成报告",
-  followup: "追加指令",
+  followup: "追加指令（旧记录）",
+  ask: "提问",
+  edit: "修改提案",
 });
 
 function stageLabel(stage: ResearchStage): string {
-  return STAGE_LABELS[stage];
+  return STAGE_LABELS[stage] ?? stage;
 }
+
+const STATUS_LABELS: Readonly<Record<MatrixCell["status"], string>> = Object.freeze({
+  missing: "无依据",
+  unassessed: "有片段待核对",
+  limited: "有限支持",
+  conflict: "冲突/不可比",
+  reviewed: "已核对",
+});
 
 function cellLabel(cell: MatrixCell, task: ReportTask): string {
   const subject = task.subjects.find((candidate) => candidate.id === cell.subjectId)?.name ?? cell.subjectId;
   const dimension = task.dimensions.find((candidate) => candidate.id === cell.dimensionId)?.name ?? cell.dimensionId;
-  return `${subject} × ${dimension}（${cell.status === "partial" ? "仅摘要/部分依据" : "无依据"}）`;
+  return `${subject} × ${dimension}（${STATUS_LABELS[cell.status] ?? cell.status}）`;
 }
 
 /** The instruction one stage run is started with. Written here, not by a model. */
@@ -100,15 +161,23 @@ export function stageInstruction(input: {
   readonly task: ReportTask;
 }): string;
 export function stageInstruction(input: {
-  readonly stage: "followup";
+  readonly stage: "ask";
   readonly task: ReportTask;
-  readonly followUp: string;
+  readonly question: string;
+}): string;
+export function stageInstruction(input: {
+  readonly stage: "edit";
+  readonly task: ReportTask;
+  readonly instruction: string;
+  readonly targetSectionId: string;
 }): string;
 export function stageInstruction(input: {
   readonly stage: ResearchStage;
   readonly task?: ReportTask;
   readonly topicInput?: string;
-  readonly followUp?: string;
+  readonly question?: string;
+  readonly instruction?: string;
+  readonly targetSectionId?: string;
 }): string {
   if (input.stage === "card") {
     return [
@@ -127,7 +196,7 @@ export function stageInstruction(input: {
   if (task === undefined) throw new Error(`the ${input.stage} stage needs a task`);
   const subjects = task.subjects.map((subject) => `${subject.name}(${subject.id})`).join("、");
   const dimensions = task.dimensions.map((dimension) => `${dimension.name}(${dimension.id})`).join("、");
-  const gapCells = task.matrix.filter((cell) => cell.status !== "sufficient");
+  const gapCells = task.matrix.filter((cell) => needsAttention(cell.status));
 
   switch (input.stage) {
     case "research":
@@ -135,13 +204,13 @@ export function stageInstruction(input: {
         "任务卡已由用户确认，现在开始真实检索与读取。请按顺序执行：",
         "1) 用 search_sources 做 1–2 次检索（英文技术关键词，每次 limit 3–5），覆盖不同研究对象或不同维度；",
         "2) 用 read_source 读取最有代表性的 2–4 个候选：question 说明要回答什么，terms 给英文关键词，targetCell 指向该来源最能回答的矩阵单元格；",
-        "3) 调用 assess_coverage 提交覆盖评估（可把已有的 evidenceId 绑定到单元格）。",
+        "3) 调用 assess_coverage 提交支持评估：每个单元格给出 relationship（supports/contradicts/contextual）、directness（direct/indirect/contextual/unassessed）、适用条件与理由。只绑定证据不给评估，单元格会停留在「待核对」。",
         `比较对象：${subjects}`,
         `研究维度：${dimensions}`,
         gapCells.length > 0
           ? `当前缺口（共 ${gapCells.length} 格，优先关注）：${gapCells.slice(0, 6).map((cell) => cellLabel(cell, task)).join("；")}`
           : "当前尚无任何证据，全部单元格都是缺口。",
-        "本轮不要写报告；只做检索、读取与覆盖评估。若工具提示预算不足，就停止并说明。",
+        "本轮不要写报告；只做检索、读取与支持评估。若工具提示预算不足，就停止并说明。",
       ].join("\n");
     case "gap":
       return [
@@ -151,7 +220,7 @@ export function stageInstruction(input: {
           .map((cell) => `- ${cellLabel(cell, task)}：${cell.gap.length > 0 ? cell.gap : cell.reason}`)
           .join("\n"),
         "可用手段：最多 1 次 search_sources（换更精确的英文关键词）或直接用已有未读来源做 read_source；读取时把 targetCell 指向对应单元格。",
-        "完成后调用 assess_coverage（gapRound=true）。如果仍然没有公开依据，保持缺失，不要用常识补写。",
+        "完成后调用 assess_coverage（gapRound=true），并给出 relationship 与 directness。如果仍然没有公开依据，保持缺失或「有限支持」，不要用常识补写，也不要把间接材料写成直接支持。",
       ].join("\n");
     case "report":
       return [
@@ -162,17 +231,42 @@ export function stageInstruction(input: {
         "4) 全部提交后用 {part:'finalize'} 校验并发布。",
         "写作要求：",
         `- comparison 章节用 table 块：列为「方法」+ 最关键的 2–3 个维度；行为 ${subjects}；`,
-        '- 没有依据的比较项写成 callout（tone="gap"）明确说明缺失；',
+        '- 没有依据的比较项写成 callout（tone="gap"）明确说明缺失；只有「有限支持」或存在冲突的项目，也要在正文或缺口说明中写清限定条件；',
         "- 报告使用中文，方法名与术语保留原文；不同实验设置/硬件的结果不要直接排名；",
         "- 篇幅控制：表格 ≤3 列、单元格 ≤40 字、段落 ≤150 字、claims ≤8 条（超出会因输出上限被截断）。",
         "finalize 成功后简要说明报告结构与仍存在的缺口。",
       ].join("\n");
-    case "followup":
+    case "ask":
       return [
-        "用户对当前研究任务追加了指令，请在已有材料与预算内执行：",
-        `"""${input.followUp ?? ""}"""`,
-        "如果指令要求新的检索或读取，注意预算限制；如果要求修改报告，请重新调用 save_report 覆盖保存。不要编造未读取到的内容。",
+        "用户提出了一个问题。请只使用当前项目已有材料回答，不要写入任何正式数据。",
+        "可用：load_research_state（读取任务卡、矩阵、来源与证据索引）。",
+        "不可用：本次动作没有补查与写入授权，search_sources / read_source / assess_coverage / save_report / propose_section_edit 都会被服务端拒绝；不要反复尝试。",
+        "回答要求：",
+        "- 引用已有材料时只能引用工具返回的真实 id；材料没有覆盖的部分，明确说明「当前材料没有记录」；",
+        "- 区分「材料里写了什么」与「你的推断」；不要用常识补齐来源；",
+        "- 如果这次回答发现项目缺少关键材料，在回答末尾用一句话建议「转为补查（Research）」，由用户决定；不要自行检索。",
+        "问题原文：",
+        `"""${input.question ?? ""}"""`,
       ].join("\n");
+    case "edit": {
+      const targetSectionId = input.targetSectionId ?? "";
+      return [
+        "用户要求修改当前报告的指定目标。请只针对该目标生成一份修改提案，不要直接改写正文。",
+        `目标章节：${targetSectionId}`,
+        "提案的基线（报告 id、该章节当前内容、可用 evidenceId）与用户原话：",
+        input.instruction ?? "",
+        "执行要求：",
+        "- 用 propose_section_edit 提交一次提案：section 为目标章节的替换内容（id 必须与目标一致；blocks 形状与 save_report 相同）；",
+        "- 如果这次修改会影响摘要，必须同时显式提供 summary 字段，不要指望系统自动同步；",
+        '- 新引入的论断必须绑定真实 evidenceId（可复用上面列出的 evidenceId）；拿不到依据的判断写成 callout(tone="gap")，或 kind="inference" 并绑定推断依据；',
+        "- 如果被授权补查，最多做一次针对该章节问题的 search_sources 或 read_source，然后提交提案；",
+        "- 报告正文在接受前不会改变：提交后简要说明「改了什么、依据是什么」，等待用户接受或放弃。",
+      ].join("\n");
+    }
+    case "followup":
+      // A stage value that only old records carry; new instructions never
+      // reach it, and reading one back must not fail.
+      return "（旧记录：该阶段已由 Ask / Research / Edit 动作取代。）";
   }
 }
 
@@ -256,6 +350,19 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       log(`[runner] task ${request.taskId} no longer exists; dropping ${request.stage}`);
       return;
     }
+
+    // The permission this run acts under, minted here and nowhere earlier: the
+    // stage decides what the run may write, not the model and not the prompt.
+    service.issueGrant({
+      sessionId: request.sessionId,
+      intent: request.grant.intent,
+      taskId: request.taskId,
+      targetType: request.grant.targetType,
+      targetId: request.grant.targetId,
+      scope: request.grant.scope,
+      allowResearch: request.grant.allowResearch,
+      ...(task === undefined || task.currentReportId === null ? {} : { baseReportId: task.currentReportId }),
+    });
 
     // Only a stage that belongs to a task is recorded as one of its runs: the
     // card stage runs before the task exists, and the workspace reads its
@@ -356,6 +463,9 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       }
     }
 
+    // The action is over, so the permission it carried is over too: a later run
+    // gets its own grant, and nothing that is still settling can keep writing.
+    if (!runFailed) service.clearGrant(request.sessionId);
     await afterStage(request, readsBefore, runFailed);
   }
 
@@ -395,6 +505,38 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     };
   }
 
+  /** What each program-driven stage is allowed to do while it runs. */
+  const STAGE_GRANTS: Readonly<Record<"card" | "research" | "gap" | "report", StageRequest["grant"]>> = Object.freeze({
+    card: {
+      intent: "card",
+      allowResearch: false,
+      targetType: "project",
+      targetId: null,
+      scope: "建立研究任务卡（不检索）",
+    },
+    research: {
+      intent: "research",
+      allowResearch: true,
+      targetType: "project",
+      targetId: null,
+      scope: "检索、读取并保存证据与支持评估；不修改报告正文",
+    },
+    gap: {
+      intent: "research",
+      allowResearch: true,
+      targetType: "project",
+      targetId: null,
+      scope: "针对矩阵缺口的定向补查；不修改报告正文",
+    },
+    report: {
+      intent: "draft",
+      allowResearch: true,
+      targetType: "report",
+      targetId: null,
+      scope: "撰写并保存本任务的报告版本",
+    },
+  });
+
   /** What the program does once a stage settles: the next bounded step, or a stop. */
   async function afterStage(request: StageRequest, readsBefore: number, runFailed: boolean): Promise<void> {
     const task = request.taskId === null ? undefined : service.getTask(request.taskId);
@@ -403,6 +545,8 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
 
     switch (request.stage) {
       case "card":
+      case "ask":
+      case "edit":
       case "followup":
         return;
       case "research": {
@@ -412,24 +556,48 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           service.failTask(task.id, "研究阶段没有成功读取任何来源；可以重试或更换主题。");
           return;
         }
-        const gaps = task.matrix.filter((cell) => cell.status !== "sufficient");
+        // A task that already has a report is never re-written by research:
+        // the material changes, the report is flagged, and the text stays.
+        if (task.currentReportId !== null) return;
+        const gaps = task.matrix.filter((cell) => needsAttention(cell.status));
         if (runFailed) {
           // A stage that ended in an error does not get to spend another round:
           // whatever was read is written up honestly, gaps included.
-          enqueue({ taskId: task.id, sessionId, stage: "report", instruction: stageInstruction({ stage: "report", task }) });
+          enqueue({
+            taskId: task.id,
+            sessionId,
+            stage: "report",
+            instruction: stageInstruction({ stage: "report", task }),
+            grant: STAGE_GRANTS.report,
+          });
           return;
         }
         if (gaps.length > 0 && gapStagesSoFar(task.id) < task.budget.maxGapRounds) {
-          enqueue({ taskId: task.id, sessionId, stage: "gap", instruction: stageInstruction({ stage: "gap", task }) });
+          enqueue({
+            taskId: task.id,
+            sessionId,
+            stage: "gap",
+            instruction: stageInstruction({ stage: "gap", task }),
+            grant: STAGE_GRANTS.gap,
+          });
           return;
         }
-        enqueue({ taskId: task.id, sessionId, stage: "report", instruction: stageInstruction({ stage: "report", task }) });
+        enqueue({
+          taskId: task.id,
+          sessionId,
+          stage: "report",
+          instruction: stageInstruction({ stage: "report", task }),
+          grant: STAGE_GRANTS.report,
+        });
         return;
       }
       case "gap": {
         const refreshed = service.getTask(task.id);
         if (refreshed === undefined) return;
-        const gaps = refreshed.matrix.filter((cell) => cell.status !== "sufficient");
+        // Same rule as above:补查 on a task that has a report ends with the
+        // material, not with a new version of the report.
+        if (refreshed.currentReportId !== null) return;
+        const gaps = refreshed.matrix.filter((cell) => needsAttention(cell.status));
         const budgetLeft = gapStagesSoFar(refreshed.id) < refreshed.budget.maxGapRounds;
         // A round that read nothing new cannot have changed the matrix, so it
         // is not repeated: the report is written with the gaps that remain.
@@ -440,6 +608,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
             sessionId,
             stage: "gap",
             instruction: stageInstruction({ stage: "gap", task: refreshed }),
+            grant: STAGE_GRANTS.gap,
           });
           return;
         }
@@ -448,6 +617,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           sessionId,
           stage: "report",
           instruction: stageInstruction({ stage: "report", task: refreshed }),
+          grant: STAGE_GRANTS.report,
         });
         return;
       }
@@ -474,32 +644,135 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
   return {
     startCard(sessionId, topicInput) {
       cardAttempts.set(sessionId, 0);
-      enqueue({ taskId: null, sessionId, stage: "card", instruction: stageInstruction({ stage: "card", topicInput }) });
+      enqueue({
+        taskId: null,
+        sessionId,
+        stage: "card",
+        instruction: stageInstruction({ stage: "card", topicInput }),
+        grant: STAGE_GRANTS.card,
+      });
     },
     startResearch(taskId) {
-      const task = service.getTask(taskId);
-      if (task === undefined) return;
-      enqueue({ taskId, sessionId: task.sessionId, stage: "research", instruction: stageInstruction({ stage: "research", task }) });
-    },
-    startGapRound(taskId) {
-      const task = service.getTask(taskId);
-      if (task === undefined) return;
-      enqueue({ taskId, sessionId: task.sessionId, stage: "gap", instruction: stageInstruction({ stage: "gap", task }) });
-    },
-    startReport(taskId) {
-      const task = service.getTask(taskId);
-      if (task === undefined) return;
-      enqueue({ taskId, sessionId: task.sessionId, stage: "report", instruction: stageInstruction({ stage: "report", task }) });
-    },
-    startFollowUp(taskId, text) {
       const task = service.getTask(taskId);
       if (task === undefined) return;
       enqueue({
         taskId,
         sessionId: task.sessionId,
-        stage: "followup",
-        instruction: stageInstruction({ stage: "followup", task, followUp: text }),
+        stage: "research",
+        instruction: stageInstruction({ stage: "research", task }),
+        grant: STAGE_GRANTS.research,
       });
+    },
+    startGapRound(taskId) {
+      const task = service.getTask(taskId);
+      if (task === undefined) return;
+      enqueue({
+        taskId,
+        sessionId: task.sessionId,
+        stage: "gap",
+        instruction: stageInstruction({ stage: "gap", task }),
+        grant: STAGE_GRANTS.gap,
+      });
+    },
+    startReport(taskId) {
+      const task = service.getTask(taskId);
+      if (task === undefined) return;
+      enqueue({
+        taskId,
+        sessionId: task.sessionId,
+        stage: "report",
+        instruction: stageInstruction({ stage: "report", task }),
+        grant: STAGE_GRANTS.report,
+      });
+    },
+
+    startAssistant(taskId, input) {
+      const task = service.getTask(taskId);
+      if (task === undefined) return undefined;
+      const targetSectionId = input.targetSectionId ?? null;
+      if (input.intent === "edit") {
+        const report =
+          task.currentReportId === null ? undefined : service.reportsOf(taskId).find((candidate) => candidate.id === task.currentReportId);
+        if (report === undefined) return undefined;
+        const section = report.sections.find((candidate) => candidate.id === targetSectionId);
+        if (section === undefined) return undefined;
+        const evidenceIndex = service.evidenceOf(taskId).map((item) => ({
+          evidenceId: item.id,
+          sourceId: item.sourceId,
+          scope: item.readScope,
+          excerpt: item.excerpt.length > 160 ? `${item.excerpt.slice(0, 160)}…` : item.excerpt,
+        }));
+        const payload = [
+          `报告 id：${report.id}（内容 hash ${report.contentHash ?? "（旧记录未记录 hash，提案只锁定章节内容）"}）`,
+          `章节当前内容：${JSON.stringify({ id: section.id, title: section.title, blocks: section.blocks })}`,
+          `可用 evidenceId（最多列出 20 条）：${JSON.stringify(evidenceIndex.slice(0, 20))}`,
+          `用户原话："""${input.text}"""`,
+        ].join("\n");
+        const view = {
+          intent: "edit" as const,
+          targetType: "section" as const,
+          targetId: section.id,
+          scope: `只针对章节「${section.title}」生成修改提案；接受前正文不变`,
+          allowResearch: input.allowResearch ?? true,
+        };
+        enqueue({
+          taskId,
+          sessionId: task.sessionId,
+          stage: "edit",
+          instruction: stageInstruction({ stage: "edit", task, instruction: payload, targetSectionId: section.id }),
+          grant: {
+            intent: "edit",
+            allowResearch: view.allowResearch,
+            targetType: "section",
+            targetId: section.id,
+            scope: view.scope,
+          },
+          targetSectionId: section.id,
+        });
+        return view;
+      }
+      const view = {
+        intent: "ask" as const,
+        targetType: "project" as const,
+        targetId: null,
+        scope: "只读取材料回答问题，不写入任何正式数据",
+        allowResearch: false,
+      };
+      enqueue({
+        taskId,
+        sessionId: task.sessionId,
+        stage: "ask",
+        instruction: stageInstruction({ stage: "ask", task, question: input.text }),
+        grant: { intent: "ask", allowResearch: false, targetType: "project", targetId: null, scope: view.scope },
+      });
+      return view;
+    },
+
+    startResearchAction(taskId, input) {
+      const task = service.getTask(taskId);
+      if (task === undefined) return undefined;
+      if (task.usage.gapRounds >= task.budget.maxGapRounds) return undefined;
+      const instruction = [
+        stageInstruction({ stage: "gap", task }),
+        "",
+        `用户提出的补查要求（${input.reading}）：`,
+        `"""${input.text}"""`,
+        task.currentReportId === null
+          ? "完成后由程序决定是否继续补查或生成报告。"
+          : "本任务已有报告：只补充材料与支持评估，不要保存报告；报告正文会保持不变，相关目标会被标记为待复核。",
+      ].join("\n");
+      enqueue({
+        taskId,
+        sessionId: task.sessionId,
+        stage: "gap",
+        instruction,
+        grant: STAGE_GRANTS.gap,
+      });
+      return {
+        intent: "research",
+        scope: "围绕用户提出的问题定向补查；不修改报告正文",
+        gapRoundsRemaining: Math.max(0, task.budget.maxGapRounds - task.usage.gapRounds),
+      };
     },
 
     reconcileInterrupted() {

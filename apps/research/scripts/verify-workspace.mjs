@@ -243,19 +243,24 @@ async function main() {
     );
     case_(
       "the evidence matrix renders with derived marks",
-      matrix !== null && matrix.cells > 0 && /[●◐○]/.test(matrix.marks),
+      matrix !== null && matrix.cells > 0 && /[●◐◑◆○]/.test(matrix.marks),
       matrix === null ? "no matrix" : `${matrix.rows} rows × ${matrix.columns} columns, ${matrix.cells} cells`,
     );
 
-    // 4. Clicking a covered cell shows the passage behind it.
+    // 4. Clicking a cell that holds material shows the passage behind it. The
+    //    cell does not have to be "reviewed": the state this product reports
+    //    for a passage nobody has judged yet still has to be inspectable.
     const suppliedCell = await session.evaluate(
       `(() => {
-        const cell = [...document.querySelectorAll('[data-testid^="cell-"]')].find((candidate) => candidate.className.includes("cell--sufficient"));
+        const held = ["cell--reviewed", "cell--limited", "cell--unassessed", "cell--conflict"];
+        const cell = [...document.querySelectorAll('[data-testid^="cell-"]')].find((candidate) =>
+          held.some((name) => candidate.className.includes(name)),
+        );
         return cell === undefined ? null : cell.getAttribute("data-testid");
       })()`,
     );
     if (suppliedCell === null) {
-      case_("a covered cell can be inspected", false, "no sufficient cell in this task");
+      case_("a cell holding material can be inspected", false, "no cell with material in this task");
     } else {
       await session.click(`[data-testid="${suppliedCell}"]`);
       await session.waitFor(
@@ -271,7 +276,7 @@ async function main() {
         })()`,
       );
       case_(
-        "clicking a covered cell shows its evidence and read scope",
+        "clicking a cell with material shows its evidence and read scope",
         inspector.excerpt.length > 10,
         `${inspector.scope ?? "?"} · sources=${String(inspector.sources)} · ${inspector.excerpt.slice(0, 40)}…`,
       );

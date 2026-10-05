@@ -127,6 +127,10 @@ describe.skipIf(!enabled)("research plugin over a real model", () => {
       service.confirmTask(task!.id);
       service.startResearch(task!.id);
       repo.updateTask({ ...service.getTask(task!.id)!, budget: { ...service.getTask(task!.id)!.budget, maxSearches: 2, maxReads: 2 } });
+      // The application also mints the permission the run acts under: without a
+      // grant the tools refuse to write, which is what this test would see if
+      // the boundary were broken.
+      service.issueGrant({ sessionId: session.sessionId, intent: "research", taskId: task!.id, allowResearch: true });
 
       // Turn 2: the agent researches for real.
       const second = await client.runs.start({
@@ -158,18 +162,20 @@ describe.skipIf(!enabled)("research plugin over a real model", () => {
       }
       console.log(`[a4] evidence=${evidence.length} (all verified against saved reads)`);
 
-      // The matrix is derived, not self-reported: a cell is sufficient only if a
-      // body-scope passage is bound to it.
+      // The matrix is derived, not self-reported: material alone never reaches
+      // "reviewed", and a reviewed cell always names the evidence it rests on.
       const cells = service.cellsOf(task!.id);
-      const sufficient = cells.filter((cell) => cell.status === "sufficient");
-      for (const cell of sufficient) {
+      const reviewed = cells.filter((cell) => cell.status === "reviewed");
+      for (const cell of reviewed) {
         expect(cell.evidenceIds.length).toBeGreaterThan(0);
       }
-      console.log(
-        `[a4] matrix: sufficient=${sufficient.length} partial=${cells.filter((c) => c.status === "partial").length} missing=${
-          cells.filter((c) => c.status === "missing").length
-        }`,
-      );
+      expect(cells.some((cell) => cell.status === "missing")).toBe(true);
+      const counts = cells.reduce<Record<string, number>>((tally, cell) => {
+        tally[cell.status] = (tally[cell.status] ?? 0) + 1;
+        return tally;
+      }, {});
+      console.log(`[a4] matrix: ${JSON.stringify(counts)}`);
+      console.log(`[a4] assessments=${service.assessmentsOf(task!.id).length}`);
     },
   );
 });

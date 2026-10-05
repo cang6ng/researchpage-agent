@@ -179,9 +179,12 @@ describe.skipIf(!enabled)(`the real demo run: ${DEMO_TOPIC.slice(0, 40)}`, () =>
         expect(text).toBeDefined();
         expect(text!.slice(stored!.locator.charStart, stored!.locator.charEnd)).toBe(item.excerpt);
       }
-      const sufficient = bundle.matrix.filter((cell) => cell.status === "sufficient");
-      expect(sufficient.length).toBeGreaterThan(0);
-      expect(sufficient.every((cell) => cell.evidenceIds.length > 0)).toBe(true);
+      // Material alone is never an answer: a cell the run did not judge stays
+      // "unassessed", and only a judged one may be "reviewed".
+      const withMaterial = bundle.matrix.filter((cell) => cell.status !== "missing");
+      expect(withMaterial.length).toBeGreaterThan(0);
+      expect(withMaterial.every((cell) => cell.evidenceIds.length > 0)).toBe(true);
+      expect(bundle.matrix.some((cell) => cell.status === "reviewed")).toBe(true);
 
       // 5. The report is validated and cites only evidence that exists.
       const report = bundle.reports.find((candidate) => candidate.isCurrent);
