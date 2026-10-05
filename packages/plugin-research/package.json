@@ -1,0 +1,13 @@
+{
+  "name": "@every-dagent/plugin-research",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ResearchPage research plugin: structure-driven research over really read sources, evidence-bound reports and PDF delivery.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@every-dagent/agent-core": "workspace:*",
+    "@every-dagent/plugin-system": "workspace:*"
+  }
+}

@@ -1,6 +1,7 @@
 node_modules/
 *.tsbuildinfo
 /apps/web/dist/
+/apps/research/dist/
 
 # local environment and credentials
 .env
@@ -12,3 +13,6 @@ node_modules/
 # coding-agent local context
 .zcode/
 .zcodeignore
+
+# local working area (logs, scratch runs, copied artifacts)
+.scratch/

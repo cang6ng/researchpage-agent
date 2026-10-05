@@ -1,0 +1,290 @@
+/**
+ * The report truth boundary: validation, and the citation numbering a renderer
+ * may rely on.
+ *
+ * A model writes the report's *content* — sections, paragraphs, claims — and
+ * nothing else. Whether that content may be published is decided here: every
+ * cited evidence id has to exist, belong to this task, and still verify against
+ * the read it came from. A report that fails keeps its problems as its answer
+ * and is not saved, so a fabricated citation cannot reach a reader through a
+ * "just this once" path.
+ *
+ * Citation numbers are minted here too, from the order claims are referenced in
+ * the document, because numbering is presentation and presentation is the
+ * program's business — the same numbers serve the screen and the PDF.
+ */
+
+import type { Evidence, MatrixCell, Report, ReportBlock, ReportClaim, ReportSection, ReportTask, Source } from "./domain.js";
+
+export interface ReportDraft {
+  readonly title: string;
+  readonly summary: string;
+  readonly sections: readonly ReportSection[];
+  readonly claims: readonly ReportClaim[];
+}
+
+export interface ValidationInput {
+  readonly draft: ReportDraft;
+  readonly task: ReportTask;
+  readonly evidence: readonly Evidence[];
+  /** The saved read text for one read id; undefined means the read is missing. */
+  readonly snapshotText: (readId: string) => string | undefined;
+  readonly now: string;
+}
+
+export interface ValidationResult {
+  readonly ok: boolean;
+  readonly problems: readonly string[];
+}
+
+/** Sections a technical comparison report must actually contain. */
+const REQUIRED_SECTIONS = ["overview", "representative", "comparison", "limitations"] as const;
+
+function blocksOf(section: ReportSection): readonly ReportBlock[] {
+  return section.blocks;
+}
+
+function blockClaimIds(block: ReportBlock): readonly string[] {
+  switch (block.kind) {
+    case "paragraph":
+      return block.claimIds;
+    case "list":
+      return block.items.flatMap((item) => item.claimIds);
+    case "table":
+      return block.rows.flatMap((row) => row.cells.flatMap((cell) => cell.claimIds));
+    case "callout":
+      return [];
+  }
+}
+
+/**
+ * Validates a report draft against the task's real materials.
+ *
+ * The checks are the ones a reader's trust depends on: the required structure
+ * is present, every claim carries evidence, every id resolves inside this task,
+ * and every excerpt still sits where its read says it does. Wording, style and
+ * whether a conclusion is *wise* are not checked — those are for the reader,
+ * and pretending a validator can judge them would be the dishonest part.
+ */
+export function validateReport(input: ValidationInput): ValidationResult {
+  const problems: string[] = [];
+  const byId = new Map(input.evidence.map((item) => [item.id, item]));
+  const claimIds = new Set(input.draft.claims.map((claim) => claim.id));
+
+  for (const sectionId of REQUIRED_SECTIONS) {
+    const section = input.draft.sections.find((candidate) => candidate.id === sectionId);
+    if (section === undefined) {
+      problems.push(`缺少必需章节：${sectionId}`);
+      continue;
+    }
+    const hasContent = section.blocks.some((block) => {
+      if (block.kind === "paragraph") return block.text.trim().length > 0;
+      if (block.kind === "list") return block.items.length > 0;
+      if (block.kind === "table") return block.rows.length > 0;
+      return block.text.trim().length > 0;
+    });
+    if (!hasContent) problems.push(`章节「${section.title}」没有任何内容`);
+  }
+
+  if (input.draft.claims.length === 0) problems.push("报告没有任何 claim");
+
+  for (const claim of input.draft.claims) {
+    if (claim.text.trim().length === 0) problems.push(`claim ${claim.id} 文本为空`);
+    if (claim.evidenceIds.length === 0) {
+      problems.push(`claim ${claim.id} 没有任何 evidence（非综合论断不允许无依据）`);
+      continue;
+    }
+    for (const evidenceId of claim.evidenceIds) {
+      const evidence = byId.get(evidenceId);
+      if (evidence === undefined) {
+        problems.push(`claim ${claim.id} 引用了不存在的 evidence：${evidenceId}`);
+        continue;
+      }
+      if (evidence.taskId !== input.task.id) {
+        problems.push(`claim ${claim.id} 引用了其他任务的 evidence：${evidenceId}`);
+        continue;
+      }
+      const text = input.snapshotText(evidence.readId);
+      if (text === undefined) {
+        problems.push(`evidence ${evidenceId} 的读取快照缺失`);
+        continue;
+      }
+      const slice = text.slice(evidence.locator.charStart, evidence.locator.charEnd);
+      if (slice !== evidence.excerpt) {
+        problems.push(`evidence ${evidenceId} 的片段与读取文本不一致（不可引用）`);
+      }
+    }
+  }
+
+  for (const section of input.draft.sections) {
+    for (const block of blocksOf(section)) {
+      for (const id of blockClaimIds(block)) {
+        if (!claimIds.has(id)) {
+          problems.push(`章节「${section.title}」引用了不存在的 claim：${id}`);
+        }
+      }
+    }
+  }
+
+  return { ok: problems.length === 0, problems, now: input.now } as ValidationResult;
+}
+
+export interface CitationReference {
+  readonly number: number;
+  readonly sourceId: string;
+  readonly source: Source;
+}
+
+export interface EvidenceIndexEntry {
+  readonly number: number;
+  readonly evidenceId: string;
+  readonly sourceId: string;
+  readonly excerpt: string;
+  readonly scope: string;
+  readonly headingPath: readonly string[];
+  readonly paragraphIndex: number;
+}
+
+export interface Citations {
+  readonly references: readonly CitationReference[];
+  readonly evidenceIndex: readonly EvidenceIndexEntry[];
+  /** Reference numbers for one claim, in document order. */
+  readonly numbersForClaim: ReadonlyMap<string, readonly number[]>;
+  /** Source id → reference number. */
+  readonly numberBySource: ReadonlyMap<string, number>;
+}
+
+/**
+ * Numbers the sources a report actually cites, in order of first use.
+ *
+ * Only cited material gets a number: a source that was found but never quoted
+ * is not a reference, and an evidence item that no claim uses has no business
+ * appearing in the index either.
+ */
+export function buildCitations(input: {
+  readonly draft: ReportDraft;
+  readonly sources: readonly Source[];
+  readonly evidence: readonly Evidence[];
+}): Citations {
+  const sourceById = new Map(input.sources.map((source) => [source.id, source]));
+  const evidenceById = new Map(input.evidence.map((item) => [item.id, item]));
+  const claimById = new Map(input.draft.claims.map((claim) => [claim.id, claim]));
+
+  const usedEvidenceIds: string[] = [];
+  const usedEvidenceSeen = new Set<string>();
+  for (const section of input.draft.sections) {
+    for (const block of blocksOf(section)) {
+      for (const claimId of blockClaimIds(block)) {
+        const claim = claimById.get(claimId);
+        if (claim === undefined) continue;
+        for (const evidenceId of claim.evidenceIds) {
+          if (usedEvidenceSeen.has(evidenceId)) continue;
+          usedEvidenceSeen.add(evidenceId);
+          usedEvidenceIds.push(evidenceId);
+        }
+      }
+    }
+  }
+
+  const numberBySource = new Map<string, number>();
+  const references: CitationReference[] = [];
+  const evidenceIndex: EvidenceIndexEntry[] = [];
+  const numbersForClaim = new Map<string, readonly number[]>();
+
+  for (const evidenceId of usedEvidenceIds) {
+    const evidence = evidenceById.get(evidenceId);
+    if (evidence === undefined) continue;
+    let number = numberBySource.get(evidence.sourceId);
+    if (number === undefined) {
+      const source = sourceById.get(evidence.sourceId);
+      if (source === undefined) continue;
+      number = references.length + 1;
+      numberBySource.set(evidence.sourceId, number);
+      references.push({ number, sourceId: evidence.sourceId, source });
+    }
+    evidenceIndex.push({
+      number,
+      evidenceId,
+      sourceId: evidence.sourceId,
+      excerpt: evidence.excerpt,
+      scope: evidence.readScope,
+      headingPath: evidence.locator.headingPath,
+      paragraphIndex: evidence.locator.paragraphIndex,
+    });
+  }
+
+  for (const claim of input.draft.claims) {
+    const numbers: number[] = [];
+    for (const evidenceId of claim.evidenceIds) {
+      const evidence = evidenceById.get(evidenceId);
+      if (evidence === undefined) continue;
+      const number = numberBySource.get(evidence.sourceId);
+      if (number !== undefined && !numbers.includes(number)) numbers.push(number);
+    }
+    numbersForClaim.set(claim.id, numbers);
+  }
+
+  return { references, evidenceIndex, numbersForClaim, numberBySource };
+}
+
+/** The cells a report still owes an answer for, as the reader should see them. */
+export function missingCells(task: ReportTask): readonly MatrixCell[] {
+  return task.matrix.filter((cell) => cell.status === "missing" || cell.status === "partial");
+}
+
+/**
+ * Whether a heading and a source title name the same work.
+ *
+ * The two rarely match character for character — a discovery title from arXiv
+ * says "A Graph RAG Approach" where the paper's own HTML says "A GraphRAG
+ * Approach" — so the comparison ignores case, punctuation and spacing, and
+ * accepts one being a prefix of the other. Short headings are compared exactly:
+ * a heading like "Methods" is not a title, however the prefixes look.
+ */
+export function sameWorkTitle(heading: string, sourceTitle: string): boolean {
+  const normalize = (value: string): string => value.toLowerCase().replace(/[^a-z0-9一-鿿]/g, "");
+  const a = normalize(heading);
+  const b = normalize(sourceTitle);
+  if (a.length === 0 || b.length === 0) return false;
+  if (a.length < 12 || b.length < 12) return a === b;
+  return a === b || a.startsWith(b) || b.startsWith(a);
+}
+
+/**
+ * A heading path as one readable line.
+ *
+ * arXiv's HTML puts the paper title in the first heading, so a path would
+ * otherwise read as the title twice; the part that repeats the source title is
+ * dropped when the caller knows it.
+ */
+export function locatorLabel(headingPath: readonly string[], paragraphIndex: number, sourceTitle?: string): string {
+  // A stored path may have come from a document that skipped heading levels;
+  // holes are dropped rather than rendered, and never dereferenced.
+  const parts = (headingPath ?? []).filter((part): part is string => typeof part === "string" && part.trim().length > 0);
+  const trimmed =
+    sourceTitle !== undefined && parts.length > 1 && sameWorkTitle(parts[0] ?? "", sourceTitle)
+      ? parts.slice(1)
+      : parts;
+  const path = trimmed.join(" > ");
+  return path.length > 0 ? `${path}（第 ${paragraphIndex + 1} 段）` : `第 ${paragraphIndex + 1} 段`;
+}
+
+/** The report as it is saved: the validated draft plus the program's own stamps. */
+export function sealReport(input: {
+  readonly id: string;
+  readonly taskId: string;
+  readonly draft: ReportDraft;
+  readonly validation: ValidationResult;
+  readonly now: string;
+}): Report {
+  return {
+    id: input.id,
+    taskId: input.taskId,
+    title: input.draft.title,
+    summary: input.draft.summary,
+    sections: input.draft.sections,
+    claims: input.draft.claims,
+    validation: { ok: input.validation.ok, problems: input.validation.problems, checkedAt: input.now },
+    createdAt: input.now,
+  };
+}
