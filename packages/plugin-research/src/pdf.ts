@@ -230,7 +230,11 @@ export async function exportHtmlToPdf(options: PdfExportOptions): Promise<PdfExp
       `--user-data-dir=${profile}`,
       "--remote-debugging-port=0",
       "--window-size=1240,1754",
-      pathToFileURL(htmlPath).href,
+      // The report is loaded by *this* connection after the socket opens.
+      // Starting on the file saves nothing and costs correctness: a browser can
+      // expose more than one page target, and printing the wrong one produces a
+      // perfectly valid, perfectly empty PDF.
+      "about:blank",
     ],
     { stdio: ["ignore", "ignore", "pipe"] },
   );
@@ -243,21 +247,26 @@ export async function exportHtmlToPdf(options: PdfExportOptions): Promise<PdfExp
     await connection.call("Page.enable");
     await connection.call("Runtime.enable");
 
-    // The document has to be complete *and* its fonts loaded: printing before
-    // the CJK face is ready is exactly how a PDF ends up with empty boxes.
+    // The report is loaded by this connection, so what gets printed is what was
+    // navigated to — never whichever page the browser exposed first.
+    await connection.call("Page.navigate", { url: pathToFileURL(htmlPath).href });
+
+    // The document has to be the report *and* complete, with its fonts loaded:
+    // printing before the CJK face is ready is how a PDF ends up with empty
+    // boxes, and printing before navigation lands is how it ends up empty.
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       let ready = false;
       try {
         ready = await evaluate<boolean>(
           connection,
-          "document.readyState === 'complete' && document.fonts !== undefined && document.fonts.status === 'loaded' && document.body !== null",
+          "location.protocol === 'file:' && document.readyState === 'complete' && document.fonts !== undefined && document.fonts.status === 'loaded' && document.body !== null && document.body.innerText.trim().length > 0",
         );
       } catch {
         ready = false;
       }
       if (ready) break;
-      if (Date.now() > deadline) return { ok: false, failure: "页面在超时前未完成渲染（字体或文档未就绪）" };
+      if (Date.now() > deadline) return { ok: false, failure: "页面在超时前未完成渲染（字体、文档或正文未就绪）" };
       await delay(150);
     }
 

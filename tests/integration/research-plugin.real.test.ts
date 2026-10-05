@@ -47,18 +47,28 @@ describe.skipIf(!enabled)("research plugin over a real model", () => {
       const model = models.getModel("deepseek", process.env["E2E_MODEL"] ?? "deepseek-flash");
       expect(model, "no deepseek model in the catalogue").toBeDefined();
 
+      const piAi = createPiAiComposition({
+        models: [model!],
+        streamSource: models,
+        credentials: explicitCredentials({ deepseek: apiKey! }),
+        maxTokens: 4_096,
+      });
+
       const platform = await createHostPlatform({
-        composition: createPiAiComposition({
-          models: [model!],
-          streamSource: models,
-          credentials: explicitCredentials({ deepseek: apiKey! }),
-          maxTokens: 4_096,
-        }),
+        // The policy belongs to the composition: a host composed without one
+        // classifies nothing and refuses every tool call, so the research tools
+        // are allowed *here*, by the same object that vouches for the model.
+        composition: {
+          toolPolicy: { revision: 1, tools: tools.tools, decide: () => "allow" },
+          validateModel: (value) => piAi.validateModel(value),
+          compose: (input) => piAi.compose(input),
+        },
         plugins: [plugin],
         persistence: { kind: "sqlite", location: join(dir, "host.db") },
-        toolPolicy: { revision: 1, tools: tools.tools, decide: () => "allow" },
         bootstrap: {
-          host: { systemPrompt: RESEARCH_SYSTEM_PROMPT, loop: { maxSteps: 30, maxModelAttempts: 3 } },
+          // The approved loop profile, unraised: a research pass is several stage
+          // runs precisely because one run may not spend more than this.
+          host: { systemPrompt: RESEARCH_SYSTEM_PROMPT, loop: { maxSteps: 12, maxModelAttempts: 3 } },
           model: { provider: "deepseek", model: process.env["E2E_MODEL"] ?? "deepseek-flash" },
         },
       });
@@ -89,7 +99,20 @@ describe.skipIf(!enabled)("research plugin over a real model", () => {
       });
 
       const task = service.taskForSession(session.sessionId);
-      expect(task, "the agent did not create a research task").toBeDefined();
+      if (task === undefined) {
+        const snapshot = client.getSnapshot();
+        const run = snapshot.presentation?.runs.items.find((candidate) => candidate.runId === first.run.runId);
+        const events = snapshot.presentation?.sessions.items ?? [];
+        throw new Error(
+          `the agent did not create a research task: run=${run?.status ?? "?"}/${run?.endReason ?? "?"} sessions=${
+            events.length
+          } lastText=${(snapshot.live[first.run.runId]?.live ?? [])
+            .filter((item) => item.kind === "text")
+            .map((item) => item.text)
+            .join(" ")
+            .slice(0, 200)}`,
+        );
+      }
       expect(task!.status).toBe("draft");
       expect(task!.subjects.length).toBeGreaterThanOrEqual(2);
       expect(task!.dimensions.length).toBeGreaterThanOrEqual(3);
