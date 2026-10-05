@@ -17,7 +17,9 @@ import type {
   CellRef,
   CoverageAssessment,
   CoverageEvidence,
+  ClaimType,
   ReportDraftState,
+  ReportFrame,
   Evidence,
   ExportArtifact,
   MatrixCell,
@@ -28,6 +30,7 @@ import type {
   ReadSnapshot,
   ResearchRunRecord,
   Source,
+  SourceRole,
   SupportAssessment,
   AssessmentDirectness,
   AssessmentRelationship,
@@ -52,6 +55,7 @@ import { newId, type ResearchRepository } from "./repository.js";
 import { createGrant, type ActionCapability, type ActionGrant, type GrantInput } from "./semantics.js";
 import { searchArxiv, type SearchOutcome } from "./search.js";
 import { buildMatrix, createTask, normalizeCard, slugId, STRUCTURE_SECTIONS, type ProposedCard } from "./structure.js";
+import { TECHNICAL_COMPARISON_V2, blueprintSections } from "./blueprint.js";
 import {
   buildCitations,
   gapNotesOf,
@@ -78,6 +82,7 @@ export type ReportPart =
       readonly kind: "start";
       readonly title?: string;
       readonly summary?: string;
+      readonly frame?: ReportFrame;
       readonly claims?: readonly ReportClaim[];
       readonly section?: ReportSection;
     }
@@ -85,6 +90,7 @@ export type ReportPart =
       readonly kind: "write";
       readonly title?: string;
       readonly summary?: string;
+      readonly frame?: ReportFrame;
       readonly claims?: readonly ReportClaim[];
       readonly section?: ReportSection;
     }
@@ -124,6 +130,8 @@ export interface ReadResult {
   readonly readStatus: Source["readStatus"];
   readonly readScope: Source["readScope"];
   readonly readUrl: string;
+  /** What this source was judged to be; used by the claim contract. */
+  readonly role: SourceRole | null;
   readonly textChars: number;
   readonly paragraphCount: number;
   readonly reuse: boolean;
@@ -171,6 +179,7 @@ export interface SaveReportResult {
   readonly reportId: string;
   readonly citations: number;
   readonly references: number;
+  /** Obligations the report met softly, plus the matrix's outstanding gaps. */
   readonly warnings: readonly string[];
   readonly missingCells: number;
 }
@@ -195,6 +204,7 @@ export interface WorkspaceState {
   readonly sources: readonly {
     readonly sourceId: string;
     readonly title: string;
+    readonly role: SourceRole | null;
     readonly readStatus: Source["readStatus"];
     readonly readScope: Source["readScope"];
     readonly url: string;
@@ -218,8 +228,20 @@ export interface WorkspaceState {
     readonly reportId: string;
     readonly title: string;
     readonly summary: string;
+    readonly frame: ReportFrame | null;
+    readonly validation: {
+      readonly ok: boolean;
+      readonly warnings: readonly string[];
+      readonly checks: readonly { readonly id: string; readonly result: string; readonly detail: string }[];
+    };
     readonly sections: readonly { readonly id: string; readonly title: string }[];
-    readonly claims: readonly { readonly id: string; readonly text: string; readonly kind: string }[];
+    readonly claims: readonly {
+      readonly id: string;
+      readonly text: string;
+      readonly kind: string;
+      readonly claimType: ClaimType;
+      readonly synthesis: boolean;
+    }[];
   } | null;
 }
 
@@ -232,7 +254,17 @@ export interface ResearchService {
   failTask(taskId: string, error: string): void;
   getTask(taskId: string): ReportTask | undefined;
   search(taskId: string, input: { readonly query: string; readonly limit?: number; readonly targetSectionId?: string; readonly targetCell?: CellRef; readonly signal?: AbortSignal }): Promise<SearchResult | Refusal>;
-  read(taskId: string, input: { readonly sourceId: string; readonly question: string; readonly terms?: readonly string[]; readonly targetCell?: CellRef; readonly maxEvidence?: number; readonly paragraphIndex?: number; readonly signal?: AbortSignal }): Promise<ReadResult | Refusal>;
+  read(taskId: string, input: {
+    readonly sourceId: string;
+    readonly question: string;
+    readonly terms?: readonly string[];
+    readonly targetCell?: CellRef;
+    readonly maxEvidence?: number;
+    readonly paragraphIndex?: number;
+    /** What kind of material the agent judges this source to be. */
+    readonly role?: SourceRole;
+    readonly signal?: AbortSignal;
+  }): Promise<ReadResult | Refusal>;
   assess(taskId: string, input: {
     readonly proposals: readonly {
       readonly cell: CellRef;
@@ -257,6 +289,14 @@ export interface ResearchService {
    */
   saveReportPart(taskId: string, part: ReportPart): SaveReportResult | Refusal;
   reportDraftOf(taskId: string): ReportDraftState | null;
+  /**
+   * Runs the full validation over the accumulated draft without saving it.
+   *
+   * The staged runner uses this between the section pass and the synthesis
+   * pass, so the model is told what is still wrong with what it has written
+   * before it is asked to conclude anything.
+   */
+  previewDraftValidation(taskId: string): ValidationResult | null;
   state(taskId: string): WorkspaceState;
   cellsOf(taskId: string): readonly CellView[];
   sourcesOf(taskId: string): readonly Source[];
@@ -500,7 +540,13 @@ export function createResearchService(options: ResearchServiceOptions): Research
   }
 
   function proposalBaseOf(report: Report): ProposalBase {
-    return { title: report.title, summary: report.summary, sections: report.sections, claims: report.claims };
+    return {
+      title: report.title,
+      summary: report.summary,
+      ...(report.frame === undefined ? {} : { frame: report.frame }),
+      sections: report.sections,
+      claims: report.claims,
+    };
   }
 
   function budgetRefusal(task: ReportTask, what: string, guidance: string): Refusal | undefined {
@@ -587,6 +633,25 @@ export function createResearchService(options: ResearchServiceOptions): Research
     return validation.problems;
   }
 
+  /**
+   * Refuses a section the task's structure does not define.
+   *
+   * A report's sections are the research structure, not free-form headings: an
+   * unknown id is either a typo or a section invented on the spot, and both
+   * would render a heading that no obligation, no matrix column and no reader
+   * outline refers to.
+   */
+  function unknownSectionRefusal(task: ReportTask, sectionIds: readonly string[]): Refusal | undefined {
+    const known = task.structure.sections.map((section) => section.id);
+    const unknown = sectionIds.filter((id) => !known.includes(id));
+    if (unknown.length === 0) return undefined;
+    return {
+      ok: false,
+      problems: [`章节 id 不在本次报告结构里：${unknown.map((id) => (id === "" ? "（空）" : id)).join("、")}`],
+      guidance: `可用章节 id：${known.join(" / ")}。章节的 id 与认知义务由研究结构决定，不能自行新增。`,
+    };
+  }
+
   return {
     taskForSession: (sessionId) => repo.taskForSession(sessionId),
 
@@ -611,7 +676,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         const next: ReportTask = {
           ...existing,
           ...normalized.value,
-          structure: { sections: STRUCTURE_SECTIONS.map(({ required: _required, ...section }) => section) },
+          structure: { sections: blueprintSections(TECHNICAL_COMPARISON_V2) },
           matrix: buildMatrix(normalized.value.subjects, normalized.value.dimensions, isoNow()),
           updatedAt: isoNow(),
         };
@@ -747,6 +812,14 @@ export function createResearchService(options: ResearchServiceOptions): Research
       const targetCells: readonly CellRef[] = input.targetCell === undefined ? [] : [input.targetCell];
       const terms = [...(input.terms ?? []), ...tokenize(input.question)];
 
+      // What the source *is* is the agent's judgement, recorded here because it
+      // is the only moment the model has just read the material and knows
+      // whether this is the original method, a survey of it, or an evaluation
+      // by someone else. It is used by the claim contract, never as a score.
+      if (input.role !== undefined && input.role !== source.role) {
+        repo.updateSource({ ...source, role: input.role });
+      }
+
       // A source already read is reused, not re-fetched: the saved snapshot is
       // the thing evidence may quote, and re-reading the network would spend the
       // task's read budget to obtain text it already has.
@@ -860,6 +933,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         readStatus: "ok",
         readScope: snapshot.scope,
         readUrl: snapshot.url,
+        role: (repo.getSource(source.id)?.role ?? null) as SourceRole | null,
         textChars: snapshot.text.length,
         paragraphCount: snapshot.paragraphs.length,
         reuse,
@@ -977,14 +1051,20 @@ export function createResearchService(options: ResearchServiceOptions): Research
       }
 
       if (part.kind !== "finalize") {
+        if (part.section !== undefined) {
+          const refusal = unknownSectionRefusal(task, [part.section.id]);
+          if (refusal !== undefined) return refusal;
+        }
         const claims = part.claims === undefined ? current.claims : mergeClaims(current.claims, part.claims);
         const sections =
           part.section === undefined
             ? current.sections
             : [...current.sections.filter((section) => section.id !== part.section?.id), part.section];
+        const frame = part.frame ?? current.frame;
         const draft: ReportDraftState = {
           title: part.title ?? current.title,
           summary: part.summary ?? current.summary,
+          ...(frame === undefined ? {} : { frame }),
           claims,
           sections,
           updatedAt: isoNow(),
@@ -1008,7 +1088,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         return {
           ok: false,
           problems: ["报告草稿还不完整：请先用 save_report 提交 title/summary，再逐节提交 sections，然后 finalize"],
-          guidance: "可以先 part=\"start\" 提交标题与摘要，再多次 part=\"section\" 提交章节，最后 part=\"finalize\"。",
+          guidance: "可以先 part=\"start\" 提交标题与摘要，再多次 part=\"write\" 提交章节，最后 part=\"finalize\"。",
         };
       }
 
@@ -1016,6 +1096,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
       const sealed = this.saveReport(task.id, {
         title: current.title,
         summary: current.summary,
+        ...(current.frame === undefined ? {} : { frame: current.frame }),
         sections: current.sections,
         claims: current.claims,
       });
@@ -1027,15 +1108,42 @@ export function createResearchService(options: ResearchServiceOptions): Research
 
     reportDraftOf: (taskId) => requireTask(taskId).reportDraft,
 
+    previewDraftValidation(taskId) {
+      const task = requireTask(taskId);
+      if (task.reportDraft === null) return null;
+      return validateReport({
+        draft: {
+          title: task.reportDraft.title,
+          summary: task.reportDraft.summary,
+          ...(task.reportDraft.frame === undefined ? {} : { frame: task.reportDraft.frame }),
+          sections: task.reportDraft.sections,
+          claims: task.reportDraft.claims,
+        },
+        task,
+        evidence: repo.listEvidence(task.id),
+        sources: repo.listSources(task.id),
+        assessments: repo.listAssessments(task.id),
+        snapshotText: (readId) => repo.getSnapshot(readId)?.text,
+        now: isoNow(),
+      });
+    },
+
     saveReport(taskId, draft) {
       const task = requireTask(taskId);
       const authRefusal = requireTaskCapability(taskId, "report");
       if (authRefusal !== undefined) return authRefusal;
+      const sectionRefusal = unknownSectionRefusal(
+        task,
+        draft.sections.map((section) => section.id),
+      );
+      if (sectionRefusal !== undefined) return sectionRefusal;
       const evidence = repo.listEvidence(task.id);
       const validation = validateReport({
         draft,
         task,
         evidence,
+        sources: repo.listSources(task.id),
+        assessments: repo.listAssessments(task.id),
         snapshotText: (readId) => repo.getSnapshot(readId)?.text,
         now: isoNow(),
       });
@@ -1045,13 +1153,13 @@ export function createResearchService(options: ResearchServiceOptions): Research
           ok: false,
           problems: refusalsOf(validation),
           guidance:
-            "报告未通过校验：请修正引用（只能使用 load_research_state 中存在的 evidence ID），或删除无法核实的论断后重新保存。",
+            "报告未通过校验：请按问题逐条修正——引用只能使用 load_research_state 中存在的 evidence ID；缺失的章节与维度要补写或写成明确缺口；不可比的数字不要排名。",
         };
       }
 
       const citations = buildCitations({ draft, sources: repo.listSources(task.id), evidence });
       const gaps = missingCells(task);
-      const warnings: string[] = [];
+      const warnings: string[] = [...validation.warnings];
       if (gaps.length > 0) {
         warnings.push(
           `矩阵中仍有 ${gaps.length} 个单元格未达到「已核对」，本次报告的缺口快照会写入报告本身，渲染时附加程序生成的「证据缺口清单」。`,
@@ -1100,6 +1208,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         sources: sources.map((source) => ({
           sourceId: source.id,
           title: source.title,
+          role: source.role ?? null,
           readStatus: source.readStatus,
           readScope: source.readScope,
           url: source.url,
@@ -1123,8 +1232,24 @@ export function createResearchService(options: ResearchServiceOptions): Research
                 reportId: report.id,
                 title: report.title,
                 summary: report.summary,
+                frame: report.frame ?? null,
+                validation: {
+                  ok: report.validation.ok,
+                  warnings: (report.validation.warnings ?? []).slice(0, 12),
+                  checks: (report.validation.checks ?? []).map((check) => ({
+                    id: check.id,
+                    result: check.result,
+                    detail: check.detail,
+                  })),
+                },
                 sections: report.sections.map((section) => ({ id: section.id, title: section.title })),
-                claims: report.claims.map((claim) => ({ id: claim.id, text: claim.text, kind: claim.kind })),
+                claims: report.claims.map((claim) => ({
+                  id: claim.id,
+                  text: claim.text,
+                  kind: claim.kind,
+                  claimType: claim.claimType ?? "fact",
+                  synthesis: claim.synthesis === true,
+                })),
               },
       };
     },
@@ -1367,6 +1492,8 @@ export function createResearchService(options: ResearchServiceOptions): Research
         draft: merged,
         task,
         evidence,
+        sources: repo.listSources(task.id),
+        assessments: repo.listAssessments(task.id),
         snapshotText: (readId) => repo.getSnapshot(readId)?.text,
         now: isoNow(),
       });
@@ -1487,8 +1614,10 @@ export function createResearchService(options: ResearchServiceOptions): Research
   };
 }
 
-/** The sections a report is not publishable without. */
-export const REQUIRED_SECTION_IDS: readonly string[] = ["overview", "representative", "comparison", "limitations"];
+/** The sections a report is not publishable without, per the current blueprint. */
+export const REQUIRED_SECTION_IDS: readonly string[] = TECHNICAL_COMPARISON_V2.sections
+  .filter((section) => section.required)
+  .map((section) => section.id);
 
 /** Replaces claims by id, keeping the order the draft already had. */
 function mergeClaims(current: readonly ReportClaim[], incoming: readonly ReportClaim[]): readonly ReportClaim[] {

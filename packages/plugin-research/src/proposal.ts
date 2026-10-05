@@ -13,7 +13,7 @@
  * Nothing here deletes research: discarding a proposal closes the proposal.
  */
 
-import type { ReportBlock, ReportClaim, ReportSection } from "./domain.js";
+import type { ReportBlock, ReportClaim, ReportFrame, ReportSection } from "./domain.js";
 import { ID_PREFIX } from "./domain.js";
 import { hashOf } from "./hash.js";
 import { newId } from "./repository.js";
@@ -72,6 +72,8 @@ export interface Proposal {
 export interface ProposalBase {
   readonly title: string;
   readonly summary: string;
+  /** The report's declared question, audience and scope, when it has one. */
+  readonly frame?: ReportFrame;
   readonly sections: readonly ReportSection[];
   readonly claims: readonly ReportClaim[];
 }
@@ -109,7 +111,16 @@ export function applyProposal(base: ProposalBase, proposal: Proposal): ProposalB
   const summaryTarget = proposal.targets.some((target) => target.targetType === "summary");
   const summary = summaryTarget && proposal.summary !== null ? proposal.summary : base.summary;
 
-  return { title: base.title, summary, sections, claims };
+  // The report's declared frame is part of the report, so an edit keeps it:
+  // replacing a section is not a way to change what the report claims to be
+  // about. Changing the frame is its own proposal target, not a side effect.
+  return {
+    title: base.title,
+    summary,
+    ...(base.frame === undefined ? {} : { frame: base.frame }),
+    sections,
+    claims,
+  };
 }
 
 export type FreshnessCheck =
@@ -164,14 +175,27 @@ export function checkProposalFreshness(input: {
   return { ok: true };
 }
 
-/** The hashable content of a report-shaped value. */
+/**
+ * The hashable content of a report-shaped value.
+ *
+ * It has to agree with `reportContentHash`, because the set of things a
+ * proposal pins is exactly the set of things that make a report a different
+ * report: wording, frame, structure, claims.
+ */
 export function contentOf(base: ProposalBase): {
   readonly title: string;
   readonly summary: string;
+  readonly frame?: ReportFrame;
   readonly sections: readonly ReportSection[];
   readonly claims: readonly ReportClaim[];
 } {
-  return { title: base.title, summary: base.summary, sections: base.sections, claims: base.claims };
+  return {
+    title: base.title,
+    summary: base.summary,
+    ...(base.frame === undefined ? {} : { frame: base.frame }),
+    sections: base.sections,
+    claims: base.claims,
+  };
 }
 
 export function createProposal(input: {

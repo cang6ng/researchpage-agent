@@ -23,6 +23,7 @@ import type {
   Report,
   ReportBlock,
   ReportClaim,
+  ReportFrame,
   ReportSection,
   ReportTask,
   Source,
@@ -34,7 +35,7 @@ import { evidenceUsedBy } from "./report.js";
 import { newId } from "./repository.js";
 
 /** Named so an old file can say which program produced it. */
-export const RENDERER = Object.freeze({ name: "researchpage-report-html", version: "1.1.0" });
+export const RENDERER = Object.freeze({ name: "researchpage-report-html", version: "2.0.0" });
 
 /** The default theme; v1 renders one theme, and switching one is a later step. */
 export const DEFAULT_THEME_ID = "editorial";
@@ -105,6 +106,8 @@ export interface FrozenRevision {
     readonly id: string;
     readonly title: string;
     readonly summary: string;
+    /** The research question, audience and scope the report declared. */
+    readonly frame?: ReportFrame;
     readonly sections: readonly ReportSection[];
     readonly claims: readonly ReportClaim[];
     readonly validation: Report["validation"];
@@ -235,6 +238,7 @@ export function buildRevisionBundle(input: RevisionBundleInput): FrozenRevision 
       id: input.report.id,
       title: input.report.title,
       summary: input.report.summary,
+      ...(input.report.frame === undefined ? {} : { frame: input.report.frame }),
       sections: input.report.sections,
       claims: input.report.claims,
       validation: input.report.validation,
@@ -268,10 +272,23 @@ export function buildRevisionBundle(input: RevisionBundleInput): FrozenRevision 
 export function reportContentOf(report: {
   readonly title: string;
   readonly summary: string;
+  readonly frame?: ReportFrame;
   readonly sections: readonly ReportSection[];
   readonly claims: readonly ReportClaim[];
-}): { readonly title: string; readonly summary: string; readonly sections: readonly ReportSection[]; readonly claims: readonly ReportClaim[] } {
-  return { title: report.title, summary: report.summary, sections: report.sections, claims: report.claims };
+}): {
+  readonly title: string;
+  readonly summary: string;
+  readonly frame?: ReportFrame;
+  readonly sections: readonly ReportSection[];
+  readonly claims: readonly ReportClaim[];
+} {
+  return {
+    title: report.title,
+    summary: report.summary,
+    ...(report.frame === undefined ? {} : { frame: report.frame }),
+    sections: report.sections,
+    claims: report.claims,
+  };
 }
 
 /** Whether a revision is a frozen dependency bundle rather than a bare report. */
@@ -292,6 +309,8 @@ export function blockText(blocks: readonly ReportBlock[]): string {
           return block.rows.map((row) => row.cells.map((cell) => cell.text).join(" | ")).join("\n");
         case "callout":
           return block.text;
+        case "mechanism":
+          return [block.input, block.intermediate, ...block.steps.map((step) => step.text), block.output, block.tradeoff, block.failure].join("\n");
       }
     })
     .join("\n");

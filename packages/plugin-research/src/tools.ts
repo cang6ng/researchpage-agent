@@ -12,7 +12,18 @@
 
 import type { Tool } from "@every-dagent/agent-core";
 
-import type { CellRef, ReportBlock, ReportClaim, ReportSection } from "./domain.js";
+import type {
+  CellRef,
+  ClaimConditions,
+  ClaimType,
+  Comparability,
+  CostStage,
+  ReportBlock,
+  ReportClaim,
+  ReportFrame,
+  ReportSection,
+  SourceRole,
+} from "./domain.js";
 import type { ResearchService } from "./service.js";
 
 /** The largest tool answer this product writes, well under the Core's item cap. */
@@ -88,6 +99,47 @@ function asRelationship(value: unknown): "supports" | "contradicts" | "contextua
 
 function asDirectness(value: unknown): "direct" | "indirect" | "contextual" | "unassessed" | undefined {
   return value === "direct" || value === "indirect" || value === "contextual" || value === "unassessed" ? value : undefined;
+}
+
+const CLAIM_TYPES: readonly ClaimType[] = ["fact", "mechanism", "comparison", "performance", "cost", "synthesis", "implication"];
+const COST_STAGES: readonly CostStage[] = ["indexing", "query", "update", "operational"];
+const COMPARABILITIES: readonly Comparability[] = ["comparable", "partially-comparable", "not-directly-comparable", "unknown"];
+const BASES = ["author-reported", "external-evaluation", "our-analysis"] as const;
+const SOURCE_ROLES: readonly SourceRole[] = ["primary", "official", "independent-evaluation", "survey", "contextual", "user-provided"];
+
+function asClaimType(value: unknown): ClaimType | undefined {
+  return typeof value === "string" && (CLAIM_TYPES as readonly string[]).includes(value) ? (value as ClaimType) : undefined;
+}
+
+/** Reads the conditions object, keeping only fields the contract defines. */
+function asConditions(value: unknown): ClaimConditions | undefined {
+  const record = asRecord(value);
+  if (record === undefined) return undefined;
+  const conditions: Record<string, unknown> = {};
+  const strings = ["scope", "task", "dataset", "metric", "baseline", "setting"] as const;
+  for (const key of strings) {
+    const text = asString(record[key]);
+    if (text !== undefined) conditions[key] = text;
+  }
+  const costStage = record["costStage"];
+  if (typeof costStage === "string" && (COST_STAGES as readonly string[]).includes(costStage)) conditions["costStage"] = costStage;
+  const comparability = record["comparability"];
+  if (typeof comparability === "string" && (COMPARABILITIES as readonly string[]).includes(comparability)) {
+    conditions["comparability"] = comparability;
+  }
+  const basis = record["basis"];
+  if (typeof basis === "string" && (BASES as readonly string[]).includes(basis)) conditions["basis"] = basis;
+  return Object.keys(conditions).length === 0 ? undefined : (conditions as ClaimConditions);
+}
+
+function asFrame(value: unknown): ReportFrame | undefined {
+  const record = asRecord(value);
+  if (record === undefined) return undefined;
+  const question = asString(record["question"]);
+  const audience = asString(record["audience"]);
+  const scope = asString(record["scope"]);
+  if (question === undefined && audience === undefined && scope === undefined) return undefined;
+  return { question: question ?? "", audience: audience ?? "", scope: scope ?? "" };
 }
 
 function refuse(message: string, guidance: string): string {
@@ -258,13 +310,20 @@ export function createResearchTools(service: ResearchService): ResearchTools {
     description:
       "真实读取一个候选来源并保存读取快照：arXiv 论文优先取 HTML 正文（full_text / body_excerpt），没有正文时退回论文摘要（abstract）。" +
       "工具会从保存的文本中切出与 question/terms 最相关的 1–5 条证据片段（excerpt 为原文原样字符，带位置）。" +
-      "只有这里产生的 evidenceId 才能被报告引用；搜索摘要不能当证据。读取失败会如实记录失败状态。",
+      "只有这里产生的 evidenceId 才能被报告引用；搜索摘要不能当证据。读取失败会如实记录失败状态。\n" +
+      "role：你读完材料后判断这条来源是什么——primary（原始方法/原始研究）、official（官方文档/实现说明）、independent-evaluation（第三方评估）、" +
+      "survey（综述/转述）、contextual（背景资料）。角色的用途只有一个：机制论断优先绑定 primary/official，用 survey 代替时要说明。",
     inputSchema: {
       type: "object",
       properties: {
         sourceId: { type: "string", description: "search_sources 返回的 sourceId" },
         question: { type: "string", description: "这次读取要回答的问题（例如该方法的图构建步骤是什么）" },
         terms: { type: "array", items: { type: "string" }, description: "英文关键词，用于选择片段" },
+        role: {
+          type: "string",
+          enum: ["primary", "official", "independent-evaluation", "survey", "contextual", "user-provided"],
+          description: "这条来源在这次研究中的角色",
+        },
         targetCell: {
           type: "object",
           description: "这些证据要绑定到的矩阵单元格",
@@ -289,6 +348,9 @@ export function createResearchTools(service: ResearchService): ResearchTools {
       if (sourceId === undefined) return refuse("缺少 sourceId", "请使用 search_sources 返回的 sourceId。");
       if (question === undefined) return refuse("缺少 question", "请说明这次读取要回答什么问题。");
       const targetCell = record === undefined ? undefined : asCellRef(record["targetCell"]);
+      const roleValue = record === undefined ? undefined : record["role"];
+      const role =
+        typeof roleValue === "string" && (SOURCE_ROLES as readonly string[]).includes(roleValue) ? (roleValue as SourceRole) : undefined;
       const maxEvidenceValue = record === undefined ? undefined : record["maxEvidence"];
       const maxEvidence =
         typeof maxEvidenceValue === "number" && Number.isFinite(maxEvidenceValue) ? Math.trunc(maxEvidenceValue) : undefined;
@@ -301,6 +363,7 @@ export function createResearchTools(service: ResearchService): ResearchTools {
         question,
         terms: asStringArray(record?.["terms"]),
         ...(targetCell === undefined ? {} : { targetCell }),
+        ...(role === undefined ? {} : { role }),
         ...(maxEvidence === undefined ? {} : { maxEvidence }),
         ...(paragraphIndex === undefined ? {} : { paragraphIndex }),
         signal: context.signal,
@@ -412,27 +475,101 @@ export function createResearchTools(service: ResearchService): ResearchTools {
     name: "load_research_state",
     description:
       "读取当前研究任务的有界状态：任务卡、章节结构、比较对象、研究维度、证据矩阵（含缺口）、来源索引、证据索引、预算使用情况。" +
-      "用于在长任务中恢复上下文；不会返回全文。",
+      "用于在长任务中恢复上下文；不会返回全文。矩阵状态由真实证据与已保存评估推导，可以据此判断哪些维度还缺依据。",
     inputSchema: { type: "object", properties: {}, required: [] },
     async execute(_input, context) {
       const binding = taskFor(context.sessionId);
       if (binding === undefined) return noTask();
-      return boundedJson({ ok: true, state: service.state(binding.taskId) });
+      const state = service.state(binding.taskId);
+      // The tool answer is an index, not a transcript: the model needs ids,
+      // statuses and short labels to decide what to look at next, and the long
+      // prose a reader sees in the workspace would push the payload past the
+      // size the Core will carry.
+      return boundedJson({
+        ok: true,
+        state: {
+          task: {
+            id: state.task.id,
+            topic: state.task.topic,
+            purpose: state.task.purpose,
+            audience: state.task.audience,
+            focus: state.task.focus,
+            lengthTarget: state.task.lengthTarget,
+            status: state.task.status,
+            confirmed: state.task.confirmed,
+          },
+          structure: state.structure.map((section) => ({ id: section.id, title: section.title, question: section.question })),
+          subjects: state.subjects,
+          dimensions: state.dimensions,
+          cells: state.cells.map((cell) => ({
+            subjectId: cell.subjectId,
+            dimensionId: cell.dimensionId,
+            status: cell.status,
+            evidenceIds: cell.evidenceIds,
+            reason: cell.reason.length > 90 ? `${cell.reason.slice(0, 90)}…` : cell.reason,
+            gap: cell.gap.length > 90 ? `${cell.gap.slice(0, 90)}…` : cell.gap,
+          })),
+          sources: state.sources.map((source) => ({
+            sourceId: source.sourceId,
+            title: source.title.length > 90 ? `${source.title.slice(0, 90)}…` : source.title,
+            role: source.role,
+            readStatus: source.readStatus,
+            readScope: source.readScope,
+          })),
+          evidence: state.evidence.map((item) => ({
+            evidenceId: item.evidenceId,
+            sourceId: item.sourceId,
+            scope: item.scope,
+            locator: item.locator,
+            excerpt: item.excerpt.length > 140 ? `${item.excerpt.slice(0, 140)}…` : item.excerpt,
+          })),
+          usage: state.usage,
+          budget: state.budget,
+          currentReportId: state.currentReportId,
+          currentReportHash: state.currentReportHash,
+          reportNeedsReview: state.reportNeedsReview,
+          currentReport:
+            state.currentReport === null
+              ? null
+              : {
+                  reportId: state.currentReport.reportId,
+                  title: state.currentReport.title,
+                  summary: state.currentReport.summary,
+                  sections: state.currentReport.sections,
+                  claims: state.currentReport.claims.map((claim) => ({
+                    id: claim.id,
+                    text: claim.text.length > 120 ? `${claim.text.slice(0, 120)}…` : claim.text,
+                    claimType: claim.claimType,
+                    synthesis: claim.synthesis,
+                  })),
+                },
+        },
+      });
     },
   };
 
   const saveReport: Tool = {
     name: "save_report",
     description:
-      "保存结构化研究报告（不是 HTML）。报告 = title + summary + sections（blocks：paragraph/list/table/callout）+ claims（每条 claim 绑定真实 evidenceId）。" +
-      "只能在被授权撰写报告的阶段调用（生成报告）；Research 动作只有补查权限，Edit 动作只能提交修改提案。" +
+      "保存结构化研究报告（不是 HTML）。报告 = frame（研究问题/读者/范围）+ title + summary + sections（blocks）+ claims（每条 claim 绑定真实 evidenceId）。" +
+      "只能在被授权撰写报告的阶段调用（生成报告 / 综合）；Research 动作只有补查权限，Edit 动作只能提交修改提案。\n" +
       "单次调用的输出有限（约 4096 tokens），长报告请分次提交：" +
-      '先 {part:"start", title, summary}，再 {part:"write", claims:[...]}，' +
-      '然后每节一次 {part:"write", section:{...}}（必需章节 overview/representative/comparison/limitations，可选 background/conditions/reading），' +
-      '最后 {part:"finalize"} 校验并发布；也可以一次性提交完整 {title, summary, sections, claims}。' +
-      "校验内容：必需章节、claim 的 evidence 是否存在且属于本任务、片段是否仍与保存文本一致；标注 inference 的综合判断也要绑定推断依据。" +
-      '没有依据的比较项写成 callout（tone="gap"）明确缺失，不要编造。' +
-      "篇幅建议：表格 ≤3 列、单元格 ≤40 字，段落 ≤150 字，claims ≤8 条。",
+      '先 {part:"start", title, summary, frame}，再 {part:"write", claims:[...]}，' +
+      '然后每节一次 {part:"write", section:{...}}，最后 {part:"finalize"} 校验并发布。\n' +
+      "claim 的 claimType 决定它被如何校验：" +
+      'mechanism（机制：优先原始方法/官方来源）、comparison（比较：声明 subjects≥2 且每个对象都要有依据）、' +
+      'performance（性能：必须声明 conditions.comparability，不可比时不要排名）、' +
+      'cost（成本：必须声明 conditions.costStage，不同口径不能合成「更便宜」）、' +
+      'synthesis（综合判断：必须 synthesis=true 且 ≥2 条来自不同来源的证据）、' +
+      'implication（条件化建议：conditions.scope 必须写明成立条件）。\n' +
+      "conditions 可选字段：scope / task / dataset / metric / baseline / setting / costStage(indexing|query|update|operational) / " +
+      "basis(author-reported|external-evaluation|our-analysis) / comparability(comparable|partially-comparable|not-directly-comparable|unknown)。\n" +
+      "block 种类：paragraph / list / table / callout / mechanism。" +
+      "mechanism 块形状：{kind:'mechanism', title, input, intermediate, steps:[{text,claimIds}], output, tradeoff, failure, claimIds}——" +
+      "它是机制的解释契约，缺步骤或中间产物会被拒绝。" +
+      "比较表要写 columnDimensions（每列对应的研究维度 id，可为 null）与 rowSubjects（每行对应的对象 id）。" +
+      "没有依据的项目写成 callout（tone='gap'，可用 dimensionIds 声明对应维度），不要用常识填空。\n" +
+      "篇幅由各章节的内容义务决定，没有全篇 claim 数量上限；仍受单次输出预算限制，按节提交即可。",
     inputSchema: {
       type: "object",
       properties: {
@@ -444,15 +581,32 @@ export function createResearchTools(service: ResearchService): ResearchTools {
         section: { type: "object", description: "part=write 时提交的单个章节 {id,title,blocks}" },
         title: { type: "string" },
         summary: { type: "string" },
+        frame: {
+          type: "object",
+          description: "报告声明的研究问题、读者与范围（finalize 前必须提供 question 与 scope）",
+          properties: {
+            question: { type: "string", description: "本次研究回答的问题" },
+            audience: { type: "string", description: "读者背景；省略时用任务卡上的读者" },
+            scope: { type: "string", description: "对象与材料范围（比较了哪些对象、读了哪类来源）" },
+          },
+        },
         claims: {
           type: "array",
           items: {
             type: "object",
             properties: {
-              id: { type: "string", description: "claim id，例如 clm_core_idea" },
+              id: { type: "string", description: "claim id，例如 clm_mechanism_index" },
               text: { type: "string" },
               evidenceIds: { type: "array", items: { type: "string" } },
-              kind: { type: "string", enum: ["fact", "comparison", "inference"] },
+              kind: { type: "string", enum: ["fact", "comparison", "inference"], description: "兼容字段；新写法用 claimType" },
+              claimType: {
+                type: "string",
+                enum: ["fact", "mechanism", "comparison", "performance", "cost", "synthesis", "implication"],
+              },
+              subjects: { type: "array", items: { type: "string" }, description: "涉及的对象 id（comparison/performance/cost 必填）" },
+              dimensions: { type: "array", items: { type: "string" }, description: "该论断回答的研究维度 id" },
+              synthesis: { type: "boolean", description: "claimType=synthesis 时必须为 true" },
+              conditions: { type: "object", description: "条件与口径（见工具说明）" },
             },
             required: ["id", "text", "evidenceIds"],
           },
@@ -462,13 +616,18 @@ export function createResearchTools(service: ResearchService): ResearchTools {
           items: {
             type: "object",
             properties: {
-              id: { type: "string", description: "章节 id：overview/background/representative/comparison/conditions/limitations/reading" },
+              id: {
+                type: "string",
+                description:
+                  "章节 id：overview / mental-model / mechanism / representative / comparison / synthesis / limitations / reading",
+              },
               title: { type: "string" },
               blocks: {
                 type: "array",
                 description:
                   "内容块：{kind:'paragraph',text,claimIds}, {kind:'list',items:[{text,claimIds}]}, " +
-                  "{kind:'table',columns:[...],rows:[{cells:[{text,claimIds}]}]}, {kind:'callout',tone:'gap'|'note',text}",
+                  "{kind:'table',columns,rows,columnDimensions,rowSubjects}, {kind:'callout',tone:'gap'|'note',text,dimensionIds}, " +
+                  "{kind:'mechanism',input,intermediate,steps,output,tradeoff,failure,claimIds}",
                 items: { type: "object" },
               },
             },
@@ -512,24 +671,32 @@ export function createResearchTools(service: ResearchService): ResearchTools {
               };
         const title = asString(record["title"]);
         const summary = asString(record["summary"]);
+        const frame = asFrame(record["frame"]);
         const result = service.saveReportPart(binding.taskId, {
           kind: part,
           ...(title === undefined ? {} : { title }),
           ...(summary === undefined ? {} : { summary }),
+          ...(frame === undefined ? {} : { frame }),
           ...(claims === undefined ? {} : { claims }),
           ...(section === undefined ? {} : { section }),
         });
         if (!result.ok) return boundedJson({ ok: false, problems: result.problems, guidance: result.guidance });
         const draft = service.reportDraftOf(binding.taskId);
+        const preview = service.previewDraftValidation(binding.taskId);
         return boundedJson({
           ok: true,
           draft: {
             title: draft?.title ?? "",
+            frameDeclared: draft?.frame !== undefined && draft.frame.question.trim().length > 0,
             summaryLength: draft?.summary.length ?? 0,
             claims: draft?.claims.length ?? 0,
             sections: draft?.sections.map((item) => item.id) ?? [],
           },
           note: result.warnings.join("；"),
+          // The draft's outstanding obligations, surfaced per write so the model
+          // can fix a section while it still has output budget for it.
+          outstanding: preview === null ? [] : preview.problems.slice(0, 6),
+          softObligations: preview === null ? [] : preview.warnings.slice(0, 6),
           next: "继续提交剩余章节，最后用 {part:'finalize'} 校验并发布。",
         });
       }
@@ -540,6 +707,7 @@ export function createResearchTools(service: ResearchService): ResearchTools {
         return refuse("缺少 title 或 summary", "请补充报告标题与摘要，或使用 part 分次提交。");
       }
 
+      const frame = asFrame(record["frame"]);
       const claims: ReportClaim[] = Array.isArray(record["claims"]) ? record["claims"].map(readClaim) : [];
       const sections = Array.isArray(record["sections"])
         ? record["sections"].map((item) => {
@@ -553,7 +721,13 @@ export function createResearchTools(service: ResearchService): ResearchTools {
           })
         : [];
 
-      const result = service.saveReport(binding.taskId, { title, summary, sections, claims });
+      const result = service.saveReport(binding.taskId, {
+        title,
+        summary,
+        ...(frame === undefined ? {} : { frame }),
+        sections,
+        claims,
+      });
       if (!result.ok) return boundedJson({ ok: false, problems: result.problems, guidance: result.guidance });
       return boundedJson({
         ok: true,
@@ -664,11 +838,21 @@ export function createResearchTools(service: ResearchService): ResearchTools {
 function readClaim(value: unknown): ReportClaim {
   const entry = asRecord(value) ?? {};
   const kind = entry["kind"];
+  const claimType = asClaimType(entry["claimType"]);
+  const subjects = asStringArray(entry["subjects"]);
+  const dimensions = asStringArray(entry["dimensions"]);
+  const conditions = asConditions(entry["conditions"]);
+  const synthesis = entry["synthesis"] === true || claimType === "synthesis" ? true : undefined;
   return {
     id: asString(entry["id"]) ?? "",
     text: asString(entry["text"]) ?? "",
     evidenceIds: asStringArray(entry["evidenceIds"]),
-    kind: kind === "comparison" || kind === "inference" ? kind : "fact",
+    kind: kind === "comparison" || kind === "inference" ? kind : claimType === "comparison" ? "comparison" : claimType === "synthesis" ? "inference" : "fact",
+    ...(claimType === undefined ? {} : { claimType }),
+    ...(subjects.length === 0 ? {} : { subjects }),
+    ...(dimensions.length === 0 ? {} : { dimensions }),
+    ...(conditions === undefined ? {} : { conditions }),
+    ...(synthesis === undefined ? {} : { synthesis }),
   };
 }
 
@@ -702,10 +886,49 @@ function normalizeBlock(value: unknown): ReportBlock {
             return { cells };
           })
         : [];
-      return { kind: "table", columns, rows };
+      const columnDimensions = Array.isArray(record["columnDimensions"])
+        ? record["columnDimensions"].map((item) => (typeof item === "string" && item.trim().length > 0 ? item.trim() : null))
+        : undefined;
+      const rowSubjects = Array.isArray(record["rowSubjects"])
+        ? record["rowSubjects"].map((item) => (typeof item === "string" && item.trim().length > 0 ? item.trim() : null))
+        : undefined;
+      return {
+        kind: "table",
+        columns,
+        rows,
+        ...(columnDimensions === undefined ? {} : { columnDimensions }),
+        ...(rowSubjects === undefined ? {} : { rowSubjects }),
+      };
     }
-    case "callout":
-      return { kind: "callout", tone: record["tone"] === "gap" ? "gap" : "note", text };
+    case "callout": {
+      const dimensionIds = asStringArray(record["dimensionIds"]);
+      return {
+        kind: "callout",
+        tone: record["tone"] === "gap" ? "gap" : "note",
+        text,
+        ...(dimensionIds.length === 0 ? {} : { dimensionIds }),
+      };
+    }
+    case "mechanism": {
+      const steps = Array.isArray(record["steps"])
+        ? record["steps"].map((step) => {
+            const entry = asRecord(step) ?? {};
+            return { text: asString(entry["text"]) ?? "", claimIds: asStringArray(entry["claimIds"]) };
+          })
+        : [];
+      const title = asString(record["title"]);
+      return {
+        kind: "mechanism",
+        ...(title === undefined ? {} : { title }),
+        input: asString(record["input"]) ?? "",
+        intermediate: asString(record["intermediate"]) ?? "",
+        steps,
+        output: asString(record["output"]) ?? "",
+        tradeoff: asString(record["tradeoff"]) ?? "",
+        failure: asString(record["failure"]) ?? "",
+        claimIds,
+      };
+    }
     default:
       return { kind: "paragraph", text, claimIds };
   }

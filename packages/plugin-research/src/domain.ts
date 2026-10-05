@@ -140,6 +140,20 @@ export const DEFAULT_BUDGET: ResearchBudget = Object.freeze({
   deadlineMs: 8 * 60 * 1000,
 });
 
+/**
+ * The question the report answers, and the boundary it answers it within.
+ *
+ * Q01 of the report quality contract: a reader must be able to see what was
+ * asked, for whom, and over which objects and material — before judging any
+ * answer. The audience defaults to the task card's; the question and the scope
+ * are the report's own statements and are required.
+ */
+export interface ReportFrame {
+  readonly question: string;
+  readonly audience: string;
+  readonly scope: string;
+}
+
 export interface ReportTask {
   readonly id: string;
   /** The session this task is trusted to; never taken from a model argument. */
@@ -153,6 +167,15 @@ export interface ReportTask {
   readonly lengthTarget: string;
   readonly status: TaskStatus;
   readonly confirmedAt: string | null;
+  /**
+   * The blueprint this card was created under.
+   *
+   * It decides which content obligations the report is validated against. A
+   * task written before blueprints existed has no id and is read as the legacy
+   * structure, so an old project keeps the rules it was written under instead
+   * of failing checks that did not exist yet.
+   */
+  readonly blueprintId?: string;
   readonly structure: { readonly sections: readonly ResearchSection[] };
   readonly subjects: readonly Subject[];
   readonly dimensions: readonly Dimension[];
@@ -188,6 +211,20 @@ export interface ReportReviewFlag {
  * A source's existence is a search fact. Whether it was read, and how much of it
  * was obtained, is a separate fact that only the read layer may set.
  */
+/**
+ * What a source *is* for this research, as opposed to how it was obtained.
+ *
+ * The role is proposed by the agent when it reads the material and is used by
+ * one thing only: deciding whether a claim's evidence is the right kind of
+ * material for that claim — a mechanism claim should stand on the original
+ * method or official documentation rather than on a survey of it. A role is
+ * never turned into a credibility score.
+ */
+export type SourceRole = "primary" | "official" | "independent-evaluation" | "survey" | "contextual" | "user-provided";
+
+/** The roles that can carry a mechanism claim's key evidence. */
+export const PRIMARY_ROLES: readonly SourceRole[] = Object.freeze(["primary", "official"]);
+
 export interface Source {
   readonly id: string;
   readonly taskId: string;
@@ -199,6 +236,8 @@ export interface Source {
   readonly doi: string | null;
   readonly publishedAt: string | null;
   readonly venue: string;
+  /** The agent's proposal for what this source is; `null` when not proposed. */
+  readonly role?: SourceRole | null;
   /** The discovery abstract, kept as search metadata — not as evidence. */
   readonly abstract: string;
   readonly discovery: {
@@ -267,11 +306,85 @@ export interface Evidence {
 
 export type ClaimKind = "fact" | "comparison" | "inference";
 
+/**
+ * What a claim is *for*, which decides what may support it.
+ *
+ * The six types come from the artifact quality contract: a mechanism claim and
+ * a cost claim are not allowed to share one "has evidence, therefore fine"
+ * rule. `fact` remains for statements that are neither a mechanism, a
+ * comparison, a measurement nor a synthesis — a definition, a date, a version.
+ */
+export type ClaimType = "fact" | "mechanism" | "comparison" | "performance" | "cost" | "synthesis" | "implication";
+
+/** Which stage of use a cost claim is about; the stages are not one number. */
+export type CostStage = "indexing" | "query" | "update" | "operational";
+
+/**
+ * Whether two objects' numbers may be set side by side for one question.
+ *
+ * The judgement is about *this comparison*, not about the papers: two results
+ * are comparable when the conditions the question depends on line up, and the
+ * answer is allowed to be "we cannot tell" or "no".
+ */
+export type Comparability = "comparable" | "partially-comparable" | "not-directly-comparable" | "unknown";
+
+/** Where a reported number or cost came from. */
+export type ClaimBasis = "author-reported" | "external-evaluation" | "our-analysis";
+
+/**
+ * The conditions a claim holds under, kept as a small structured object.
+ *
+ * The point is not to model experiments; it is to make the conditions that
+ * decide comparability *checkable*. A performance claim with no task, dataset
+ * or metric cannot be ranked against another method, and the validator can say
+ * so because the fields are there to be missing.
+ */
+export interface ClaimConditions {
+  /** The scope sentence: what this holds for, in the author's own words. */
+  readonly scope?: string;
+  readonly task?: string;
+  readonly dataset?: string;
+  readonly metric?: string;
+  readonly baseline?: string;
+  readonly setting?: string;
+  readonly costStage?: CostStage;
+  readonly basis?: ClaimBasis;
+  readonly comparability?: Comparability;
+}
+
 export interface ReportClaim {
   readonly id: string;
   readonly text: string;
   readonly evidenceIds: readonly string[];
+  /** The legacy three-way kind; kept so old reports and the workspace still read. */
   readonly kind: ClaimKind;
+  /** The claim contract this claim is judged by. Absent means `fact`. */
+  readonly claimType?: ClaimType;
+  /** The comparison subjects this claim is about (task subject ids). */
+  readonly subjects?: readonly string[];
+  /** The research dimensions this claim answers (task dimension ids). */
+  readonly dimensions?: readonly string[];
+  readonly conditions?: ClaimConditions;
+  /**
+   * True when the claim is ResearchPage's own synthesis of several sources.
+   *
+   * It is an explicit mark, not an inference from the wording: the report has
+   * to say which statements are ours, and a synthesis bound to several sources
+   * is the only kind of claim allowed to say something a single source did not.
+   */
+  readonly synthesis?: boolean;
+}
+
+/**
+ * One step of a mechanism, as part of the structured mechanism block.
+ *
+ * Steps are the mechanism's process; the block's own `claimIds` cover the
+ * framing statements (input, intermediate product, output, trade-off, failure
+ * conditions) so each part of the explanation can point at what supports it.
+ */
+export interface MechanismStep {
+  readonly text: string;
+  readonly claimIds: readonly string[];
 }
 
 export type ReportBlock =
@@ -281,8 +394,36 @@ export type ReportBlock =
       readonly kind: "table";
       readonly columns: readonly string[];
       readonly rows: readonly { readonly cells: readonly { readonly text: string; readonly claimIds: readonly string[] }[] }[];
+      /**
+       * Which research dimension each column answers. A comparison table that
+       * does not say so cannot show that every object answered the same
+       * question, which is the whole reason the table exists.
+       */
+      readonly columnDimensions?: readonly (string | null)[];
+      /** Which subject each row is about (task subject ids). */
+      readonly rowSubjects?: readonly (string | null)[];
     }
-  | { readonly kind: "callout"; readonly tone: "gap" | "note"; readonly text: string };
+  | { readonly kind: "callout"; readonly tone: "gap" | "note"; readonly text: string; readonly dimensionIds?: readonly string[] }
+  /**
+   * A mechanism, in the shape its own explanation contract requires.
+   *
+   * There is no renderer for diagrams in this round: the block is a structured
+   * explanation — input, intermediate product, process, output, trade-off and
+   * failure conditions — and the HTML/PDF projection lays it out as steps. The
+   * structure is what the validator reads, so "a mechanism was explained" is a
+   * checkable statement rather than a paragraph that mentions the word.
+   */
+  | {
+      readonly kind: "mechanism";
+      readonly title?: string;
+      readonly input: string;
+      readonly intermediate: string;
+      readonly steps: readonly MechanismStep[];
+      readonly output: string;
+      readonly tradeoff: string;
+      readonly failure: string;
+      readonly claimIds: readonly string[];
+    };
 
 export interface ReportSection {
   readonly id: string;
@@ -302,14 +443,37 @@ export interface ReportSection {
 export interface ReportDraftState {
   readonly title: string;
   readonly summary: string;
+  /** The question, audience and scope the report declares; required to finalize. */
+  readonly frame?: ReportFrame;
   readonly claims: readonly ReportClaim[];
   readonly sections: readonly ReportSection[];
   readonly updatedAt: string;
 }
 
+/**
+ * One quality check's outcome, as the contract asks it to be recorded.
+ *
+ * Each entry names the rule, what was required, how it was checked (program,
+ * assisted, or both), and what happened. Warnings are as much part of the
+ * record as failures: a report that shipped without saying which checks were
+ * soft would be worse than one that listed them.
+ */
+export interface QualityCheckRecord {
+  readonly id: string;
+  readonly requirement: string;
+  readonly mode: "D" | "A" | "D+A" | "A+H" | "D+H";
+  readonly severity: "error" | "warning";
+  readonly result: "pass" | "fail" | "warning" | "not_applicable";
+  readonly detail: string;
+}
+
 export interface ReportValidation {
   readonly ok: boolean;
   readonly problems: readonly string[];
+  /** Contract obligations that were not met but do not block publication. */
+  readonly warnings?: readonly string[];
+  /** The Q-series results, kept with the report they describe. */
+  readonly checks?: readonly QualityCheckRecord[];
   readonly checkedAt: string;
 }
 
@@ -318,6 +482,8 @@ export interface Report {
   readonly taskId: string;
   readonly title: string;
   readonly summary: string;
+  /** The declared research question and scope; absent on pre-v2 reports. */
+  readonly frame?: ReportFrame;
   readonly sections: readonly ReportSection[];
   readonly claims: readonly ReportClaim[];
   readonly validation: ReportValidation;
@@ -376,13 +542,17 @@ export interface ExportArtifact {
  *
  * Each stage is a separate host run, because a run's step budget is the Core's
  * approved profile and a whole research pass does not fit in one: the card is
- * one run, the first search/read/assess pass is one, each gap round is one, and
- * the report is one. `ask` and `edit` are the assistant's own actions, which
- * write nothing to the report. The stage is also what the workspace shows the
- * user, so "what is happening" is a fact about the task rather than about a
- * request. `followup` only survives as the value old records carry.
+ * one run, the first search/read/assess pass is one, each gap round is one, the
+ * report's sections are one, and the synthesis pass that assembles and
+ * validates them is another. That split is a content decision as much as a
+ * budget one — synthesis is its own cognitive step, not the last paragraph of
+ * whatever section was being written. `ask` and `edit` are the assistant's own
+ * actions, which write nothing to the report. The stage is also what the
+ * workspace shows the user, so "what is happening" is a fact about the task
+ * rather than about a request. `followup` only survives as the value old
+ * records carry.
  */
-export type ResearchStage = "card" | "research" | "gap" | "report" | "ask" | "edit" | "followup";
+export type ResearchStage = "card" | "research" | "gap" | "report" | "synthesis" | "ask" | "edit" | "followup";
 
 /** One stage's execution, as the application recorded it. */
 export interface ResearchRunRecord {

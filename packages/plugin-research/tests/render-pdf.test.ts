@@ -269,7 +269,8 @@ describe.skipIf(!enabled)("A3 real render to PDF (network + browser)", () => {
     expect(html).toContain("<table class=\"matrix\">");
     expect(html).toContain("参考来源");
     expect(html).toContain("[1]");
-    expect(html).toContain("证据节选索引");
+    // The default projection is a compact verification index, not an evidence dump.
+    expect(html).toContain("核验索引");
 
     const dir = process.env["RESEARCHPAGE_KEEP_ARTIFACTS"] ?? mkdtempSync(join(tmpdir(), "researchpage-a3-"));
     try {

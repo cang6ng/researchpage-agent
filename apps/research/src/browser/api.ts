@@ -123,7 +123,16 @@ export interface ReportView {
   readonly title: string;
   readonly summary: string;
   readonly createdAt: string;
-  readonly validation: { readonly ok: boolean; readonly problems: readonly string[]; readonly checkedAt: string };
+  /** The question, audience and scope the report declares; null on old reports. */
+  readonly frame: { readonly question: string; readonly audience: string; readonly scope: string } | null;
+  readonly validation: {
+    readonly ok: boolean;
+    readonly problems: readonly string[];
+    /** Obligations the report met softly, and the Q-series record behind them. */
+    readonly warnings: readonly string[];
+    readonly checks: readonly { readonly id: string; readonly result: string; readonly detail: string }[];
+    readonly checkedAt: string;
+  };
   readonly contentHash: string | null;
   readonly gapsCaptured: boolean;
   readonly isCurrent: boolean;
@@ -132,6 +141,8 @@ export interface ReportView {
     readonly id: string;
     readonly text: string;
     readonly kind: "fact" | "comparison" | "inference";
+    readonly claimType: string;
+    readonly synthesis: boolean;
     readonly evidenceIds: readonly string[];
   }[];
 }

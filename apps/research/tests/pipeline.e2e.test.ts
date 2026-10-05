@@ -197,6 +197,29 @@ function scriptedResearchModel(): { readonly client: ModelClient; readonly calls
       };
       const say = (text: string): readonly ModelEvent[] => [{ type: "text-delta", text }, { type: "done" }];
 
+      // The bounded view the product hands the model: the task's subjects,
+      // dimensions and evidence index, read back from the most recent load.
+      const latestResearchView = (): {
+        readonly subjects: readonly { readonly id: string; readonly name: string }[];
+        readonly dimensions: readonly { readonly id: string; readonly name: string }[];
+        readonly evidenceForSubject: (subjectId: string) => string[];
+      } => {
+        const loads = results.filter((result) => result.name === "load_research_state");
+        const state = (loads[loads.length - 1]?.value["state"] ?? {}) as {
+          subjects?: { id: string; name: string }[];
+          dimensions?: { id: string; name: string }[];
+          cells?: { subjectId: string; dimensionId: string; evidenceIds: string[] }[];
+        };
+        const cells = state.cells ?? [];
+        return {
+          subjects: state.subjects ?? [],
+          dimensions: state.dimensions ?? [],
+          evidenceForSubject: (subjectId: string): string[] => [
+            ...new Set(cells.filter((cell) => cell.subjectId === subjectId).flatMap((cell) => cell.evidenceIds)),
+          ],
+        };
+      };
+
       // 1. The card stage.
       if (instruction.includes("建立研究任务卡")) {
         return next(
@@ -341,131 +364,317 @@ function scriptedResearchModel(): { readonly client: ModelClient; readonly calls
         return next(say("补查完成，剩余缺口将在报告中如实标注。"));
       }
 
-      // 4. The report stage: the incremental protocol, then the closing sentence.
-      if (instruction.includes("写出结构化研究报告")) {
-        const saved = results.filter((result) => result.name === "save_report");
-        if (saved.some((result) => typeof result.value["reportId"] === "string" && result.value["reportId"] !== "")) {
-          return next(say("报告已保存，可在工作台预览与导出。"));
+      // 4. The report stage: the frame-and-mechanism pass. It writes the
+      //    sections that explain what the objects are and how they work, and
+      //    stops; the synthesis pass compares, concludes and publishes.
+      if (instruction.includes("前半部分") || instruction.includes("报告的第一部分")) {
+        if (runInstruction !== instruction) {
+          runInstruction = instruction;
+          runStep = 0;
         }
-        const evidence = results
-          .filter((result) => result.name === "read_source")
-          .flatMap((result) => ((result.value["evidence"] ?? []) as { evidenceId: string }[]).map((item) => item.evidenceId));
-        const card = results.find((result) => result.name === "propose_task");
-        const subjects = (card?.value["subjects"] ?? []) as { id: string; name: string }[];
-        const dimensions = (card?.value["dimensions"] ?? []) as { id: string; name: string }[];
-        const first = evidence[0] ?? "";
-        const second = evidence[Math.min(1, evidence.length - 1)] ?? first;
-        const third = evidence[Math.min(2, evidence.length - 1)] ?? first;
+        runStep += 1;
+        if (runStep === 1) return next(call("load_research_state", {}));
 
-        // One part per step — start, claims, four sections, finalize — which is
-        // what a real model has to do: a whole report does not fit in one
-        // step's output budget.
-        const submitted = saved.length;
-        if (submitted === 0) {
+        const view = latestResearchView();
+        const { subjects, dimensions, evidenceForSubject } = view;
+        const dim = (index: number): string => dimensions[index]?.id ?? "";
+        const subjectIds = subjects.map((subject) => subject.id);
+        const a = evidenceForSubject(subjectIds[0] ?? "")[0] ?? "";
+        const b = evidenceForSubject(subjectIds[1] ?? "")[0] ?? a;
+        const aCost = evidenceForSubject(subjectIds[0] ?? "")[1] ?? a;
+        const bCost = evidenceForSubject(subjectIds[1] ?? "")[1] ?? b;
+
+        if (runStep === 2) {
           return next(
             call("save_report", {
               part: "start",
-              title: "GraphRAG 与 HippoRAG：图结构检索方法的机制比较",
+              title: "GraphRAG 与 HippoRAG：机制差异与证据边界",
               summary:
-                "本报告比较两种以图结构组织知识的检索方法：GraphRAG 用实体知识图谱与社区摘要支撑覆盖整个语料的问答，HippoRAG 用知识图谱作为长期记忆索引支撑多跳整合检索。",
-            }),
-          );
-        }
-        if (submitted === 1) {
-          return next(
-            call("save_report", {
-              part: "write",
+                "本报告比较两种以图结构组织知识的方法在构建与检索机制上的差异，并说明现有材料不能支持的结论：没有独立评估，成本口径不可比。",
+              frame: {
+                question: "GraphRAG 与 HippoRAG 在机制上有什么可比较的差异，现有材料能支持到什么程度？",
+                audience: "计算机专业研究生的组会",
+                scope: "只覆盖 GraphRAG 与 HippoRAG 的方法论文与读到的相关材料，不声称覆盖该领域全部工作。",
+              },
               claims: [
-              { id: "clm_graphrag_build", text: "GraphRAG 先抽取实体与关系，再做社区检测与摘要生成。", evidenceIds: [first], kind: "fact" },
-              { id: "clm_hipporag_build", text: "HippoRAG 用开放信息抽取构建知识图谱作为检索的记忆结构。", evidenceIds: [second], kind: "fact" },
-              { id: "clm_retrieval", text: "两者的检索机制不同：社区摘要驱动的全局搜索，与基于图扩散的单步多跳检索。", evidenceIds: [first, second], kind: "comparison" },
-                { id: "clm_cost", text: "两者的索引成本都是一次性的构建开销，查询成本结构不同。", evidenceIds: [third], kind: "inference" },
+                {
+                  id: "clm_graphrag_build",
+                  claimType: "mechanism",
+                  text: "GraphRAG 先抽取实体与关系，再对图做社区检测并预生成社区摘要。",
+                  evidenceIds: [a],
+                  kind: "fact",
+                  subjects: [subjectIds[0] ?? ""],
+                  dimensions: [dim(0), dim(1)],
+                },
+                {
+                  id: "clm_hipporag_build",
+                  claimType: "mechanism",
+                  text: "HippoRAG 用开放信息抽取构建图索引，查询时在图上做扩散检索。",
+                  evidenceIds: [b],
+                  kind: "fact",
+                  subjects: [subjectIds[1] ?? ""],
+                  dimensions: [dim(1), dim(2)],
+                },
+                {
+                  id: "clm_compare_build",
+                  claimType: "comparison",
+                  text: "两者的构建产物不同：GraphRAG 产出社区摘要，HippoRAG 产出可扩散的图索引。",
+                  evidenceIds: [a, b],
+                  kind: "comparison",
+                  subjects: subjectIds,
+                  dimensions: [dim(1)],
+                  conditions: { scope: "只比较构建产物与检索方式，不比较效果。" },
+                },
+                {
+                  id: "clm_cost",
+                  claimType: "cost",
+                  text: "在各自报告的实验中，GraphRAG 的索引成本随语料规模增长；HippoRAG 报告一次构建后按查询扩散。",
+                  evidenceIds: [aCost, bCost],
+                  kind: "fact",
+                  subjects: subjectIds,
+                  conditions: {
+                    costStage: "indexing",
+                    comparability: "not-directly-comparable",
+                    basis: "author-reported",
+                    scope: "两篇论文各自报告口径，规模与硬件未对齐，不能直接比较。",
+                  },
+                },
+                {
+                  id: "clm_limit",
+                  claimType: "fact",
+                  text: "现有材料没有独立评估：效果与成本都来自各自论文的自报口径。",
+                  evidenceIds: [aCost],
+                  kind: "fact",
+                },
               ],
             }),
           );
         }
 
-        const SECTIONS: readonly { readonly id: string; readonly title: string; readonly blocks: readonly unknown[] }[] = [
+        const passOneSections: readonly { readonly id: string; readonly title: string; readonly blocks: readonly unknown[] }[] = [
+          {
+            id: "overview",
+            title: "一、研究问题与关键认识",
+            blocks: [
               {
-                id: "overview",
-                title: "一、研究任务与关键认识",
-                blocks: [
-                  { kind: "paragraph", text: "本次研究面向组会汇报，比较两种图结构检索方法的机制差异与适用条件。", claimIds: [] },
-                  { kind: "paragraph", text: "GraphRAG 在索引阶段构建实体图谱与社区摘要，回答需要覆盖整个语料的问题。", claimIds: ["clm_graphrag_build"] },
-                  { kind: "paragraph", text: "HippoRAG 把知识图谱当作长期记忆索引，用单步图扩散完成多跳检索。", claimIds: ["clm_hipporag_build"] },
+                kind: "paragraph",
+                text: "本次研究为组会汇报比较两种图结构检索方法，材料只覆盖读到的两篇方法论文，范围与结论都限定在这批材料内。",
+                claimIds: [],
+              },
+              {
+                kind: "list",
+                items: [
+                  { text: "两者都使用图结构，但结构信息被使用的位置不同。", claimIds: ["clm_compare_build"] },
+                  { text: "成本来自各自论文口径，不能直接比较。", claimIds: ["clm_cost"] },
                 ],
               },
               {
-                id: "background",
-                title: "二、背景与方法分类",
-                blocks: [
-                  {
-                    kind: "list",
-                    items: [
-                      { text: "全局式问答：需要在语料级别归纳，而不是召回若干片段。", claimIds: [] },
-                      { text: "多跳整合检索：答案分布在多个文档，需要沿关系链连接。", claimIds: [] },
-                    ],
-                  },
-                ],
+                kind: "callout",
+                tone: "gap",
+                text: "关键限制：没有独立评估，效果差异只能按各自报告的实验理解；本报告不给出排名。",
+              },
+            ],
+          },
+          {
+            id: "mental-model",
+            title: "二、概念坐标",
+            blocks: [
+              {
+                kind: "paragraph",
+                text: "图结构检索的共同思路是把实体与关系显式保存成结构，再让查询使用它；可以按「结构在哪个阶段被使用」分类：构建期预生成摘要，或查询期在图上扩散。理解这条轴之后，后面的比较才有共同坐标。",
+                claimIds: ["clm_graphrag_build"],
               },
               {
-                id: "representative",
-                title: "三、代表工作",
-                blocks: [
-                  { kind: "paragraph", text: "GraphRAG（Edge 等）提出图谱加社区摘要的路线。", claimIds: ["clm_graphrag_build"] },
-                  { kind: "paragraph", text: "HippoRAG（Gutiérrez 等）提出图谱作记忆索引的路线。", claimIds: ["clm_hipporag_build"] },
+                kind: "list",
+                items: [
+                  { text: "社区摘要：面向语料级问题的预生成描述。", claimIds: ["clm_graphrag_build"] },
+                  { text: "图索引：查询时用于多跳整合的结构。", claimIds: ["clm_hipporag_build"] },
                 ],
               },
+            ],
+          },
+          {
+            id: "mechanism",
+            title: "三、机制解释",
+            blocks: [
               {
+                kind: "mechanism",
+                title: "GraphRAG：抽取、社区检测、摘要",
+                input: "整份语料的文本单元。",
+                intermediate: "实体关系图与社区层级摘要。",
+                steps: [
+                  { text: "从每个文本单元抽取实体与关系。", claimIds: ["clm_graphrag_build"] },
+                  { text: "对图做社区检测，并为每个社区生成摘要。", claimIds: ["clm_graphrag_build"] },
+                ],
+                output: "查询时可被组织成全局回答的社区摘要。",
+                tradeoff: "用一次覆盖全语料的处理换取语料级归纳能力。",
+                failure: "图抽取质量差时，社区摘要会失真。",
+                claimIds: ["clm_graphrag_build"],
+              },
+              {
+                kind: "mechanism",
+                title: "HippoRAG：同图索引与扩散检索",
+                input: "文档与抽取出的三元组。",
+                intermediate: "文档节点与实体节点共享的图索引。",
+                steps: [
+                  { text: "用开放信息抽取得到三元组并与文档同图。", claimIds: ["clm_hipporag_build"] },
+                  { text: "查询时以查询实体为种子在图上扩散，得到整合证据。", claimIds: ["clm_hipporag_build"] },
+                ],
+                output: "一次扩散即可覆盖多跳的证据集合。",
+                tradeoff: "把整合成本放到查询期的图计算，索引期更轻。",
+                failure: "查询实体有歧义时扩散会跑到无关子图。",
+                claimIds: ["clm_hipporag_build"],
+              },
+            ],
+          },
+          {
+            id: "representative",
+            title: "四、代表工作与对象身份",
+            blocks: [
+              { kind: "paragraph", text: "GraphRAG（Edge 等）以社区摘要为核心产物。", claimIds: ["clm_graphrag_build"] },
+              { kind: "paragraph", text: "HippoRAG 以图上的扩散检索为核心机制。", claimIds: ["clm_hipporag_build"] },
+            ],
+          },
+        ];
+        const nextSection = passOneSections[runStep - 3];
+        if (nextSection !== undefined) return next(call("save_report", { part: "write", section: nextSection }));
+        return next(say("第一部分（框架与机制）已提交，等待综合阶段完成比较、综合与发布。"));
+      }
+
+      // 5. The synthesis stage: comparison under shared conditions, the
+      //    cross-source judgement, the limits — then validation.
+      if (instruction.includes("综合成有界的判断") || instruction.includes("写第二部分")) {
+        if (runInstruction !== instruction) {
+          runInstruction = instruction;
+          runStep = 0;
+        }
+        runStep += 1;
+        if (runStep === 1) return next(call("load_research_state", {}));
+
+        const view = latestResearchView();
+        const subjects = view.subjects;
+        const dimensions = view.dimensions;
+        const subjectIds = subjects.map((subject) => subject.id);
+        const dim = (index: number): string => dimensions[index]?.id ?? "";
+        const a = view.evidenceForSubject(subjectIds[0] ?? "")[0] ?? "";
+        const b = view.evidenceForSubject(subjectIds[1] ?? "")[0] ?? a;
+
+        if (runStep === 2) {
+          return next(
+            call("save_report", {
+              part: "write",
+              section: {
                 id: "comparison",
-                title: "四、共同维度比较",
+                title: "五、条件化比较",
                 blocks: [
                   {
                     kind: "table",
-                    columns: ["方法", dimensions[0]?.name ?? "核心思想", dimensions[2]?.name ?? "检索机制"],
+                    columns: ["对象", dimensions[1]?.name ?? "结构与构建", dimensions[2]?.name ?? "检索机制"],
+                    columnDimensions: [null, dim(1), dim(2)],
+                    rowSubjects: subjectIds,
                     rows: [
                       {
                         cells: [
-                          { text: "GraphRAG", claimIds: [] },
-                          { text: "社区摘要支撑全局归纳问答", claimIds: ["clm_graphrag_build"] },
-                          { text: "全局搜索映射到社区摘要；局部搜索沿实体邻域展开", claimIds: ["clm_retrieval"] },
+                          { text: subjects[0]?.name ?? "GraphRAG", claimIds: [] },
+                          { text: "实体图 + 社区摘要", claimIds: ["clm_graphrag_build"] },
+                          { text: "全局搜索映射到社区摘要", claimIds: ["clm_compare_build"] },
                         ],
                       },
                       {
                         cells: [
-                          { text: "HippoRAG", claimIds: [] },
-                          { text: "图谱作为长期记忆索引", claimIds: ["clm_hipporag_build"] },
-                          { text: "以查询实体为种子的个性化 PageRank 单步检索", claimIds: ["clm_retrieval"] },
+                          { text: subjects[1]?.name ?? "HippoRAG", claimIds: [] },
+                          { text: "文档与三元组同图", claimIds: ["clm_hipporag_build"] },
+                          { text: "以查询实体为种子的扩散检索", claimIds: ["clm_compare_build"] },
                         ],
                       },
                     ],
                   },
+                  { kind: "paragraph", text: "两者的构建产物不同，这是比较中最直接的差异。", claimIds: ["clm_compare_build"] },
                   {
                     kind: "callout",
                     tone: "gap",
-                    text: "成本与部署：本次材料只读到构建成本结构，未取得可直接比较的硬件与运行条件，暂不下结论。",
+                    dimensionIds: [dim(3), dim(4), dim(5)],
+                    text: "实验与评测、成本与资源条件、局限与风险三个维度：本次只读到各自论文的自报口径，没有共同设置下的对照，只能并列报告，不作统一排名。",
                   },
                 ],
               },
-              {
+            }),
+          );
+        }
+        if (runStep === 3) {
+          return next(
+            call("save_report", {
+              part: "write",
+              claims: [
+                {
+                  id: "clm_synthesis",
+                  claimType: "synthesis",
+                  synthesis: true,
+                  text: "综合两篇方法论文可以看出：差异不在是否使用图结构，而在结构信息被使用的阶段——构建期预生成，还是查询期现算。",
+                  evidenceIds: [a, b],
+                  kind: "inference",
+                  subjects: subjectIds,
+                  conditions: { scope: "由两条机制证据共同支持；没有独立评估，属于我们的综合判断。" },
+                },
+                {
+                  id: "clm_implication",
+                  claimType: "implication",
+                  text: "若主要问题是语料级的全局归纳，可先评估 GraphRAG；若主要是多跳事实整合，可先评估 HippoRAG。",
+                  evidenceIds: [a, b],
+                  kind: "inference",
+                  subjects: subjectIds,
+                  conditions: { scope: "条件取决于实际查询类型；两篇论文的评测设置不同，需要在自己的数据上验证后再决定。" },
+                },
+              ],
+            }),
+          );
+        }
+        if (runStep === 4) {
+          return next(
+            call("save_report", {
+              part: "write",
+              section: {
+                id: "synthesis",
+                title: "六、综合判断与权衡",
+                blocks: [
+                  {
+                    kind: "paragraph",
+                    text: "综合两篇方法论文可以看出：差异不在是否使用图结构，而在结构信息被使用的阶段。",
+                    claimIds: ["clm_synthesis"],
+                  },
+                  {
+                    kind: "paragraph",
+                    text: "这个区分带来一个可检验的取舍：构建期预生成把成本放在索引阶段，查询期扩散把成本放在查询阶段；两者的成本对照在各自论文中口径不同，因此这里只作为条件化建议。",
+                    claimIds: ["clm_implication"],
+                  },
+                ],
+              },
+            }),
+          );
+        }
+        if (runStep === 5) {
+          return next(
+            call("save_report", {
+              part: "write",
+              section: {
                 id: "limitations",
-                title: "五、局限与证据缺口",
+                title: "七、局限、未知与下一步",
                 blocks: [
                   {
                     kind: "list",
                     items: [
-                      { text: "两种方法面向的问答类型不同，跨方法性能排名需要谨慎。", claimIds: [] },
-                      { text: "本报告未覆盖全部实验设置与资源条件。", claimIds: [] },
+                      { text: "缺独立评估：效果差异只有作者自报口径。", claimIds: ["clm_limit"] },
+                      { text: "成本口径不同：规模与硬件未对齐，不能合成一个「更便宜」。", claimIds: ["clm_cost"] },
+                      { text: "下一步应查共同设置下的对照实验，或在自己的语料上做小规模验证。", claimIds: [] },
                     ],
                   },
                 ],
               },
-        ];
-        const nextSection = SECTIONS[submitted - 2];
-        if (nextSection !== undefined) {
-          return next(call("save_report", { part: "write", section: nextSection }));
+            }),
+          );
         }
-        return next(call("save_report", { part: "finalize" }));
+        if (runStep === 6) return next(call("save_report", { part: "finalize" }));
+        return next(say("比较、综合与结论已提交，报告已保存并可在工作台预览与导出。"));
       }
 
       return next(say("已按当前指令处理。"));
@@ -609,7 +818,10 @@ describe("the product, end to end, offline", () => {
     expect(stages[0]).toBe("research");
     expect(stages.filter((stage) => stage === "gap").length).toBeGreaterThanOrEqual(1);
     expect(stages.filter((stage) => stage === "gap").length).toBeLessThanOrEqual(2);
-    expect(stages[stages.length - 1]).toBe("report");
+    // The report stage writes the sections; the synthesis pass is the one
+    // that concludes and publishes, so it is the last stage of a pass.
+    expect(stages).toContain("report");
+    expect(stages[stages.length - 1]).toBe("synthesis");
     expect(bundle.runs.every((run) => run.status === "completed")).toBe(true);
 
     // 3b. The structure drove the work, not just the report's headings: the
@@ -664,10 +876,10 @@ describe("the product, end to end, offline", () => {
     // 7. HTML preview renders the report, the table and the references.
     const html = await get(`/api/research/reports/${current!.reportId}/html`);
     expect(html.status).toBe(200);
-    expect(html.text).toContain("研究任务与关键认识");
+    expect(html.text).toContain("研究问题与关键认识");
     expect(html.text).toContain("<table class=\"matrix\">");
     expect(html.text).toContain("参考来源");
-    expect(html.text).toContain("证据节选索引");
+    expect(html.text).toContain("核验索引");
     expect(html.text).not.toContain("<script");
 
     // 8. A real PDF was exported (the runner does it the moment a report lands).

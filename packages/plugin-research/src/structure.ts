@@ -1,12 +1,11 @@
 /**
- * The one research structure, and how a topic becomes an executable task card.
+ * The research structure, and how a topic becomes an executable task card.
  *
- * v1 ships exactly one structure — a technical survey that compares 2–4
- * representative works across shared dimensions — and it is a plain TypeScript
- * value rather than a template system, because the interesting part is not the
- * configuration format: it is that these sections, subjects and dimensions
- * actually drive queries, the evidence matrix and the report. Every id a model
- * later cites comes from here, minted by the program.
+ * The structure a new card is created under is Technical Comparison v2: a plain
+ * TypeScript blueprint value rather than a template system, because the
+ * interesting part is not the configuration format: it is that these sections,
+ * subjects and dimensions actually drive queries, the evidence matrix and the
+ * report. Every id a model later cites comes from here, minted by the program.
  */
 
 import type {
@@ -17,70 +16,30 @@ import type {
   Subject,
 } from "./domain.js";
 import { DEFAULT_BUDGET, emptyUsage } from "./domain.js";
+import { BLUEPRINT_ID_V2, TECHNICAL_COMPARISON_V2, V2_COMPARISON_DIMENSIONS, blueprintSections } from "./blueprint.js";
 import { newId, type ResearchRepository } from "./repository.js";
 import { ID_PREFIX } from "./domain.js";
 
-export const STRUCTURE_ID = "technical-comparison-v1";
+export const STRUCTURE_ID = BLUEPRINT_ID_V2;
 
 /**
  * The sections of the structure, each a research question the report must
  * answer. `required` sections are the ones a report is not publishable without;
- * the rest are filled when the material supports them.
+ * the rest are filled when the material supports them. The list is derived from
+ * the blueprint so that what the card shows and what the report is validated
+ * against cannot drift apart.
  */
-export const STRUCTURE_SECTIONS: readonly (ResearchSection & { readonly required: boolean })[] = Object.freeze([
-  {
-    id: "overview",
-    title: "研究任务与关键认识",
-    question: "为谁研究、研究什么，主要认识是什么，证据边界在哪里",
-    required: true,
-  },
-  {
-    id: "background",
-    title: "背景与方法分类",
-    question: "问题是什么，代表方法可以按什么维度分类",
-    required: false,
-  },
-  {
-    id: "representative",
-    title: "代表工作",
-    question: "每个研究对象的核心主张与做法是什么",
-    required: true,
-  },
-  {
-    id: "comparison",
-    title: "共同维度比较",
-    question: "在统一维度下，各对象的具体差异是什么",
-    required: true,
-  },
-  {
-    id: "conditions",
-    title: "实验与适用条件",
-    question: "实验设置、数据与资源条件是否可比，结论在什么条件下成立",
-    required: false,
-  },
-  {
-    id: "limitations",
-    title: "局限与证据缺口",
-    question: "材料自身的局限、没有找到依据的项目、不能下的结论是什么",
-    required: true,
-  },
-  {
-    id: "reading",
-    title: "阅读建议",
-    question: "按什么顺序读这些材料最有效率",
-    required: false,
-  },
-]);
+export const STRUCTURE_SECTIONS: readonly (ResearchSection & { readonly required: boolean })[] = Object.freeze(
+  TECHNICAL_COMPARISON_V2.sections.map((section) => ({
+    id: section.id,
+    title: section.title,
+    question: section.question,
+    required: section.required,
+  })),
+);
 
 /** The dimensions a comparison must cover, unless the card says otherwise. */
-export const DEFAULT_DIMENSIONS: readonly Dimension[] = Object.freeze([
-  { id: "dim_core_idea", name: "核心思想", question: "该方法要解决什么问题，核心思路是什么" },
-  { id: "dim_construction", name: "结构与构建", question: "图/记忆/结构具体如何构建，需要哪些步骤与数据" },
-  { id: "dim_retrieval", name: "检索机制", question: "查询时如何检索或整合信息" },
-  { id: "dim_evaluation", name: "实验与评测", question: "在什么数据与指标上被验证，设置是否可比" },
-  { id: "dim_cost", name: "成本与部署", question: "构建与查询成本、依赖的资源条件是什么" },
-  { id: "dim_limits", name: "局限与风险", question: "作者报告或明显的局限是什么" },
-]);
+export const DEFAULT_DIMENSIONS: readonly Dimension[] = V2_COMPARISON_DIMENSIONS;
 
 export function slugId(prefix: string, name: string, index: number): string {
   const slug = name
@@ -208,7 +167,8 @@ export function createTask(input: {
     lengthTarget: input.card.lengthTarget,
     status: "draft",
     confirmedAt: null,
-    structure: { sections: STRUCTURE_SECTIONS.map(({ required: _required, ...section }) => section) },
+    blueprintId: BLUEPRINT_ID_V2,
+    structure: { sections: blueprintSections(TECHNICAL_COMPARISON_V2) },
     subjects: input.card.subjects,
     dimensions: input.card.dimensions,
     matrix: buildMatrix(input.card.subjects, input.card.dimensions, input.now),

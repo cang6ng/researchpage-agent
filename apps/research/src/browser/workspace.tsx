@@ -31,6 +31,17 @@ import {
 
 const POLL_MS = 1_500;
 
+/** What a claim's contract type is called in the workspace. */
+const CLAIM_TYPE_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  fact: "事实",
+  mechanism: "机制",
+  comparison: "比较",
+  performance: "性能",
+  cost: "成本",
+  synthesis: "综合判断",
+  implication: "条件化建议",
+});
+
 function when(iso: string | null): string {
   if (iso === null) return "—";
   const date = new Date(iso);
@@ -335,6 +346,21 @@ export function Workspace() {
             <p className="empty">报告尚未生成。</p>
           ) : (
             <div className="report">
+              {currentReport.frame === null ? null : (
+                <p className="hint" data-testid="report-frame-question">
+                  研究问题：{currentReport.frame.question}｜范围：{currentReport.frame.scope}
+                </p>
+              )}
+              {currentReport.validation.warnings.length === 0 ? null : (
+                <details className="hint hint--warn" data-testid="report-warnings">
+                  <summary>质量检查提醒 {currentReport.validation.warnings.length} 条（不阻止发布）</summary>
+                  <ul>
+                    {currentReport.validation.warnings.map((warning) => (
+                      <li key={warning}>{warning}</li>
+                    ))}
+                  </ul>
+                </details>
+              )}
               <iframe
                 className="report__frame"
                 title="报告预览"
@@ -754,7 +780,9 @@ function ProgressPanel({
               .filter((report) => report.isCurrent)
               .flatMap((report) => report.claims.map((claim) => (
                 <li key={claim.id}>
-                  <span className={`tag tag--${claim.kind}`}>{claim.kind === "inference" ? "综合判断" : claim.kind === "comparison" ? "比较" : "事实"}</span>
+                  <span className={`tag tag--${claim.claimType === "fact" ? claim.kind : claim.claimType}`}>
+                    {CLAIM_TYPE_LABELS[claim.claimType] ?? "事实"}
+                  </span>
                   <span className="claims__text">{short(claim.text, 120)}</span>
                   <span className="claims__evidence">
                     {claim.evidenceIds.map((id) => (

@@ -150,8 +150,11 @@ function scriptedModel(): Scripted {
    * and dimensions in its own instruction, but the *ids* only ever came back
    * from `propose_task`, so the script keeps them.
    */
-  let card: { subjects: { id: string }[]; dimensions: { id: string }[] } | undefined;
+  let card: { subjects: { id: string; name: string }[]; dimensions: { id: string; name: string }[] } | undefined;
   let step = 0;
+  /** The instruction currently being served, and how many steps it has taken. */
+  let runInstruction = "";
+  let runStep = 0;
   const next = (events: readonly ModelEvent[]): AsyncIterable<ModelEvent> =>
     (async function* () {
       for (const event of events) yield event;
@@ -166,8 +169,8 @@ function scriptedModel(): Scripted {
       const cardResult = results.find((result) => result.name === "propose_task");
       if (cardResult !== undefined) {
         card = {
-          subjects: (cardResult.value["subjects"] ?? []) as { id: string }[],
-          dimensions: (cardResult.value["dimensions"] ?? []) as { id: string }[],
+          subjects: (cardResult.value["subjects"] ?? []) as { id: string; name: string }[],
+          dimensions: (cardResult.value["dimensions"] ?? []) as { id: string; name: string }[],
         };
       }
       const call = (name: string, input: unknown): readonly ModelEvent[] => {
@@ -202,16 +205,25 @@ function scriptedModel(): Scripted {
         const subjects = card?.subjects ?? [];
         const dimensions = card?.dimensions ?? [];
         if (searches.length === 0) {
-          return next(call("search_sources", { query: "GraphRAG graph construction summarization", limit: 1 }));
+          return next(call("search_sources", { query: "GraphRAG graph construction summarization", limit: 2 }));
         }
-        if (reads.length === 0) {
-          const sources = (searches[0]!.value["sources"] ?? []) as { sourceId: string }[];
+        const found = (searches[0]!.value["sources"] ?? []) as { sourceId: string }[];
+        const unreadFound = found.filter((source) => !reads.some((result) => String(result.value["sourceId"]) === source.sourceId));
+        if (unreadFound.length > 0) {
+          // One read per compared object: the second source is the other
+          // method's material, which the synthesis has to stand on.
+          const index = found.length - unreadFound.length;
           return next(
             call("read_source", {
-              sourceId: sources[0]!.sourceId,
-              question: "GraphRAG 的结构如何构建",
+              sourceId: unreadFound[0]!.sourceId,
+              question: `${subjects[index]?.name ?? "该方法"} 的结构如何构建`,
               terms: ["graph", "construction", "community"],
-              targetCell: { sectionId: "comparison", subjectId: subjects[0]!.id, dimensionId: dimensions[1]!.id },
+              targetCell: {
+                sectionId: "comparison",
+                subjectId: subjects[index]?.id ?? subjects[0]!.id,
+                dimensionId: dimensions[1]!.id,
+              },
+              role: "primary",
               maxEvidence: 2,
             }),
           );
@@ -259,6 +271,7 @@ function scriptedModel(): Scripted {
               question: "构建成本与资源条件",
               terms: ["cost", "construction", "corpus"],
               targetCell: { sectionId: "comparison", subjectId: subjects[0]!.id, dimensionId: dimensions[1]!.id },
+              role: "primary",
               maxEvidence: 2,
             }),
           );
@@ -289,70 +302,238 @@ function scriptedModel(): Scripted {
         return next(say("补查结束：材料已更新，报告正文保持不变。"));
       }
 
-      if (instruction.includes("写出结构化研究报告")) {
-        const saved = results.filter((result) => result.name === "save_report");
-        if (saved.some((result) => typeof result.value["reportId"] === "string" && result.value["reportId"] !== "")) {
-          return next(say("报告已保存。"));
+      if (instruction.includes("写出结构化研究报告") || instruction.includes("报告的第一部分")) {
+        if (runInstruction !== instruction) {
+          runInstruction = instruction;
+          runStep = 0;
         }
-        // A real report stage reads the state first: the evidence ids belong to
-        // the task, not to this run's tool results.
-        const stateResult = results.find((result) => result.name === "load_research_state");
-        if (stateResult === undefined) return next(call("load_research_state", {}));
-        const state = stateResult.value["state"] as { evidence: { evidenceId: string }[] };
-        const evidenceIds = state.evidence.map((item) => item.evidenceId);
-        const first = evidenceIds[0] ?? "";
-        const second = evidenceIds[1] ?? first;
-        const submitted = saved.length;
-        if (submitted === 0) {
+        runStep += 1;
+        if (runStep === 1) return next(call("load_research_state", {}));
+        const state = (results.filter((result) => result.name === "load_research_state").slice(-1)[0]?.value["state"] ?? {}) as {
+          subjects?: { id: string; name: string }[];
+          dimensions?: { id: string; name: string }[];
+          cells?: { subjectId: string; dimensionId: string; evidenceIds: string[] }[];
+        };
+        const subjects = state.subjects ?? [];
+        const dimensions = state.dimensions ?? [];
+        const cells = state.cells ?? [];
+        const subjectIds = subjects.map((subject) => subject.id);
+        const evidenceFor = (subjectId: string): string[] => [
+          ...new Set(cells.filter((cell) => cell.subjectId === subjectId).flatMap((cell) => cell.evidenceIds)),
+        ];
+        const first = evidenceFor(subjectIds[0] ?? "")[0] ?? "";
+        const second = evidenceFor(subjectIds[1] ?? "")[0] ?? evidenceFor(subjectIds[0] ?? "")[1] ?? first;
+        const dim = (index: number): string => dimensions[index]?.id ?? "";
+
+        if (runStep === 2) {
           return next(
             call("save_report", {
               part: "start",
               title: "GraphRAG：机制、构建与证据边界",
               summary: "本报告说明 GraphRAG 的图构建流程与检索机制，并标出评测与局限方面的证据缺口。",
-            }),
-          );
-        }
-        if (submitted === 1) {
-          return next(
-            call("save_report", {
-              part: "write",
+              frame: {
+                question: "GraphRAG 的图构建与检索机制是什么，现有材料能支持到什么程度？",
+                audience: "研究生",
+                scope: "只覆盖读到的 GraphRAG 论文材料，不声称覆盖该方法的全部实现。",
+              },
               claims: [
-                { id: "clm_build", text: "GraphRAG 先抽取实体与关系，再做社区检测与摘要生成。", evidenceIds: [first], kind: "fact" },
-                { id: "clm_query", text: "查询时可在社区摘要上做全局搜索，也可沿实体邻域做局部搜索。", evidenceIds: [second], kind: "fact" },
+                {
+                  id: "clm_build",
+                  claimType: "mechanism",
+                  text: "GraphRAG 先抽取实体与关系，再做社区检测与摘要生成。",
+                  evidenceIds: [first],
+                  kind: "fact",
+                  subjects: [subjectIds[0] ?? ""],
+                  dimensions: [dim(0), dim(1)],
+                },
+                {
+                  id: "clm_query",
+                  claimType: "mechanism",
+                  text: "查询时可在社区摘要上做全局搜索，也可沿实体邻域做局部搜索。",
+                  evidenceIds: [second],
+                  kind: "fact",
+                  subjects: [subjectIds[1] ?? subjectIds[0] ?? ""],
+                  dimensions: [dim(1)],
+                },
+                {
+                  id: "clm_limits",
+                  claimType: "fact",
+                  text: "现有材料没有给出可直接比较的评测设置与硬件条件。",
+                  evidenceIds: [second],
+                  kind: "fact",
+                  dimensions: [dim(2)],
+                },
               ],
             }),
           );
         }
-        const sections = [
+
+        const passOne = [
           {
             id: "overview",
-            title: "一、研究任务与关键认识",
-            blocks: [{ kind: "paragraph", text: "本次研究面向组会汇报，梳理 GraphRAG 的构建与检索机制。", claimIds: [] }],
-          },
-          {
-            id: "representative",
-            title: "三、代表工作",
-            blocks: [{ kind: "paragraph", text: "GraphRAG 用实体图谱与社区摘要支撑全语料问答。", claimIds: ["clm_build"] }],
-          },
-          {
-            id: "comparison",
-            title: "四、共同维度比较",
+            title: "一、研究问题与关键认识",
             blocks: [
-              { kind: "paragraph", text: "构建流程与检索机制是本次比较的两个维度。", claimIds: ["clm_build"] },
-              { kind: "callout", tone: "gap", text: "局限与风险：本次材料只间接涉及，暂不作结论。" },
+              { kind: "paragraph", text: "本次研究面向组会汇报，梳理 GraphRAG 的构建与检索机制，并把结论限定在读到的材料范围内。", claimIds: [] },
+              {
+                kind: "list",
+                items: [
+                  { text: "构建阶段抽取实体与关系，并生成社区摘要。", claimIds: ["clm_build"] },
+                  { text: "评测与硬件条件没有取得可比较的材料。", claimIds: ["clm_limits"] },
+                ],
+              },
+              { kind: "callout", tone: "gap", text: "关键限制：没有独立评估，本报告不给出效果结论。" },
             ],
           },
           {
-            id: "limitations",
-            title: "五、局限与证据缺口",
-            blocks: [{ kind: "list", items: [{ text: "评测口径与硬件条件未取得可直接比较的材料。", claimIds: [] }] }],
+            id: "mental-model",
+            title: "二、概念坐标",
+            blocks: [
+              {
+                kind: "paragraph",
+                text: "理解这个方法需要两个概念：实体关系图（把语料中的对象与关系显式保存）和社区摘要（在图上分组后预生成的描述）。查询使用结构的方式决定了它适合什么问题。",
+                claimIds: ["clm_build"],
+              },
+              { kind: "list", items: [{ text: "社区摘要：面向语料级问题的预生成描述。", claimIds: ["clm_build"] }] },
+            ],
+          },
+          {
+            id: "mechanism",
+            title: "三、机制解释",
+            blocks: [
+              {
+                kind: "mechanism",
+                title: "GraphRAG 的索引与查询",
+                input: "整份语料的文本单元。",
+                intermediate: "实体关系图与社区层级摘要。",
+                steps: [
+                  { text: "从每个文本单元抽取实体与关系。", claimIds: ["clm_build"] },
+                  { text: "对图做社区检测并为每个社区生成摘要。", claimIds: ["clm_build"] },
+                ],
+                output: "查询时可组织成全局回答的社区摘要。",
+                tradeoff: "用一次覆盖全语料的处理换取语料级归纳能力。",
+                failure: "图抽取质量差时社区摘要会失真。",
+                claimIds: ["clm_build"],
+              },
+            ],
           },
         ];
-        const section = sections[submitted - 2];
+        const section = passOne[runStep - 3];
         if (section !== undefined) return next(call("save_report", { part: "write", section }));
-        return next(call("save_report", { part: "finalize" }));
+        return next(say("第一部分已提交，等待综合阶段完成比较与发布。"));
       }
 
+      if (instruction.includes("写第二部分")) {
+        if (runInstruction !== instruction) {
+          runInstruction = instruction;
+          runStep = 0;
+        }
+        runStep += 1;
+        if (runStep === 1) return next(call("load_research_state", {}));
+        const state = (results.filter((result) => result.name === "load_research_state").slice(-1)[0]?.value["state"] ?? {}) as {
+          subjects?: { id: string; name: string }[];
+          dimensions?: { id: string; name: string }[];
+          cells?: { subjectId: string; dimensionId: string; evidenceIds: string[] }[];
+        };
+        const subjects = state.subjects ?? [];
+        const dimensions = state.dimensions ?? [];
+        const cells = state.cells ?? [];
+        const subjectIds = subjects.map((subject) => subject.id);
+        const evidenceFor = (subjectId: string): string[] => [
+          ...new Set(cells.filter((cell) => cell.subjectId === subjectId).flatMap((cell) => cell.evidenceIds)),
+        ];
+        const first = evidenceFor(subjectIds[0] ?? "")[0] ?? "";
+        const second = evidenceFor(subjectIds[1] ?? "")[0] ?? evidenceFor(subjectIds[0] ?? "")[1] ?? first;
+        const dim = (index: number): string => dimensions[index]?.id ?? "";
+
+        if (runStep === 2) {
+          return next(
+            call("save_report", {
+              part: "write",
+              section: {
+                id: "comparison",
+                title: "四、条件化比较",
+                blocks: [
+                  { kind: "paragraph", text: "构建流程与检索机制是本次比较的两个维度。", claimIds: ["clm_build"] },
+                  {
+                    kind: "table",
+                    columns: ["对象", dimensions[1]?.name ?? "结构与构建"],
+                    columnDimensions: [null, dim(1)],
+                    rowSubjects: [subjectIds[0] ?? "", subjectIds[1] ?? ""],
+                    rows: [
+                      { cells: [{ text: subjects[0]?.name ?? "GraphRAG", claimIds: [] }, { text: "实体图 + 社区摘要", claimIds: ["clm_build"] }] },
+                      { cells: [{ text: subjects[1]?.name ?? "LightRAG", claimIds: [] }, { text: "本次材料未取得该对象的正文依据", claimIds: [] }] },
+                    ],
+                  },
+                  {
+                    kind: "callout",
+                    tone: "gap",
+                    dimensionIds: [dim(0), dim(2)],
+                    text: "核心思想与局限维度：只读到一方的正文材料，另一方没有取得依据，不作比较结论。",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+        if (runStep === 3) {
+          return next(
+            call("save_report", {
+              part: "write",
+              claims: [
+                {
+                  id: "clm_synthesis",
+                  claimType: "synthesis",
+                  synthesis: true,
+                  text: "综合读到的材料可以看出，图结构检索的能力来自索引期预生成的结构，而不是查询期的检索技巧。",
+                  evidenceIds: [first, second],
+                  kind: "inference",
+                  conditions: { scope: "由两条机制证据共同支持；没有独立评估，属于我们的综合判断。" },
+                },
+              ],
+            }),
+          );
+        }
+        if (runStep === 4) {
+          return next(
+            call("save_report", {
+              part: "write",
+              section: {
+                id: "synthesis",
+                title: "五、综合判断与权衡",
+                blocks: [
+                  {
+                    kind: "paragraph",
+                    text: "综合读到的材料可以看出，图结构检索的能力来自索引期预生成的结构，而不是查询期的检索技巧。",
+                    claimIds: ["clm_synthesis"],
+                  },
+                ],
+              },
+            }),
+          );
+        }
+        if (runStep === 5) {
+          return next(
+            call("save_report", {
+              part: "write",
+              section: {
+                id: "limitations",
+                title: "六、局限、未知与下一步",
+                blocks: [
+                  {
+                    kind: "list",
+                    items: [
+                      { text: "评测口径与硬件条件未取得可直接比较的材料。", claimIds: ["clm_limits"] },
+                      { text: "下一步应补读另一对象的正文，再看两者的构建成本是否可比。", claimIds: [] },
+                    ],
+                  },
+                ],
+              },
+            }),
+          );
+        }
+        if (runStep === 6) return next(call("save_report", { part: "finalize" }));
+        return next(say("报告已保存。"));
+      }
       // An Ask run: the model tries to write anyway, and is refused.
       if (instruction.includes("用户提出了一个问题")) {
         for (const result of results) {
@@ -384,6 +565,14 @@ function scriptedModel(): Scripted {
         const match = /章节当前内容：(\{.*?\})\n/s.exec(instruction);
         const section = match === null ? undefined : (JSON.parse(match[1]!) as { id: string; title: string });
         const target = section ?? { id: "comparison", title: "四、共同维度比较" };
+        const load = results.filter((result) => result.name === "load_research_state").slice(-1)[0];
+        if (load === undefined) return next(call("load_research_state", {}));
+        const state = (load.value["state"] ?? {}) as {
+          subjects?: { id: string; name: string }[];
+          dimensions?: { id: string; name: string }[];
+        };
+        const subjects = state.subjects ?? [];
+        const dimensions = state.dimensions ?? [];
         return next(
           call("propose_section_edit", {
             section: {
@@ -391,7 +580,27 @@ function scriptedModel(): Scripted {
               title: target.title,
               blocks: [
                 { kind: "paragraph", text: "构建流程可拆成抽取、社区检测与摘要三步，均由正文片段支持。", claimIds: ["clm_build"] },
-                { kind: "callout", tone: "gap", text: "评测口径仍未取得可直接比较的材料。" },
+                {
+                  kind: "table",
+                  columns: ["对象", dimensions[1]?.name ?? "结构与构建"],
+                  columnDimensions: [null, dimensions[1]?.id ?? ""],
+                  rowSubjects: subjects.map((subject) => subject.id),
+                  rows: subjects.map((subject, index) => ({
+                    cells: [
+                      { text: subject.name, claimIds: [] },
+                      {
+                        text: index === 0 ? "实体图 + 社区摘要" : "本次材料未取得该对象的正文依据",
+                        claimIds: index === 0 ? ["clm_build"] : [],
+                      },
+                    ],
+                  })),
+                },
+                {
+                  kind: "callout",
+                  tone: "gap",
+                  dimensionIds: [dimensions[0]?.id ?? "", dimensions[2]?.id ?? ""],
+                  text: "核心思想与局限：仍只读到一方的正文材料，评测口径也未取得可直接比较的依据。",
+                },
               ],
             },
             reason: "把构建流程写成三步，并把仍未取得依据的部分显式标出。",
@@ -584,7 +793,7 @@ describe("the assistant's three intents, over HTTP", () => {
 
     const proposalId = staged.proposals[0]!.proposalId;
     const accepted = await post(`/api/research/proposals/${proposalId}/accept`, {});
-    expect(accepted.status).toBe(200);
+    expect(accepted.status, JSON.stringify(accepted.json)).toBe(200);
     expect(accepted.json["ok"]).toBe(true);
     expect(accepted.json["alreadyApplied"]).toBe(false);
 

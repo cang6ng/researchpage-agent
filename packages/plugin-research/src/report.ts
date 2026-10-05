@@ -17,21 +17,27 @@
 import type {
   Evidence,
   MatrixCell,
+  QualityCheckRecord,
   ReadScope,
   Report,
   ReportBlock,
   ReportClaim,
+  ReportFrame,
   ReportGapNote,
   ReportSection,
   ReportTask,
   Source,
+  SupportAssessment,
 } from "./domain.js";
 import { hashOf } from "./hash.js";
 import { needsAttention } from "./domain.js";
+import { blueprintById, type BlueprintSpec } from "./blueprint.js";
+import { validateArtifactQuality } from "./artifact.js";
 
 export interface ReportDraft {
   readonly title: string;
   readonly summary: string;
+  readonly frame?: ReportFrame;
   readonly sections: readonly ReportSection[];
   readonly claims: readonly ReportClaim[];
 }
@@ -42,12 +48,20 @@ export interface ValidationInput {
   readonly evidence: readonly Evidence[];
   /** The saved read text for one read id; undefined means the read is missing. */
   readonly snapshotText: (readId: string) => string | undefined;
+  /** The task's sources, needed to judge whether a claim's material is the right kind. */
+  readonly sources?: readonly Source[];
+  /** The saved support judgements, needed for claim adequacy. */
+  readonly assessments?: readonly SupportAssessment[];
   readonly now: string;
 }
 
 export interface ValidationResult {
   readonly ok: boolean;
   readonly problems: readonly string[];
+  /** Obligations that were not met but do not block publication. */
+  readonly warnings: readonly string[];
+  /** The Q-series record, when the task is written under a blueprint. */
+  readonly checks: readonly QualityCheckRecord[];
 }
 
 /** Sections a technical comparison report must actually contain. */
@@ -67,24 +81,40 @@ function blockClaimIds(block: ReportBlock): readonly string[] {
       return block.rows.flatMap((row) => row.cells.flatMap((cell) => cell.claimIds));
     case "callout":
       return [];
+    case "mechanism":
+      return [...block.claimIds, ...block.steps.flatMap((step) => step.claimIds)];
   }
 }
 
 /**
  * Validates a report draft against the task's real materials.
  *
- * The checks are the ones a reader's trust depends on: the required structure
- * is present, every claim carries evidence, every id resolves inside this task,
- * and every excerpt still sits where its read says it does. Wording, style and
- * whether a conclusion is *wise* are not checked — those are for the reader,
- * and pretending a validator can judge them would be the dishonest part.
+ * Two layers run here, and a reader can tell them apart in the result. The
+ * truth boundary — required structure, every claim carrying resolvable
+ * evidence, every excerpt still sitting where its read says it does — is
+ * checked for every task, old and new. The artifact quality contract runs on
+ * top of it when the task was written under a blueprint, and asks the harder
+ * questions: is there a declared question, a mental model before the
+ * comparison, a real mechanism, a comparison under shared conditions, a
+ * synthesis, and a claim contract each statement obeys.
+ *
+ * Wording and whether a conclusion is *wise* are still not checked: those are
+ * for the reader, and pretending a validator can judge them would be the
+ * dishonest part.
  */
 export function validateReport(input: ValidationInput): ValidationResult {
   const problems: string[] = [];
+  const warnings: string[] = [];
+  const checks: QualityCheckRecord[] = [];
   const byId = new Map(input.evidence.map((item) => [item.id, item]));
   const claimIds = new Set(input.draft.claims.map((claim) => claim.id));
+  const blueprint: BlueprintSpec | undefined = blueprintById(input.task.blueprintId);
 
-  for (const sectionId of REQUIRED_SECTIONS) {
+  // A task written under a blueprint has its sections checked by the artifact
+  // contract below, which knows what each section owes; a legacy task keeps the
+  // simple "these four sections exist and have content" rule it was written to.
+  const requiredSections = blueprint === undefined ? REQUIRED_SECTIONS : [];
+  for (const sectionId of requiredSections) {
     const section = input.draft.sections.find((candidate) => candidate.id === sectionId);
     if (section === undefined) {
       problems.push(`缺少必需章节：${sectionId}`);
@@ -94,6 +124,7 @@ export function validateReport(input: ValidationInput): ValidationResult {
       if (block.kind === "paragraph") return block.text.trim().length > 0;
       if (block.kind === "list") return block.items.length > 0;
       if (block.kind === "table") return block.rows.length > 0;
+      if (block.kind === "mechanism") return block.steps.length > 0;
       return block.text.trim().length > 0;
     });
     if (!hasContent) problems.push(`章节「${section.title}」没有任何内容`);
@@ -139,7 +170,21 @@ export function validateReport(input: ValidationInput): ValidationResult {
     }
   }
 
-  return { ok: problems.length === 0, problems, now: input.now } as ValidationResult;
+  if (blueprint !== undefined) {
+    const artifact = validateArtifactQuality({
+      draft: input.draft,
+      task: input.task,
+      blueprint,
+      evidence: input.evidence,
+      sources: input.sources ?? [],
+      assessments: input.assessments ?? [],
+    });
+    problems.push(...artifact.errors);
+    warnings.push(...artifact.warnings);
+    checks.push(...artifact.checks);
+  }
+
+  return { ok: problems.length === 0, problems, warnings, checks } as ValidationResult;
 }
 
 /**
@@ -152,12 +197,14 @@ export function validateReport(input: ValidationInput): ValidationResult {
 export function reportContentHash(report: {
   readonly title: string;
   readonly summary: string;
+  readonly frame?: ReportFrame;
   readonly sections: readonly ReportSection[];
   readonly claims: readonly ReportClaim[];
 }): string {
   return hashOf({
     title: report.title,
     summary: report.summary,
+    frame: report.frame ?? null,
     sections: report.sections,
     claims: report.claims,
   });
@@ -382,9 +429,16 @@ export function sealReport(input: {
     taskId: input.taskId,
     title: input.draft.title,
     summary: input.draft.summary,
+    ...(input.draft.frame === undefined ? {} : { frame: input.draft.frame }),
     sections: input.draft.sections,
     claims: input.draft.claims,
-    validation: { ok: input.validation.ok, problems: input.validation.problems, checkedAt: input.now },
+    validation: {
+      ok: input.validation.ok,
+      problems: input.validation.problems,
+      warnings: input.validation.warnings,
+      checks: input.validation.checks,
+      checkedAt: input.now,
+    },
     createdAt: input.now,
     contentHash: reportContentHash(input.draft),
   };

@@ -27,7 +27,7 @@ import type {
   ResearchService,
   ResearchStage,
 } from "@every-dagent/plugin-research";
-import { ID_PREFIX, needsAttention, newId } from "@every-dagent/plugin-research";
+import { ID_PREFIX, blueprintById, needsAttention, newId } from "@every-dagent/plugin-research";
 
 export interface ResearchRunnerOptions {
   readonly client: Client;
@@ -127,7 +127,8 @@ const STAGE_LABELS: Readonly<Record<ResearchStage, string>> = Object.freeze({
   card: "建立任务卡",
   research: "检索与读取",
   gap: "定向补查",
-  report: "生成报告",
+  report: "撰写章节",
+  synthesis: "综合与校验",
   followup: "追加指令（旧记录）",
   ask: "提问",
   edit: "修改提案",
@@ -151,6 +152,42 @@ function cellLabel(cell: MatrixCell, task: ReportTask): string {
   return `${subject} × ${dimension}（${STATUS_LABELS[cell.status] ?? cell.status}）`;
 }
 
+/**
+ * Which sections each writing pass submits.
+ *
+ * One pass cannot write the whole report: the Core's step budget is part of the
+ * approved resource profile, and a six-section report with its claims does not
+ * fit inside it. The split is by cognitive responsibility rather than by size —
+ * the first pass declares the question and explains how the objects work
+ * (frame, mental model, mechanism, per-object identity); the second compares
+ * them under shared conditions, synthesises across sources, states the limits
+ * and publishes.
+ */
+const REPORT_PASS_SECTIONS: readonly string[] = Object.freeze(["overview", "mental-model", "mechanism", "representative"]);
+const SYNTHESIS_PASS_SECTIONS: readonly string[] = Object.freeze(["comparison", "synthesis", "limitations", "reading"]);
+
+/**
+ * The blueprint's sections as instruction lines, for one writing pass.
+ *
+ * The list comes from the blueprint the task was created under, so what the
+ * model is asked to write and what the validator will hold it to are the same
+ * list; `include` only decides which pass submits which section.
+ */
+function blueprintSectionLines(blueprintId?: string, include?: readonly string[]): readonly string[] {
+  const blueprint = blueprintById(blueprintId);
+  if (blueprint === undefined) {
+    return ["- 必需章节：overview / representative / comparison / limitations（旧结构任务）。"];
+  }
+  const sections = include === undefined ? blueprint.sections : blueprint.sections.filter((section) => include.includes(section.id));
+  return sections
+    .slice()
+    .sort((a, b) => Number(b.required) - Number(a.required))
+    .map((section) => {
+      const mark = section.required ? "必需" : "可选";
+      return `  · ${section.id}（${mark}｜${section.title}）：${section.cognitivePurpose}；须回答：${section.requiredQuestions.join("；")}；篇幅：${section.budget}`;
+    });
+}
+
 /** The instruction one stage run is started with. Written here, not by a model. */
 export function stageInstruction(input: {
   readonly stage: "card";
@@ -159,6 +196,11 @@ export function stageInstruction(input: {
 export function stageInstruction(input: {
   readonly stage: "research" | "gap" | "report";
   readonly task: ReportTask;
+}): string;
+export function stageInstruction(input: {
+  readonly stage: "synthesis";
+  readonly task: ReportTask;
+  readonly reportBrief: string;
 }): string;
 export function stageInstruction(input: {
   readonly stage: "ask";
@@ -178,13 +220,14 @@ export function stageInstruction(input: {
   readonly question?: string;
   readonly instruction?: string;
   readonly targetSectionId?: string;
+  readonly reportBrief?: string;
 }): string {
   if (input.stage === "card") {
     return [
       "请为用户的研究主题建立研究任务卡。",
       "调用 propose_task（一次调用即可），字段要求：",
       "- 比较对象（subjects）2–4 个，是具体的技术/方法/系统名称；",
-      "- 研究维度（dimensions）3–6 个，要能驱动证据矩阵（例如核心思想、结构与构建、检索机制、实验与评测、成本与部署、局限与风险）；",
+      "- 研究维度（dimensions）3–6 个，每个维度写成「要回答的问题」，而不是一个词（例如「索引构建、查询和更新分别产生什么可观察成本，来源是否在相同口径下报告」）；",
       "- topic 用一句话概括主题；purpose 写明用途；audience 写明读者；focus 写本次关注点。",
       "主题原文：",
       `"""${input.topicInput ?? ""}"""`,
@@ -224,17 +267,37 @@ export function stageInstruction(input: {
       ].join("\n");
     case "report":
       return [
-        "请基于已保存的证据写出结构化研究报告。单次输出有限，请用 save_report 分次提交：",
-        '1) {part:"start", title, summary}；',
-        '2) {part:"write", claims:[{id,text,evidenceIds,kind}]}（每条 claim 的 evidenceIds 只能来自工具返回的真实 evidenceId；综合推断用 kind="inference"）；',
-        '3) 逐节提交 {part:"write", section:{id,title,blocks}}：必需章节 overview / representative / comparison / limitations，可选 background / conditions / reading；',
-        "4) 全部提交后用 {part:'finalize'} 校验并发布。",
+        "请写这份技术比较报告的第一部分：声明研究框架与论断，然后解释对象如何工作。本阶段的步数预算有限，请用 save_report 分次提交：",
+        "1) 先调用 load_research_state 确认可用的 evidenceId（只能引用它返回的 id）；",
+        '2) {part:"start", title, summary, frame:{question, audience, scope}, claims:[...]}——frame 是报告自己的声明：研究问题是什么、给谁看、比较了哪些对象与哪类材料；claims 形状 {id,text,evidenceIds,claimType,subjects,dimensions,conditions,synthesis}；',
+        '3) 每节一次 {part:"write", section:{id,title,blocks}}。本阶段要提交的章节与各自的认知义务：',
+        ...blueprintSectionLines(task.blueprintId, REPORT_PASS_SECTIONS),
         "写作要求：",
-        `- comparison 章节用 table 块：列为「方法」+ 最关键的 2–3 个维度；行为 ${subjects}；`,
-        '- 没有依据的比较项写成 callout（tone="gap"）明确说明缺失；只有「有限支持」或存在冲突的项目，也要在正文或缺口说明中写清限定条件；',
-        "- 报告使用中文，方法名与术语保留原文；不同实验设置/硬件的结果不要直接排名；",
-        "- 篇幅控制：表格 ≤3 列、单元格 ≤40 字、段落 ≤150 字、claims ≤8 条（超出会因输出上限被截断）。",
-        "finalize 成功后简要说明报告结构与仍存在的缺口。",
+        `- 比较对象：${subjects}；研究维度：${dimensions}；`,
+        `- 全文篇幅目标：${task.lengthTarget}。这是写作预算而不是必须写满：每节只写支撑其义务所需的内容，宁精确勿冗长；机制块、表格与缺口说明不计入段落预算。`,
+        "- mechanism 节必须有一个 mechanism 块：input / intermediate / steps（≥2 步）/ output / tradeoff / failure，都要写；",
+        "- 机制判断优先引用 primary/official 来源；用 claim 的 dimensions 声明它回答了哪个研究维度；",
+        "- 没有依据的项目写成 callout(tone=\"gap\")，不要用常识填空；",
+        "- 各节的内容义务决定篇幅，没有全篇 claim 数上限；工具返回的 outstanding 只修正相关那一条，不要重写全部章节。",
+        "本阶段不要调用 finalize，也不要写 comparison / synthesis / limitations：剩余章节由下一个阶段完成。",
+        "写完这些章节后，用一两句话说明你提交了什么，然后停止。",
+      ].join("\n");
+    case "synthesis":
+      return [
+        "第一阶段已完成。现在写第二部分并校验发布：在共同条件下比较、跨来源综合、写明缺口。",
+        input.reportBrief ?? "",
+        "执行要求（步数预算有限，请按顺序做）：",
+        "1) 用 load_research_state 复核矩阵与可用 evidenceId。",
+        '2) 每节一次 {part:"write", section:{id,title,blocks}} 提交下面这些章节：',
+        ...blueprintSectionLines(task.blueprintId, SYNTHESIS_PASS_SECTIONS),
+        '3) 用 {part:"write", claims:[...]} 提交综合判断：claimType="synthesis"、synthesis=true、绑定 ≥2 条来自 ≥2 个不同来源的证据，conditions.scope 写明推断桥梁与适用边界；条件化建议用 claimType="implication" 并带 conditions.scope。',
+        '4) 用 {part:"finalize"} 校验并发布。若返回 problems，只修正被指出的那一项后再次 finalize；不要为了通过校验删除诚实写出的缺口与限制。',
+        "写作要求：",
+        `- 全文篇幅目标：${task.lengthTarget}。这是写作预算而不是必须写满：每节只写支撑其义务所需的内容，宁精确勿冗长。`,
+        "- comparison 节的表要写 columnDimensions（每列对应哪个研究维度 id）与 rowSubjects（每行是哪个对象 id），每列回答同一个问题；",
+        "- 研究 frame 里的每个维度都要被处理：正文回答，或 callout(tone=\"gap\", dimensionIds=[维度 id]) 明确写出缺证据/不可比及原因；",
+        "- 性能与成本判断要带 conditions（comparability / costStage），不可比就并列报告，不要排名；",
+        "综合判断的最低标准：**它比逐篇摘要多给出了什么认识**——共性、关键差异、trade-off、冲突或研究空白——并且这些认识能回到各对象的证据。",
       ].join("\n");
     case "ask":
       return [
@@ -506,7 +569,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
   }
 
   /** What each program-driven stage is allowed to do while it runs. */
-  const STAGE_GRANTS: Readonly<Record<"card" | "research" | "gap" | "report", StageRequest["grant"]>> = Object.freeze({
+  const STAGE_GRANTS: Readonly<Record<"card" | "research" | "gap" | "report" | "synthesis", StageRequest["grant"]>> = Object.freeze({
     card: {
       intent: "card",
       allowResearch: false,
@@ -535,7 +598,48 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       targetId: null,
       scope: "撰写并保存本任务的报告版本",
     },
+    synthesis: {
+      intent: "draft",
+      allowResearch: true,
+      targetType: "report",
+      targetId: null,
+      scope: "综合判断、按校验问题修正并发布报告版本",
+    },
   });
+
+  /**
+   * The synthesis stage's brief: what has been written, and what is still
+   * wrong with it.
+   *
+   * The validator runs over the accumulated draft *before* the synthesis pass,
+   * so the model concludes from a draft it has already been told the problems
+   * of — repair and synthesis in one pass instead of a finalize-and-retry loop.
+   */
+  function synthesisBrief(taskId: string): string {
+    const draft = service.reportDraftOf(taskId);
+    if (draft === null) return "（本任务还没有已保存的报告草稿；请直接用 save_report 从 {part:\"start\"} 开始补写。）";
+    const preview = service.previewDraftValidation(taskId);
+    const sections = draft.sections.map((section) => section.id).join("、");
+    const claims = draft.claims
+      .slice(0, 24)
+      .map((claim) => `${claim.id}[${claim.claimType ?? "fact"}${claim.synthesis === true ? ",synthesis" : ""}]`)
+      .join("；");
+    return [
+      "当前草稿：",
+      `- 标题：${draft.title}`,
+      `- frame：${draft.frame === undefined ? "（未声明）" : `${draft.frame.question}｜${draft.frame.scope}`}`,
+      `- 已提交章节：${sections || "（无）"}`,
+      `- 已提交 claims：${claims || "（无）"}`,
+      preview === null || preview.problems.length === 0
+        ? "- 校验预检：没有结构性问题"
+        : `- 校验预检问题（必须在 finalize 前修正）：\n${preview.problems.slice(0, 8).map((problem) => `    · ${problem}`).join("\n")}`,
+      preview === null || preview.warnings.length === 0
+        ? ""
+        : `- 校验预检提醒（不阻止发布，但应处理或在正文说明）：\n${preview.warnings.slice(0, 6).map((warning) => `    · ${warning}`).join("\n")}`,
+    ]
+      .filter((line) => line.length > 0)
+      .join("\n");
+  }
 
   /** What the program does once a stage settles: the next bounded step, or a stop. */
   async function afterStage(request: StageRequest, readsBefore: number, runFailed: boolean): Promise<void> {
@@ -624,21 +728,52 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       case "report": {
         const settled = service.getTask(task.id);
         if (settled === undefined) return;
+        // The report stage writes the sections; synthesis is its own run for two
+        // reasons: a section pass plus a synthesis pass plus validation does not
+        // fit in one step budget, and synthesis is a distinct cognitive step
+        // that deserves its own instruction rather than being the last paragraph
+        // of whatever section happened to be open.
         if (settled.currentReportId === null) {
+          enqueue({
+            taskId: settled.id,
+            sessionId,
+            stage: "synthesis",
+            instruction: stageInstruction({ stage: "synthesis", task: settled, reportBrief: synthesisBrief(settled.id) }),
+            grant: STAGE_GRANTS.synthesis,
+          });
+          return;
+        }
+        await afterReportSaved(settled);
+        return;
+      }
+      case "synthesis": {
+        const settled = service.getTask(task.id);
+        if (settled === undefined) return;
+        if (settled.currentReportId === null) {
+          // The draft's own outstanding obligations are the most useful thing to
+          // leave in the log: the pass ended, and this says what it still owed.
+          const preview = service.previewDraftValidation(settled.id);
+          log(
+            `[runner] report was not saved for ${settled.id}: ${(preview?.problems ?? ["草稿校验未通过"]).slice(0, 6).join("；")}`,
+          );
           service.failTask(settled.id, "报告阶段结束但没有保存有效报告；可以在工作台重新生成。");
           return;
         }
-        if (options.exportPdf !== undefined) {
-          const exported = await options.exportPdf(settled.id);
-          log(
-            exported.ok
-              ? `[runner] PDF exported for ${settled.id}`
-              : `[runner] PDF export failed for ${settled.id}: ${exported.failure ?? "unknown"}`,
-          );
-        }
+        await afterReportSaved(settled);
         return;
       }
     }
+  }
+
+  /** What happens once a validated report exists: export the PDF, and stop. */
+  async function afterReportSaved(settled: ReportTask): Promise<void> {
+    if (options.exportPdf === undefined) return;
+    const exported = await options.exportPdf(settled.id);
+    log(
+      exported.ok
+        ? `[runner] PDF exported for ${settled.id}`
+        : `[runner] PDF export failed for ${settled.id}: ${exported.failure ?? "unknown"}`,
+    );
   }
 
   return {

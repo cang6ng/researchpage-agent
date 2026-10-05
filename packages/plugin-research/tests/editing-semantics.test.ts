@@ -65,6 +65,17 @@ function open(): Harness {
           primaryCategory: "cs.CL",
           doi: null,
         },
+        {
+          title: "Fixture Paper on Deployment Costs",
+          authors: ["C. Author"],
+          abstract: "A third fixture source, discovered by later searches.",
+          absUrl: "https://arxiv.org/abs/2403.00003",
+          pdfUrl: null,
+          publishedAt: "2024-03-01T00:00:00Z",
+          arxivId: "2403.00003",
+          primaryCategory: "cs.CL",
+          doi: null,
+        },
       ].slice(0, options.limit),
     }),
     read: async ({ url }): Promise<ReadOutcome> => {
@@ -125,42 +136,260 @@ function open(): Harness {
 
 async function research(harness: Harness): Promise<{ readonly evidenceIds: readonly string[]; readonly cell: CellRef }> {
   harness.service.issueGrant({ sessionId: SESSION, intent: "research", taskId: harness.taskId, allowResearch: true });
-  const found = await harness.service.search(harness.taskId, { query: "graph retrieval", limit: 1 });
+  const found = await harness.service.search(harness.taskId, { query: "graph retrieval", limit: 2 });
   if (!found.ok) throw new Error(`search refused: ${found.problems.join("; ")}`);
-  const source: Source = harness.service.sourcesOf(harness.taskId)[0] as Source;
+  const task = harness.service.getTask(harness.taskId)!;
+  const sources = harness.service.sourcesOf(harness.taskId);
+  const evidenceIds: string[] = [];
+  // One read per compared object, like a real pass: each method's own paper,
+  // bound to that object's column of the comparison.
+  for (const [index, subject] of task.subjects.entries()) {
+    const source = sources[index];
+    if (source === undefined) continue;
+    const read = await harness.service.read(harness.taskId, {
+      sourceId: source.id,
+      question: `${subject.name} 的图如何构建`,
+      terms: ["graph", "community", "construction"],
+      targetCell: { sectionId: "comparison", subjectId: subject.id, dimensionId: task.dimensions[1]!.id },
+      role: "primary",
+      maxEvidence: 2,
+    });
+    if (!read.ok) throw new Error(`read refused: ${read.problems.join("; ")}`);
+    evidenceIds.push(...read.evidence.map((item) => item.evidenceId));
+  }
+  harness.service.clearGrant(SESSION);
   const cell: CellRef = {
     sectionId: "comparison",
-    subjectId: harness.service.getTask(harness.taskId)!.subjects[0]!.id,
-    dimensionId: harness.service.getTask(harness.taskId)!.dimensions[1]!.id,
+    subjectId: task.subjects[0]!.id,
+    dimensionId: task.dimensions[1]!.id,
   };
-  const read = await harness.service.read(harness.taskId, {
-    sourceId: source.id,
-    question: "该方法的图如何构建",
-    terms: ["graph", "community", "construction"],
-    targetCell: cell,
-    maxEvidence: 2,
-  });
-  if (!read.ok) throw new Error(`read refused: ${read.problems.join("; ")}`);
-  harness.service.clearGrant(SESSION);
-  return { evidenceIds: read.evidence.map((item) => item.evidenceId), cell };
+  return { evidenceIds, cell };
 }
 
-/** The smallest draft that passes validation for the task's first report. */
+/**
+ * A draft that satisfies Technical Comparison v2's content contract.
+ *
+ * The editing contracts are tested against a report that could really be
+ * published, so that "the proposal was applied" is never silently a report the
+ * validator would have refused: it declares its frame, builds a mental model,
+ * explains a mechanism, compares under a declared table, synthesises two
+ * sources and states what the material does not support.
+ */
 function draftFor(task: ReportTask, evidenceIds: readonly string[]) {
-  const first = evidenceIds[0] ?? "";
-  const second = evidenceIds[1] ?? first;
+  const [a1 = "", a2 = a1, b1 = a1, b2 = b1] = evidenceIds;
+  const [subjectA, subjectB] = task.subjects;
+  const [dimIdea, dimBuild, dimRetrieval] = task.dimensions;
   return {
     title: "GraphRAG 与图结构检索的机制比较",
-    summary: "本报告比较两种图结构检索方法的构建与检索机制。",
+    summary: "本报告比较两种图结构检索方法的构建与检索机制，并说明当前材料不能支持的结论。",
+    frame: {
+      question: "这两种图结构检索方法在构建与检索机制上有什么可比较的差异？",
+      audience: task.audience,
+      scope: "只比较 GraphRAG 与 HippoRAG 两篇方法论文中的机制与报告设置，不覆盖其他实现。",
+    },
     claims: [
-      { id: "clm_build", text: "GraphRAG 先抽取实体与关系，再做社区检测与摘要。", evidenceIds: [first], kind: "fact" as const },
-      { id: "clm_eval", text: "报告用 LLM 判定的涵盖度作为评测口径。", evidenceIds: [second], kind: "fact" as const },
+      {
+        id: "clm_mechanism_a",
+        text: "GraphRAG 先抽取实体与关系，再用社区检测与摘要生成对语料的全局描述。",
+        evidenceIds: [a1],
+        kind: "fact" as const,
+        claimType: "mechanism" as const,
+        subjects: [subjectA?.id ?? ""],
+        dimensions: [dimIdea?.id ?? "", dimBuild?.id ?? ""],
+      },
+      {
+        id: "clm_mechanism_b",
+        text: "HippoRAG 把文档与抽取的三元组放进同一图，用图扩散完成整合检索。",
+        evidenceIds: [b1],
+        kind: "fact" as const,
+        claimType: "mechanism" as const,
+        subjects: [subjectB?.id ?? ""],
+        dimensions: [dimBuild?.id ?? ""],
+      },
+      {
+        id: "clm_compare",
+        text: "两者的构建产物不同：一方是社区摘要，另一方是可扩散的图索引。",
+        evidenceIds: [a1, b1],
+        kind: "comparison" as const,
+        claimType: "comparison" as const,
+        subjects: [subjectA?.id ?? "", subjectB?.id ?? ""],
+        dimensions: [dimBuild?.id ?? ""],
+        conditions: { scope: "只比较两者的构建产物，不比较效果。" },
+      },
+      {
+        id: "clm_synth",
+        text: "综合两篇方法论文可以看出，差异不在是否使用图，而在结构信息在哪个阶段被利用。",
+        evidenceIds: [a1, b1],
+        kind: "inference" as const,
+        claimType: "synthesis" as const,
+        synthesis: true,
+        conditions: { scope: "两条机制证据共同支持；未取得独立评估，属于我们的综合判断。" },
+      },
+      {
+        id: "clm_limit",
+        text: "现有材料只有作者自报的评测口径，不能据此给出性能排名。",
+        evidenceIds: [a2],
+        kind: "fact" as const,
+        claimType: "fact" as const,
+      },
     ],
     sections: [
-      { id: "overview", title: "一、研究任务与关键认识", blocks: [{ kind: "paragraph" as const, text: "本次研究比较图结构检索方法。", claimIds: [] }] },
-      { id: "representative", title: "三、代表工作", blocks: [{ kind: "paragraph" as const, text: "GraphRAG 构建实体图谱。", claimIds: ["clm_build"] }] },
-      { id: "comparison", title: "四、共同维度比较", blocks: [{ kind: "paragraph" as const, text: "构建方式不同。", claimIds: ["clm_build"] }] },
-      { id: "limitations", title: "五、局限与证据缺口", blocks: [{ kind: "paragraph" as const, text: "评测口径来自作者。", claimIds: ["clm_eval"] }] },
+      {
+        id: "overview",
+        title: "一、研究问题与关键认识",
+        blocks: [
+          {
+            kind: "paragraph" as const,
+            text: "本次研究为组会汇报比较两种图结构检索方法，只覆盖两篇方法论文中的机制与设置。",
+            claimIds: [] as string[],
+          },
+          {
+            kind: "list" as const,
+            items: [
+              { text: "两者的构建产物不同：一方是社区摘要，另一方是可扩散的图索引。", claimIds: ["clm_compare"] },
+              { text: "现有材料不能支持性能排名。", claimIds: ["clm_limit"] },
+            ],
+          },
+          { kind: "callout" as const, tone: "gap" as const, text: "关键限制：没有独立评估，效果差异只能按各自报告的实验理解。" },
+        ],
+      },
+      {
+        id: "mental-model",
+        title: "二、概念坐标",
+        blocks: [
+          {
+            kind: "paragraph" as const,
+            text: "图结构检索的共同思路是把文档之外的结构（实体、关系、社区）显式保存下来，再让查询使用它；差异在于结构在索引阶段还是查询阶段被利用。",
+            claimIds: ["clm_synth"],
+          },
+          {
+            kind: "list" as const,
+            items: [
+              { text: "社区摘要：对语料的全局描述，用于全局问题。", claimIds: ["clm_mechanism_a"] },
+              { text: "图索引：可扩散的结构，用于多跳整合。", claimIds: ["clm_mechanism_b"] },
+            ],
+          },
+        ],
+      },
+      {
+        id: "mechanism",
+        title: "三、机制解释",
+        blocks: [
+          {
+            kind: "mechanism" as const,
+            title: "GraphRAG 的构建与查询",
+            input: "整份语料的文本单元。",
+            intermediate: "实体关系图与社区层级摘要。",
+            steps: [
+              { text: "从每个文本单元抽取实体与关系。", claimIds: ["clm_mechanism_a"] },
+              { text: "对图做社区检测并为每个社区生成摘要。", claimIds: ["clm_mechanism_a"] },
+            ],
+            output: "可在查询时被组织成全局回答的社区摘要集合。",
+            tradeoff: "用一次全语料的 LLM 处理换取语料级归纳能力。",
+            failure: "图抽取质量差时，社区摘要会失真。",
+            claimIds: ["clm_mechanism_a"],
+          },
+        ],
+      },
+      {
+        id: "representative",
+        title: "四、代表工作与对象身份",
+        blocks: [
+          { kind: "paragraph" as const, text: "GraphRAG（Edge 等）以社区摘要为核心产物。", claimIds: ["clm_mechanism_a"] },
+          { kind: "paragraph" as const, text: "HippoRAG 以图上的扩散检索为核心机制。", claimIds: ["clm_mechanism_b"] },
+        ],
+      },
+      {
+        id: "comparison",
+        title: "五、条件化比较",
+        blocks: [
+          {
+            kind: "table" as const,
+            columns: ["对象", dimBuild?.name ?? "结构与构建"],
+            columnDimensions: [null, dimBuild?.id ?? ""],
+            rowSubjects: [subjectA?.id ?? "", subjectB?.id ?? ""],
+            rows: [
+              {
+                cells: [
+                  { text: subjectA?.name ?? "A", claimIds: [] as string[] },
+                  { text: "实体图 + 社区摘要", claimIds: ["clm_mechanism_a"] },
+                ],
+              },
+              {
+                cells: [
+                  { text: subjectB?.name ?? "B", claimIds: [] as string[] },
+                  { text: "文档与三元组同图 + 扩散检索", claimIds: ["clm_mechanism_b"] },
+                ],
+              },
+            ],
+          },
+          { kind: "paragraph" as const, text: "两者的构建产物不同，这是比较中最直接的差异。", claimIds: ["clm_compare"] },
+          {
+            kind: "callout" as const,
+            tone: "gap" as const,
+            dimensionIds: [dimRetrieval?.id ?? ""],
+            text: "检索机制维度：本次只读到各自论文的描述，没有独立或共同设置下的比较，暂不下结论。",
+          },
+        ],
+      },
+      {
+        id: "synthesis",
+        title: "六、综合判断与权衡",
+        blocks: [
+          {
+            kind: "paragraph" as const,
+            text: "综合两篇方法论文可以看出，差异不在是否使用图，而在结构信息在哪个阶段被利用。",
+            claimIds: ["clm_synth"],
+          },
+        ],
+      },
+      {
+        id: "limitations",
+        title: "七、局限、未知与下一步",
+        blocks: [
+          {
+            kind: "list" as const,
+            items: [
+              { text: "缺独立评估：效果差异只有作者自报口径。", claimIds: ["clm_limit"] },
+              { text: "检索机制维度没有取得可比较的依据，下一步应查共同设置下的对照实验。", claimIds: [] as string[] },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+/** A comparison section a proposal can substitute, still v2-valid. */
+function comparisonReplacement(task: ReportTask, claimId: string) {
+  const [subjectA, subjectB] = task.subjects;
+  const [, dimBuild, dimRetrieval] = task.dimensions;
+  return {
+    id: "comparison",
+    title: "五、条件化比较",
+    blocks: [
+      {
+        kind: "table" as const,
+        columns: ["对象", dimBuild?.name ?? "结构与构建"],
+        columnDimensions: [null, dimBuild?.id ?? ""],
+        rowSubjects: [subjectA?.id ?? "", subjectB?.id ?? ""],
+        rows: [
+          {
+            cells: [
+              { text: subjectA?.name ?? "A", claimIds: [] as string[] },
+              { text: "构建流程拆成抽取、社区检测与摘要三步。", claimIds: [claimId] },
+            ],
+          },
+          {
+            cells: [
+              { text: subjectB?.name ?? "B", claimIds: [] as string[] },
+              { text: "构建产物是可扩散的图索引。", claimIds: [] as string[] },
+            ],
+          },
+        ],
+      },
+      { kind: "callout" as const, tone: "gap" as const, dimensionIds: [dimRetrieval?.id ?? ""], text: "检索机制的独立比较尚未取得依据。" },
+      { kind: "paragraph" as const, text: "对象身份与构建产物不同，比较只覆盖已取得依据的部分。", claimIds: [claimId] },
     ],
   };
 }
@@ -331,16 +560,7 @@ describe("C, D, E, F. Proposals", () => {
       });
       const created = harness.service.createProposal(harness.taskId, {
         actionId: "act_edit_1",
-        sections: [
-          {
-            id: "comparison",
-            title: "四、共同维度比较",
-            blocks: [
-              { kind: "paragraph", text: "构建流程拆成抽取、社区检测与摘要三步。", claimIds: ["clm_build"] },
-              { kind: "callout", tone: "gap", text: "检索机制的独立比较尚未取得依据。" },
-            ],
-          },
-        ],
+        sections: [comparisonReplacement(harness.service.getTask(harness.taskId)!, "clm_mechanism_a")],
         reason: "把构建流程写清楚，并标出仍缺依据的部分。",
       });
       expect(created.ok).toBe(true);
@@ -357,19 +577,14 @@ describe("C, D, E, F. Proposals", () => {
 
       // Accepting changes the authorized section and nothing else.
       const accepted = harness.service.acceptProposal(created.proposal.id);
-      expect(accepted.ok).toBe(true);
+      expect(accepted.ok, accepted.ok ? "" : accepted.problems.join("; ")).toBe(true);
       if (!accepted.ok) return;
       expect(accepted.alreadyApplied).toBe(false);
 
       const after = harness.service.reportsOf(harness.taskId).find((report) => report.id === accepted.reportId)!;
-      expect(after.sections.find((section) => section.id === "comparison")).toEqual({
-        id: "comparison",
-        title: "四、共同维度比较",
-        blocks: [
-          { kind: "paragraph", text: "构建流程拆成抽取、社区检测与摘要三步。", claimIds: ["clm_build"] },
-          { kind: "callout", tone: "gap", text: "检索机制的独立比较尚未取得依据。" },
-        ],
-      });
+      expect(after.sections.find((section) => section.id === "comparison")).toEqual(
+        comparisonReplacement(harness.service.getTask(harness.taskId)!, "clm_mechanism_a"),
+      );
       for (const section of before.sections) {
         if (section.id === "comparison") continue;
         expect(after.sections.find((candidate) => candidate.id === section.id)).toEqual(section);
@@ -662,6 +877,34 @@ describe("H, I. Evidence is not sufficiency", () => {
       });
       const conflicted = harness.service.cellsOf(harness.taskId).find((entry) => entry.dimensionId === cell.dimensionId);
       expect(conflicted?.status).toBe("conflict");
+    } finally {
+      harness.close();
+    }
+  });
+});
+
+describe("the report structure is fixed by the task", () => {
+  it("refuses a section whose id the research structure does not define", async () => {
+    const harness = open();
+    try {
+      const { evidenceIds } = await research(harness);
+      harness.service.issueGrant({ sessionId: SESSION, intent: "draft", taskId: harness.taskId, allowResearch: false });
+      const draft = draftFor(harness.service.getTask(harness.taskId)!, evidenceIds);
+      const saved = harness.service.saveReport(harness.taskId, {
+        ...draft,
+        sections: [...draft.sections, { id: "invented-section", title: "自造章节", blocks: [] }],
+      });
+      expect(saved.ok).toBe(false);
+      if (!saved.ok) {
+        expect(saved.problems.join(" ")).toContain("invented-section");
+        expect(saved.guidance).toContain("comparison");
+      }
+      // The incremental path refuses it too, before anything is accumulated.
+      const part = harness.service.saveReportPart(harness.taskId, {
+        kind: "write",
+        section: { id: "invented-section", title: "自造章节", blocks: [] },
+      });
+      expect(part.ok).toBe(false);
     } finally {
       harness.close();
     }
