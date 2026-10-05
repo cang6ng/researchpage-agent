@@ -18,6 +18,9 @@
     "@every-dagent/plugin-research": "workspace:*",
     "@every-dagent/protocol": "workspace:*",
     "@every-dagent/web": "workspace:*",
+    "@mantine/core": "9.7.0",
+    "@mantine/hooks": "9.7.0",
+    "lucide-react": "1.52.0",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   }

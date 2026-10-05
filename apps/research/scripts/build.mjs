@@ -33,7 +33,11 @@ export async function buildResearchApp(options = {}) {
     platform: "browser",
     target: ["es2022"],
     jsx: "automatic",
-    define: { "process.env.NODE_ENV": '"production"' },
+    // The page has no environment to read: a browser has no `process`, and a
+    // dependency that asks for one must not leave an env lookup in the artifact
+    // for a reader to wonder about. The specific define wins over the general
+    // one, so React's own production check is still compiled away.
+    define: { "process.env.NODE_ENV": '"production"', "process.env": "{}" },
     metafile: true,
     logLevel: quiet ? "silent" : "info",
   });

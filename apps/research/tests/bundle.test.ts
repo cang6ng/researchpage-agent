@@ -57,9 +57,18 @@ describe("the workspace page bundle", () => {
     expect(app).not.toContain("startResearchApp");
     expect(app).not.toContain("createHost");
     expect(app).not.toContain("pi-ai");
-    for (const name of ["apiKey", "DEEPSEEK", "OPENAI", "process.env"]) {
+    for (const name of ["apiKey", "DEEPSEEK", "OPENAI"]) {
       expect(app, `the page bundle must not mention ${name}`).not.toContain(name);
     }
+    // The page has no environment to read. `process.env` itself is compiled
+    // away by the build (`define`), so the only mentions left in the artifact
+    // are esbuild's own markers for the value it substituted — a comment and a
+    // module name, never an expression. Any *read* of the environment, by
+    // property or by index, is still a failure.
+    expect(app).not.toMatch(/process\.env[.[]/);
+    const envMentions = app.match(/process\.env/g)?.length ?? 0;
+    const defineMarkers = app.match(/<define:process\.env>/g)?.length ?? 0;
+    expect(defineMarkers, "every process.env mention must be an esbuild define marker").toBe(envMentions);
     // The page reaches the product only through its own routes.
     expect(app).toContain("/api/research/tasks");
   });

@@ -1,0 +1,702 @@
+/*
+ * ResearchPage — the research artifact.
+ *
+ * The second visual grammar. Everything here belongs to the *document*: the
+ * report a reader reads, the one the PDF renders, the one the gallery previews.
+ * It shares the brand ink and the semantic status colors with the application
+ * and shares no component with it — no Mantine, no app surface, no soft card.
+ *
+ * Two themes, and they must remain distinguishable in greyscale:
+ *
+ *   Editorial — a research journal. Serif hierarchy, generous leading, thin
+ *   rules, warm paper, headings that are set rather than boxed.
+ *
+ *   Swiss — an analytical publication. One sans face, numbered sections, a
+ *   visible grid, tight tables, a rule under every heading.
+ *
+ * The difference is carried by typography, numbering and grid — not by an
+ * accent colour, which a greyscale print would erase.
+ */
+
+.rp-doc {
+  color: #16232a;
+  font-size: 16px;
+  line-height: 1.78;
+}
+
+.rp-doc * {
+  box-sizing: border-box;
+}
+
+/* --------------------------------------------------------------- editorial -- */
+
+.rp-doc[data-theme="editorial"] {
+  font-family: var(--rp-font-serif);
+  background: #fdfcfa;
+  padding: 8px 0;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__head {
+  max-width: 720px;
+  margin: 0 auto 40px;
+  text-align: left;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__kicker {
+  font-family: var(--rp-font);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #8a8578;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 22px;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__kicker::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: rgba(60, 52, 40, 0.16);
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__title {
+  font-size: 38px;
+  line-height: 1.2;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0 0 18px;
+  color: #1d1a15;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__summary {
+  font-size: 17px;
+  line-height: 1.72;
+  color: #4a463c;
+  margin: 0;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__frame {
+  font-family: var(--rp-font);
+  margin-top: 26px;
+  padding-top: 18px;
+  border-top: 1px solid rgba(60, 52, 40, 0.14);
+  display: grid;
+  gap: 6px;
+  font-size: 12.5px;
+  color: #6b6659;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__frame b {
+  font-weight: 500;
+  color: #8a8578;
+  letter-spacing: 0.04em;
+  margin-right: 8px;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__section {
+  max-width: 720px;
+  margin: 0 auto 44px;
+  padding: 0 0 0 0;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__h2 {
+  font-size: 25px;
+  line-height: 1.3;
+  font-weight: 600;
+  margin: 0 0 20px;
+  color: #1d1a15;
+  letter-spacing: -0.005em;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__h2::before {
+  content: "";
+  display: block;
+  width: 34px;
+  height: 2px;
+  background: #244b60;
+  margin-bottom: 18px;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__p {
+  margin: 0 0 18px;
+  text-align: justify;
+  text-justify: inter-ideograph;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__list {
+  margin: 0 0 20px;
+  padding-left: 22px;
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__list li {
+  margin-bottom: 8px;
+}
+
+/* --------------------------------------------------------------- swiss -- */
+
+.rp-doc[data-theme="swiss"] {
+  font-family: var(--rp-font);
+  background: #ffffff;
+  padding: 4px 0;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__head {
+  max-width: 720px;
+  margin: 0 auto 34px;
+  border-bottom: 2px solid #16232a;
+  padding-bottom: 20px;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__kicker {
+  font-family: var(--rp-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #56636b;
+  margin-bottom: 14px;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__title {
+  font-size: 34px;
+  line-height: 1.14;
+  font-weight: 700;
+  letter-spacing: -0.022em;
+  margin: 0 0 14px;
+  color: #102027;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__summary {
+  font-size: 16px;
+  line-height: 1.62;
+  color: #3d4a51;
+  margin: 0;
+  max-width: 62ch;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__frame {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  font-size: 12px;
+  color: #45525a;
+  border-top: 1px solid rgba(31, 44, 51, 0.16);
+  padding-top: 14px;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__frame b {
+  display: block;
+  font-family: var(--rp-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #7a858c;
+  margin-bottom: 4px;
+  font-weight: 500;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__section {
+  max-width: 720px;
+  margin: 0 auto 36px;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__h2 {
+  font-size: 20px;
+  line-height: 1.3;
+  font-weight: 650;
+  letter-spacing: -0.012em;
+  margin: 0 0 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(31, 44, 51, 0.16);
+  color: #102027;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__h2 .rp-doc__num {
+  font-family: var(--rp-font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: #244b60;
+  letter-spacing: 0;
+  flex: none;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__p {
+  margin: 0 0 16px;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__list {
+  margin: 0 0 18px;
+  padding-left: 20px;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__list li {
+  margin-bottom: 6px;
+}
+
+/* ------------------------------------------------------------ shared blocks -- */
+
+.rp-doc__section[data-selected="true"] .rp-doc__h2 {
+  background: rgba(36, 75, 96, 0.06);
+}
+
+/* A citation. The number is the source's, minted by the program, and it is the
+   same number the reference list and the PDF print. */
+.rp-cite {
+  appearance: none;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 0.72em;
+  line-height: 0;
+  vertical-align: super;
+  letter-spacing: 0.02em;
+  color: #244b60;
+  padding: 0 1px 0 2px;
+  cursor: pointer;
+  border-radius: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-cite:hover {
+  background: rgba(36, 75, 96, 0.12);
+}
+
+.rp-cite[data-active="true"] {
+  background: #244b60;
+  color: #fff;
+}
+
+/* Read mode: the publication as it would be printed. */
+.rp-doc[data-mode="read"] .rp-cite {
+  display: none;
+}
+
+.rp-claim {
+  cursor: pointer;
+  border-radius: 2px;
+  transition: background 100ms var(--rp-ease);
+}
+
+.rp-claim:hover {
+  background: rgba(36, 75, 96, 0.06);
+}
+
+.rp-claim[data-selected="true"] {
+  background: rgba(36, 75, 96, 0.1);
+  box-shadow: inset 0 -1px 0 rgba(36, 75, 96, 0.35);
+}
+
+/* A synthesis is ours rather than a source's. It is marked by a rule and a
+   label in the margin — not by a colour wash, which would make it a different
+   kind of object instead of a different kind of sentence. */
+.rp-doc__synthesis {
+  position: relative;
+}
+
+.rp-doc__synthesis::before {
+  content: "综合判断";
+  position: absolute;
+  left: -104px;
+  top: 4px;
+  width: 84px;
+  text-align: right;
+  font-family: var(--rp-font);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  color: #244b60;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__synthesis::before {
+  position: static;
+  display: inline-block;
+  width: auto;
+  text-align: left;
+  font-family: var(--rp-font-mono);
+  font-size: 10px;
+  border: 1px solid rgba(36, 75, 96, 0.3);
+  border-radius: 3px;
+  padding: 0 5px;
+  margin-right: 8px;
+  vertical-align: 1px;
+}
+
+.rp-doc__synthesis {
+  border-left: 2px solid rgba(36, 75, 96, 0.28);
+  padding-left: 14px;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__synthesis {
+  border-left: 0;
+  padding-left: 0;
+}
+
+/* Comparison: the one block allowed to exceed the reading measure. */
+.rp-doc__compare {
+  margin: 26px -60px 30px;
+  max-width: none;
+}
+
+.rp-doc__compare__label {
+  font-family: var(--rp-font);
+  font-size: 11px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #8b9499;
+  margin-bottom: 10px;
+}
+
+.rp-doc__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--rp-font);
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
+.rp-doc__table th {
+  text-align: left;
+  font-weight: 600;
+  padding: 10px 14px 10px 0;
+  border-bottom: 1px solid rgba(31, 44, 51, 0.22);
+  color: #16232a;
+  vertical-align: bottom;
+}
+
+.rp-doc__table th:first-child {
+  width: 22%;
+}
+
+.rp-doc__table td {
+  padding: 12px 14px 12px 0;
+  border-bottom: 1px solid rgba(31, 44, 51, 0.09);
+  vertical-align: top;
+  color: #33414a;
+}
+
+.rp-doc__table td:first-child,
+.rp-doc__table th:first-child {
+  padding-left: 0;
+}
+
+.rp-doc__table tbody tr:hover td {
+  background: rgba(31, 44, 51, 0.02);
+}
+
+.rp-doc__table th.rp-doc__col--none,
+.rp-doc__table td.rp-doc__col--none {
+  opacity: 0.92;
+}
+
+.rp-doc__dimhint {
+  display: block;
+  font-family: var(--rp-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: #8b9499;
+  font-weight: 400;
+  margin-top: 3px;
+  text-transform: none;
+}
+
+.rp-doc__table td[data-empty="true"] {
+  color: #98a1a7;
+}
+
+/* Mechanism: structured explanation, laid out as annotated stages. */
+.rp-doc__mech {
+  margin: 26px 0 30px;
+  font-family: var(--rp-font);
+}
+
+.rp-doc__mech__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #16232a;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.rp-doc__mech__title::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: rgba(31, 44, 51, 0.12);
+}
+
+.rp-doc__mech__ends {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.rp-doc__mech__end {
+  border: 1px solid rgba(31, 44, 51, 0.12);
+  border-radius: 3px;
+  padding: 11px 13px;
+  background: rgba(31, 44, 51, 0.015);
+}
+
+.rp-doc__mech__end b {
+  display: block;
+  font-family: var(--rp-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8b9499;
+  font-weight: 500;
+  margin-bottom: 5px;
+}
+
+.rp-doc__mech__steps {
+  list-style: none;
+  margin: 0 0 18px;
+  padding: 0;
+  counter-reset: rp-step;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rp-doc__mech__steps li {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  gap: 12px;
+  padding: 11px 0;
+  border-top: 1px solid rgba(31, 44, 51, 0.08);
+  font-size: 14.5px;
+  line-height: 1.65;
+  color: #2b3841;
+  font-family: var(--rp-font-serif);
+}
+
+.rp-doc__mech__steps li::before {
+  counter-increment: rp-step;
+  content: counter(rp-step);
+  font-family: var(--rp-font-mono);
+  font-size: 11px;
+  color: #244b60;
+  padding-top: 4px;
+  text-align: right;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__mech__steps li {
+  font-family: var(--rp-font);
+  font-size: 13.5px;
+}
+
+.rp-doc__mech__terms {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.rp-doc__mech__term {
+  padding: 12px 13px;
+  border-left: 2px solid rgba(31, 44, 51, 0.14);
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: #3d4a51;
+}
+
+.rp-doc__mech__term b {
+  display: block;
+  font-family: var(--rp-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8b9499;
+  font-weight: 500;
+  margin-bottom: 5px;
+}
+
+.rp-doc__mech__term--failure {
+  border-left-color: rgba(173, 71, 66, 0.4);
+}
+
+/* A gap the research did not close: stated in the document, never hidden. */
+.rp-doc__callout {
+  border-left: 2px solid rgba(148, 101, 28, 0.5);
+  background: rgba(255, 244, 223, 0.5);
+  padding: 12px 15px;
+  font-family: var(--rp-font);
+  font-size: 13.5px;
+  line-height: 1.62;
+  color: #6f4c14;
+  margin: 20px 0;
+}
+
+.rp-doc__callout--note {
+  border-left-color: rgba(36, 75, 96, 0.35);
+  background: rgba(234, 241, 244, 0.5);
+  color: #244b60;
+}
+
+.rp-doc__callout__dims {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  margin-top: 6px;
+  opacity: 0.8;
+}
+
+/* The reference list and the verification index, at the end of the document. */
+.rp-doc__back {
+  max-width: 720px;
+  margin: 56px auto 0;
+  padding-top: 26px;
+  border-top: 1px solid rgba(31, 44, 51, 0.18);
+  font-family: var(--rp-font);
+}
+
+.rp-doc[data-theme="editorial"] .rp-doc__back {
+  border-top-color: rgba(60, 52, 40, 0.18);
+}
+
+.rp-doc__back h3 {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  margin: 0 0 14px;
+  color: #16232a;
+}
+
+.rp-doc__ref {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid rgba(31, 44, 51, 0.08);
+  font-size: 13px;
+  line-height: 1.6;
+  color: #3d4a51;
+}
+
+.rp-doc__ref__num {
+  font-family: var(--rp-font-mono);
+  font-size: 11.5px;
+  color: #244b60;
+  padding-top: 2px;
+}
+
+.rp-doc__ref__title {
+  color: #16232a;
+  font-weight: 500;
+}
+
+.rp-doc__ref__meta {
+  font-size: 12px;
+  color: #8b9499;
+  margin-top: 2px;
+}
+
+.rp-doc__warn {
+  font-family: var(--rp-font);
+  max-width: 720px;
+  margin: 0 auto 26px;
+  border: 1px solid rgba(148, 101, 28, 0.3);
+  background: rgba(255, 244, 223, 0.45);
+  border-radius: 4px;
+  padding: 12px 15px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: #6f4c14;
+}
+
+.rp-doc__warn b {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.rp-doc__warn ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+/* Empty and loading states inside the document area. */
+.rp-doc__placeholder {
+  font-family: var(--rp-font);
+  max-width: 720px;
+  margin: 60px auto;
+  text-align: center;
+  color: #8b9499;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+@media (max-width: 1100px) {
+  .rp-doc__compare {
+    margin-inline: -20px;
+  }
+  .rp-doc__synthesis::before {
+    position: static;
+    display: block;
+    width: auto;
+    text-align: left;
+    margin-bottom: 4px;
+  }
+}
+
+/* Section headings are also the object handle: selecting a section is how a
+   reader gets at its actions, so the heading itself is the control. */
+.rp-doc__h2-btn {
+  appearance: none;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  padding: 0;
+  margin: 0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rp-doc__h2-btn:hover {
+  color: #244b60;
+}
+
+/* The section number belongs to the analytical theme; the journal prints
+   headings without one. */
+.rp-doc[data-theme="editorial"] .rp-doc__num {
+  display: none;
+}
+
+.rp-doc__ref__link {
+  appearance: none;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-family: var(--rp-font);
+  font-size: 12px;
+  color: #244b60;
+  padding: 0;
+  margin-left: 10px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* A theme change is a reprint, not a redraw: the document crossfades once so a
+   reader sees the presentation change and nothing else move. */
+.rp-doc[data-theme] {
+  animation: rp-doc-theme 120ms var(--rp-ease) 1;
+}
+
+@keyframes rp-doc-theme {
+  from {
+    opacity: 0.55;
+  }
+  to {
+    opacity: 1;
+  }
+}
