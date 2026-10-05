@@ -16,3 +16,6 @@ node_modules/
 
 # local working area (logs, scratch runs, copied artifacts)
 .scratch/
+
+# the product's default local data directory
+/researchpage-data/
