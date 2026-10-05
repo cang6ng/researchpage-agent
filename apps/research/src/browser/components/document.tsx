@@ -123,13 +123,18 @@ function renderBlock(block: ReportBlock, context: BlockContext, index: number): 
     case "list":
       return (
         <ul className="rp-doc__list" key={index}>
-          {block.items.map((item, itemIndex) => (
-            <li key={itemIndex}>
-              <ClaimTarget claimIds={item.claimIds} context={context}>
-                {item.text}
-              </ClaimTarget>
-            </li>
-          ))}
+          {block.items.map((item, itemIndex) => {
+            // A judgement of ours stays marked wherever it is printed: a list
+            // item carrying a synthesis says so just as a paragraph does.
+            const isSynthesis = blockIsSynthesis(item.claimIds, context.claimsById);
+            return (
+              <li key={itemIndex} className={isSynthesis ? "rp-doc__synthesis rp-doc__synthesis--inline" : undefined}>
+                <ClaimTarget claimIds={item.claimIds} context={context}>
+                  {item.text}
+                </ClaimTarget>
+              </li>
+            );
+          })}
         </ul>
       );
     case "table":

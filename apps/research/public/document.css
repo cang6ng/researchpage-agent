@@ -700,3 +700,19 @@
     opacity: 1;
   }
 }
+
+/* Inside a list the synthesis label sits on the line rather than in the margin:
+   a negative offset there would collide with the marker. */
+.rp-doc__synthesis--inline {
+  border-left: 0;
+  padding-left: 0;
+}
+
+.rp-doc__synthesis--inline::before {
+  position: static;
+  display: inline;
+  width: auto;
+  text-align: left;
+  margin-right: 6px;
+  vertical-align: 1px;
+}

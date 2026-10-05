@@ -481,10 +481,61 @@ async function main() {
       })()`,
     );
     case_("报告由原生文档画布渲染（没有 iframe）", canvas.isNative === true && canvas.sections > 3, `${String(canvas.sections)} 节 · ${String(canvas.citations)} 处引用`);
+
+    // What the report says it contains decides what has to be drawn: a report
+    // written under the v2 blueprint carries mechanisms and syntheses, and one
+    // written before it does not. The gate asks the document what it has and
+    // then checks the canvas drew exactly those shapes — rather than assuming
+    // a generation and reporting a correct v1 report as a failure.
+    const declared = await (async () => {
+      const bundle = await fetch(`${base}/api/research/tasks/${taskId}`).then((response) => response.json());
+      if (bundle.currentReportId === null) return null;
+      const document = await fetch(`${base}/api/research/reports/${String(bundle.currentReportId)}/document`).then((response) => response.json());
+      const isSynthesis = new Map(
+        document.claims.map((claim) => [claim.id, claim.synthesis === true || claim.claimType === "synthesis"]),
+      );
+      const claimIdsOf = (block) => {
+        switch (block.kind) {
+          case "paragraph":
+            return block.claimIds;
+          case "list":
+            return block.items.flatMap((item) => item.claimIds);
+          case "table":
+            return block.rows.flatMap((row) => row.cells.flatMap((cell) => cell.claimIds));
+          case "mechanism":
+            return [...block.claimIds, ...block.steps.flatMap((step) => step.claimIds)];
+          default:
+            return [];
+        }
+      };
+      const kinds = {};
+      let markedBlocks = 0;
+      for (const section of document.sections) {
+        for (const block of section.blocks) {
+          kinds[block.kind] = (kinds[block.kind] ?? 0) + 1;
+          // The canvas marks a block as ours when everything it says is ours:
+          // the gate counts the blocks that obligation produces.
+          const ids = claimIdsOf(block);
+          if (ids.length > 0 && ids.every((id) => isSynthesis.get(id) === true)) markedBlocks += 1;
+        }
+      }
+      return {
+        kinds,
+        claims: document.claims.length,
+        syntheses: document.claims.filter((claim) => isSynthesis.get(claim.id) === true).length,
+        markedBlocks,
+        warnings: document.validation === null ? 0 : (document.validation.warnings ?? []).length,
+      };
+    })();
     case_(
-      "机制 / 比较表 / 综合判断按各自的形态渲染",
-      canvas.mechanism >= 1 && canvas.tables >= 1 && canvas.synthesis >= 1,
-      `机制 ${String(canvas.mechanism)} · 比较表 ${String(canvas.tables)} · 综合 ${String(canvas.synthesis)}`,
+      "每种区块按自己的形态渲染",
+      declared !== null &&
+        canvas.tables >= (declared.kinds.table ?? 0) &&
+        canvas.mechanism >= (declared.kinds.mechanism ?? 0) &&
+        canvas.synthesis >= declared.markedBlocks,
+      declared === null
+        ? "no report"
+        : `报告声明 ${JSON.stringify(declared.kinds)}（${String(declared.markedBlocks)} 个整段综合）· 画布 机制 ${String(canvas.mechanism)} / 比较表 ${String(canvas.tables)} / 综合 ${String(canvas.synthesis)}`,
     );
 
     // Selecting a claim must open the evidence inspector, and the inspector has
@@ -560,8 +611,8 @@ async function main() {
     );
     case_(
       "质量校验提醒只出现在核验模式，不进印刷稿",
-      verifyState.warnings === 1 && readMode.warnings === 0,
-      `核验 ${String(verifyState.warnings)} · 阅读 ${String(readMode.warnings)}`,
+      readMode.warnings === 0 && verifyState.warnings === (declared !== null && declared.warnings > 0 ? 1 : 0),
+      `报告声明 ${String(declared === null ? 0 : declared.warnings)} 条提醒 · 核验 ${String(verifyState.warnings)} · 阅读 ${String(readMode.warnings)}`,
     );
     await session.clickText("核验", ".rp-toolbar");
     await delay(300);
