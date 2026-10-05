@@ -7,6 +7,9 @@
 export type {
   AssessmentDirectness,
   AssessmentRelationship,
+  BriefFieldName,
+  BriefFieldState,
+  BriefFieldStates,
   CellRef,
   CellStatus,
   ClaimBasis,
@@ -47,13 +50,16 @@ export type {
 } from "./domain.js";
 export {
   DEFAULT_BUDGET,
+  BRIEF_FIELDS,
   deriveCellCoverage,
   emptyUsage,
   ID_PREFIX,
   isCellRef,
   isCovered,
+  lockedFieldStates,
   needsAttention,
   PRIMARY_ROLES,
+  suggestedFieldStates,
 } from "./domain.js";
 
 export {
@@ -91,6 +97,46 @@ export {
 export { validateArtifactQuality, type ArtifactDraft, type ArtifactInput, type ArtifactVerdict } from "./artifact.js";
 
 export { canonicalJson, hashOf } from "./hash.js";
+
+export {
+  applyBriefPatch,
+  briefBlueprintOf,
+  briefFieldHash,
+  briefFieldStatesOf,
+  briefFieldSummary,
+  briefFieldValue,
+  briefHashOf,
+  briefStructureView,
+  briefVersionOf,
+  briefWithApplication,
+  EDITABLE_BRIEF_FIELDS,
+  fieldTakesFreeText,
+  GUIDE_DECISION_LIMIT,
+  guideQuestionIsStale,
+  INITIAL_BRIEF_VERSION,
+  isStructural,
+  MAX_BRIEF_DIMENSIONS,
+  MAX_BRIEF_FOCUS,
+  MAX_BRIEF_SUBJECTS,
+  nextGuideTarget,
+  patchFromFreeText,
+  readBriefPatch,
+  STRUCTURAL_BRIEF_FIELDS,
+  validateBriefDraft,
+  type BriefApplication,
+  type BriefApplyResult,
+  type BriefDimensionInput,
+  type BriefPatch,
+  type BriefPatchProblem,
+  type BriefPatchReading,
+  type BriefSubjectInput,
+  type BriefValidation,
+  type GuideAnswerRecord,
+  type GuideOption,
+  type GuideQuestion,
+  type GuideQuestionStatus,
+  type GuideTarget,
+} from "./brief.js";
 
 export {
   capabilitiesFor,
@@ -198,7 +244,18 @@ export {
   SECTION_IDS,
   type AcceptProposalResult,
   type AssessResult,
+  type BriefConflict,
+  type BriefView,
   type CellView,
+  type ConfirmResult,
+  type GuideAnswerInput,
+  type GuideAnswerResult,
+  type GuideDecisionView,
+  type GuideOptionView,
+  type GuideQuestionView,
+  type GuideTargetDecision,
+  type PatchBriefResult,
+  type ProposeGuideQuestionResult,
   type ReadResult,
   type Refusal,
   type ResearchService,

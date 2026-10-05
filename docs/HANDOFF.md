@@ -8,7 +8,9 @@
 - Upstream sealed baseline：`c5f97ba63f719ec81030746f3eb67fe7c538e01f`；见 [UPSTREAM_BASELINE.md](./UPSTREAM_BASELINE.md)。未修改 upstream，未引入 Phase 5。
 - 实施依据：[COMPETITION_SPEC.md](./COMPETITION_SPEC.md)、`ResearchPage_Product_Redesign.md`（§6/§8/§17/§23）、`What Makes a Great AI-Native Research Artifact?`（§6/§11–13/§17）。
 
-## Current Status（2026-10-05）
+## Current Status（2026-10-06）
+
+- **Step 3.5A（Editable Research Brief + Guided Planning）已完成**：未确认的 ResearchTask 本身就是可编辑的 **Research Brief Draft**；结构化 PATCH 与引导式（一次一问）两种交互写同一份草稿；确认时按最终草稿校验、冻结字段状态并重建矩阵；历史项目仍按只读返回。
 
 - **Step 3（Frontend Product Redesign）已完成**：产品前端从「最小兼容」重写为 desktop-grade 研究工具——统一设计系统、Start/Library、Research Brief、Evidence Matrix、统一 Context Dock、原生 Report Studio（Editorial / Swiss 两套文档主题）、Source Workspace、Template Gallery、Settings；全部界面连接真实 API，浏览器 gate 逐项验收。
 
@@ -37,6 +39,70 @@
 - 校验失败与警告分开：`validation.checks` 记录每条 Q 规则的 result（pass/fail/warning/not_applicable），`problems` 阻止发布，`warnings` 随报告保存并显示在工作台。
 - 旧报告与新规则解耦：没有 `blueprintId` 的任务沿用 v1 的「必需章节 + 引用真实」规则，老数据不会因为新义务而无法编辑或导出。
 - 页数不是硬约束：card 的 lengthTarget 与各节 budget 作为写作预算写进阶段指令（实测把同一主题从 15 页收到 11 页），但 validator 不会因为页数拒绝报告。
+## Step 3.5A 新增（本次工作产物）
+
+本轮只解决一件事：**研究开始之前，用户必须能真正参与定义 Research Brief**。不做前端 redesign（正式 Structured / Guided UI 属于 STEP 3.5B）。
+
+### Research Brief Draft（数据模型）
+
+- **没有第二个数据模型**：`confirmedAt === null` 的 `ReportTask` 就是草稿。新增三个最小字段（`packages/plugin-research/src/domain.ts`）：`briefVersion`（整数，每次正式草稿变更 +1）、`briefFieldStates`（逐字段 `suggested | edited | confirmed`）、`briefUpdatedAt`；另加 `guideClosed`（引导结束的判定与理由）。字段名与状态类型集中在 `domain.ts`（`BriefFieldName` / `BRIEF_FIELDS`），因为它们是记录的一部分。
+- **可编辑字段**（白名单，其余一律按名拒绝）：`topic / purpose / audience / subjects / dimensions / focus / exclusions / lengthTarget`。`purpose` 就是「研究问题/用途」的唯一 source of truth（没有另造 question 字段）；`topic` 仍是一句话主题。**不允许**通过 Brief 修改 `confirmedAt / status / budget / matrix / sources / evidence / blueprintId / run 状态`。
+- **默认提案不变**：`propose_task` 仍然先给出完整默认方案（§4「不要 Empty Form」）。若同一份卡片被重复提议，服务端**不再**无条件 +1 版本（内容与矩阵形状一致时原样返回），避免模型在 card 阶段多次调用导致版本虚增。
+- **报告结构仍由 Blueprint 派生**：`BriefView.reportStructure` 只读展示，不提供编辑；用户在 Brief 里改的是研究问题、对象、维度、范围、读者与关注点，不能把 Blueprint 变成任意 outline。
+
+### 结构化编辑
+
+- **`PATCH /api/research/tasks/:id/brief`**，输入 `{ expectedVersion?, patch }`（`patch` 也可直接展开为 body）。返回 `{ ok, brief, changedFields }`；`changedFields` 只包含本次真正提交的字段。
+- **服务端负责**：白名单校验、normalization、**stable IDs**、字段状态、版本递增、矩阵同步。新增对象/维度**不要带 id**（由服务端按 `slugId` 生成并去重）；改已有的必须带它的 id，未知 id 直接拒绝（400）。
+- **局部不完整是允许的**：`purpose` 清空、`subjects: []` 这类编辑会被接受，并在返回的 `brief.validation.problems` 里列出问题；**confirm 时才会被拒绝**（409，附带当前 brief）。malformed patch（未知字段、类型错、id 重复/未知、超出上限）直接 400，不会把任务置于无法修复的状态。
+- **Blueprint 最低义务**（`BlueprintSpec.briefMinimums` = subjects ≥ 1、dimensions ≥ 3）：维度不能被编辑到 3 个以下，否则报告 validator 会失去比较对象；subjects 下限取 1（Technical Comparison 推荐 2–5，未硬编码成 3）。
+- **结构性字段**（`subjects` / `dimensions`）的增删改会同步重建矩阵（见下）；若任务在未确认状态**已有实际读取的材料**（已读 source / evidence / assessment / report），结构变更与矩阵重建都会被拒绝（409），不静默删除研究材料。
+
+### Guided Planning（一次一问）
+
+- **问题由程序选题、模型写题**：新增 `guide` stage（`ResearchStage`）与 `propose_guide_question` 工具。程序按固定阶梯（purpose → audience → subjects → dimensions → focus → exclusions → lengthTarget）决定「下一件最值得确认的事」，**跳过用户已经决定的字段**，并在 5 个决策后停止（`GUIDE_DECISION_LIMIT`）；模型只负责措辞、`whyThisMatters` 和 2–5 个候选选项，也可以返回 `{ complete: true, reason }` 表示「默认已经足够具体，不值得再问」（§17 的跳过低价值问题）。
+- **服务端校验**：`fieldTargets` 必须**正好**是程序指定的那一个字段（多字段问题本轮不支持）；`options` 必须 2–5 项；**每个选项必须带 `value`**——它是该字段的最小 patch，创建问题时就按同一套 normalizer 对着当前草稿验证过，`value` 只能包含 `fieldTargets` 里的字段。因此「选中一个选项」不是一个需要再猜一次的标签（§20）。
+- **一次一问**：一个任务同时只有一个 `active` 问题；写新问题会把旧的置为 `superseded`。`allowFreeText` 固定为 `true`。
+- **自由文本有声明式规则**（不是让模型猜）：文本字段（topic/purpose/audience/exclusions/lengthTarget）回答即取值；`focus` 按行/顿号/逗号切分；`subjects` 每行 `名称 | 说明`（同一行内也支持逗号分隔）；`dimensions` 每行 `名称 | 要回答的问题`。名称能对上现有对象时**保留其 id**。
+- **答案路径与结构化 PATCH 完全同一条**：`applyBriefChange` 是两者唯一的写入口，validation / normalization / stable id / 结构性守卫 / 矩阵同步全部共用；区别只在字段状态（引导答案是 `confirmed`，结构化编辑是 `edited`）。
+- **persistence**：`brief_guide` 表（`CREATE TABLE IF NOT EXISTS`）保存每条问题的 question / fieldTargets / options / `basedOnBriefVersion` / `basedOnFields`（目标字段取值的 hash）/ 答案（optionIds、freeText、appliedFields、`resultingBriefVersion`）。页面刷新后能回答「已经做过哪些决定」；不做长期对话记忆。active 问题在重启后可按需重新生成。
+
+### Version / stale 语义
+
+- 每次正式草稿变更（PATCH 应用、引导答案应用、confirm 冻结）`briefVersion +1`。
+- PATCH / answer 支持 `expectedVersion`：不一致返回 **409 + 当前 Brief**（`stale: true`），客户端据此重新读取。**版本不一致不等于问题作废**：若该问题的目标字段没变，重新提交即可继续回答。
+- **问题 stale 的判据是目标字段本身**：`basedOnFields` 的 hash 变了 → 该问题被置为 `superseded` 并返回 409「研究任务已更新，请获取新的问题」；结构化编辑改到某个活动问题的目标字段时，也会立即把它置为 `superseded`。
+- 已回答的问题不能再回答（400），答案不会二次应用。
+
+### Confirm 语义
+
+- `POST /tasks/:id/confirm`（`service.confirmTask(taskId, { expectedVersion? })`）现在：**验证草稿完整** → 拒绝不完整的草稿（409 + 问题清单 + 当前 Brief，不启动 research）→ **冻结**（全部字段状态归一为 `confirmed`）→ 版本 +1 → **reconcile 矩阵**（`syncMatrix`：按最终 subjects/dimensions 生成，保留仍存在且已有工作的单元格；不保留任何 stale 单元格）。
+- **矩阵建于 propose_task 时**（已核实，非假设）：`createTask → buildMatrix`；确认只做 reconcile。由于结构性 PATCH 已经同步矩阵，confirm 的 `matrixRebuilt` 在正常流程里是 `false`，只有面对矩阵与简报不一致的记录（老数据/外部改写）才会是 `true`——§13 要求的一致性由此得到保证，而不依赖「确认之前没人动过矩阵」。
+- **确认即上锁**：PATCH brief → 409；`guide/next` → 409；`guide/answer` → 409。研究中途改方向仍属 Assistant Edit / 未来 Reframe，本轮不实现。
+
+### API 汇总（本轮新增/变更）
+
+| 方法与路径 | 作用 |
+| --- | --- |
+| `GET /api/research/tasks/:id/brief` | Brief（草稿或冻结记录）。已确认任务仍可 GET，`readonly: true` |
+| `PATCH /api/research/tasks/:id/brief` | 结构化编辑；`{ expectedVersion?, patch }`；409 = 版本过期/已冻结/结构变更会破坏既有材料 |
+| `POST /api/research/tasks/:id/brief/guide/next` | 生成下一个引导问题（202，一个问题一个 stage run）；已有活动问题直接返回（200，不重复花一次 run）；引导已结束返回 `complete: true` |
+| `POST /api/research/tasks/:id/brief/guide/answer` | `{ questionId, expectedVersion?, optionIds?, freeText? }` → `{ brief, appliedFields, complete, nextQuestion }` |
+| `POST /api/research/tasks/:id/confirm` | 基于当前草稿确认；拒绝不完整草稿（409） |
+| `GET /api/research/tasks/:id` | bundle 新增 `brief`（随轮询一起下发，和矩阵/来源同一份状态） |
+
+`BriefView` 含：taskId、confirmed、readonly、version、topic、question/purpose、audience、subjects、dimensions、focus、exclusions、lengthTarget、reportStructure（派生）、editableFields、fieldStates、validation、blueprint（id/name/purpose/最低与推荐数量）、guide（complete/reason/decisions/active）、matrix 摘要、contentHash。
+
+### 前端（本轮只做最小兼容）
+
+- 只更新了 `apps/research/src/browser/api.ts`：新增 `BriefView` / `BriefPatch` / `GuideQuestionView` / `GuideDecisionView` 等 DTO 与 `api.brief / patchBrief / guideNext / guideAnswer`；`TaskBundle` 增加 `brief`；`RunView.stage` 与 `STAGE_LABELS` 增加 `guide`；新增 `BRIEF_FIELD_LABELS` / `BRIEF_STATE_LABELS`。
+- 既有 Brief 页面**未改**，仍能正常读取（它读的 `task.*` / `subjects` / `dimensions` / `structure` 都未变）；本轮**没有**在页面上拼一半新版 Structured Mode。
+
+### 测试（本轮新增）
+
+- `packages/plugin-research/tests/brief-guide.test.ts`（33 例，服务层契约 A–N）：默认草稿与 fieldStates、PATCH 只改目标字段且版本 +1、stable IDs（改名/重排保 id、新增才生成、未知 id 拒绝）、不完整草稿可读不可确认、Blueprint 最低义务、confirm 用最新草稿并重建矩阵、confirm 后三处上锁、一次一问、选项 value 必须是真 patch、引导答案走同一套规则（含自由文本结构化解析）、stale（版本与目标字段两条判据）、已答不可重答、引导看到最新值且不重复追问、5 个决策后停止、两种模式互为同一份草稿、历史已确认/未确认项目。
+- `apps/research/tests/brief-api.test.ts`（6 例，HTTP → runner → host run → tool → service → DB 全链路）：默认草稿、结构化 PATCH + 409 stale + 400 白名单、删一个维度加一个维度、一个问题一次写入 + 重问不重复花 run + 版本 stale 409 + 重复回答 400、下一问落到未决定字段（`subjects`）后由模型声明结束、confirm 后矩阵等于最终 subjects×dimensions 且两条路径都上锁。
+
 ## Step 3 新增（本次工作产物）
 
 - **技术栈**：React 19 + Mantine 9（`@mantine/core` / `@mantine/hooks` 9.7.0，负责 Button / Input / Select / SegmentedControl / Menu / Popover / Tooltip / Modal / Drawer / ScrollArea 等 primitive）+ lucide-react 图标 + 既有 esbuild 管线；未引入第二套组件系统。依赖只加在 `apps/research`。
@@ -106,9 +172,35 @@
 
 - 前端（Step 3 后仍存在的限制）：任务卡字段不能在界面里直接编辑——后端没有该路由，改结构的方式是改主题重新生成任务卡（会产生新项目，原项目保留）；Ask 的回答只从会话历史读回最近 5 次，界面不提供完整对话列表；PDF 仍只有 Editorial 版式（Swiss 的 PDF 适配属 Step 4）；切主题不产生 Revision，只记录在冻结版本的 themeId 上；1366 窗口下 Dock 为 overlay，会覆盖矩阵最右一列（可 Esc 关闭，Dock 标题与选中态仍表明当前目标）。
 
+- 简报与引导（Step 3.5A 后仍存在的限制）：
+  - **界面未接**：本轮只做了 API，Brief 页面仍是只读卡片 + 「换个说法重新生成」；正式 Structured / Guided UI 属于 STEP 3.5B。因此现在通过界面**无法**编辑简报，也**无法**手动引导——必须走 API 或 3.5B。
+  - 引导问题**一次只能针对一个字段**（`fieldTargets` 长度为 1），不支持「一个问题同时决定目标与关注点」。`GUIDE_DECISION_LIMIT` 为 5，之后其余字段只能靠结构化编辑。
+  - 引导问题由**一个 stage run** 生成，不是即时返回：`guide/next` 是 202 + 轮询，模型不可用时该轮不会产生问题（返回 409/空），不伪造问题。
+  - 自由文本对 `subjects` / `dimensions` 是**整体替换**语义（按行解析），不是增量编辑；已存在的对象按名称匹配复用 id，改名同时改列表需要显式带 id（结构化 PATCH 可以精确做到）。
+  - 结构性编辑（增删/重排对象或维度）在任务**已有实际读取材料**时被拒绝并返回 409，而不是静默删除证据；正常流程里未确认任务没有材料，所以这条只在异常数据上生效。
+  - `topic` 也可编辑（项目标题），但本轮没有把它从 Brief 的语义讨论里单独拆出：`purpose` 才是研究问题的唯一来源。
+  - 未做：mid-research reframe、简报的历史版本/回滚（只保留 `briefVersion` 计数与引导决策记录）、多字段问题、分支式问题树。
+
 ## Next Action
 
-**STEP 4**（后续步骤，本轮未做）：PDF 双主题适配（把 ThemeSpec 映射到 plugin 的 HTML/PDF renderer，使 Editorial/Swiss 在导出文件里也成立）、Mermaid / DiagramSpec 机制图、File Upload 作为来源、第二 Blueprint、MCP 集成。第 3 轮已经把这些位置留好：主题在版本里记录 themeId，机制块保留结构化数据，Source Workspace 与 Settings 对未接入能力如实标注。
+**STEP 3.5B — Brief & Studio Interaction Repair**（下一步，本轮未做）。
+
+需要 3.5B 处理的是「语义已经有了、界面还没接上」的那一段：
+
+- **Structured Mode UI**：Brief 页面的字段真正可编辑（inline 编辑 / segmented / editable chips，不要 full-width 表单墙），带 `fieldStates` 的 suggested/edited/confirmed 视觉区分与 400–600ms 更新提示、`expectedVersion` 409 的重新同步路径。现在页面上唯一的修改方式是「换个说法重新生成」（会产生新项目）——这正是本轮要消灭的产品缺陷，但**只在 API 层消灭了，界面还没换**。
+- **Guided Mode UI**：一次一问的引导面板（question / whyThisMatters / 2–5 个选项 + free text / 已做决定的回看），`POST brief/guide/next` 是异步的（202 + 轮询 brief），UI 需要处理「问题生成中」这一状态；模型声明 `complete` 后要能自然收束，并允许用户「默认方案已经够好 → 一键确认」。
+- **旧 Brief 页面的确认按钮**：`POST /confirm` 现在会因草稿不完整返回 409。store 会把它显示成错误提示，但页面无法据此引导用户补齐字段——3.5B 必须把 409 的问题清单接到可编辑字段上。
+- **Studio 双栏**：Assistant 与 Brief 的联动（conversation shapes structure），字段更新后的轻微高亮与可撤销。
+- 仍需遵守既有取舍：Report Structure 由 Blueprint 派生、只读；不引入 Markdown renderer / Mermaid；本轮遗留的 `reportNeedsReview`、冻结版本与主题切换语义不变。
+
+**STEP 4**（后续步骤）：PDF 双主题适配（把 ThemeSpec 映射到 plugin 的 HTML/PDF renderer，使 Editorial/Swiss 在导出文件里也成立）、Mermaid / DiagramSpec 机制图、File Upload 作为来源、第二 Blueprint、MCP 集成。第 3 轮已经把这些位置留好：主题在版本里记录 themeId，机制块保留结构化数据，Source Workspace 与 Settings 对未接入能力如实标注。
+
+## Step 3.5A 的验证入口
+
+- 简报 / 引导契约（服务层）：`npx vitest run packages/plugin-research/tests/brief-guide.test.ts`。
+- 简报 / 引导全链路（HTTP → runner → tool → service）：`npx vitest run apps/research/tests/brief-api.test.ts`。两者都使用脚本化模型与本地 fixture，不需要网络或模型凭据。
+- 离线全量与类型检查同 Step 2：`pnpm typecheck`、`pnpm build:research`、`EVERY_DAGENT_NO_BROWSER=1 npx vitest run --exclude "**/real-provider.e2e.test.ts" --exclude "**/real-network.test.ts" --exclude "**/render-pdf.test.ts" --exclude "**/research-plugin.real.test.ts" --exclude "**/real-demo.e2e.test.ts"`。
+- 浏览器 gate 未重跑（本轮未改前端视图）；`verify-workspace.mjs` 的 brief 步骤读的是未改动的既有页面。
 
 ## Step 2 的验证入口
 

@@ -32,6 +32,7 @@ import type {
 } from "./domain.js";
 import type { Proposal } from "./proposal.js";
 import type { FrozenRevision } from "./revision.js";
+import type { GuideQuestion } from "./brief.js";
 
 export function newId(prefix: string): string {
   return `${prefix}_${randomBytes(8).toString("hex")}`;
@@ -74,6 +75,17 @@ export interface ResearchRepository {
   saveRevision(revision: FrozenRevision): void;
   getRevision(revisionId: string): FrozenRevision | undefined;
   listRevisions(taskId: string): readonly FrozenRevision[];
+
+  /**
+   * The guided questions a task has asked, in the order they were asked.
+   *
+   * They are stored as records rather than kept as a transcript: a page that
+   * was refreshed asks "which decisions has this brief already had?" and the
+   * answer is the list, not a conversation.
+   */
+  saveGuideQuestion(question: GuideQuestion): void;
+  getGuideQuestion(questionId: string): GuideQuestion | undefined;
+  listGuideQuestions(taskId: string): readonly GuideQuestion[];
 
   saveExport(artifact: ExportArtifact): void;
   listExports(taskId: string): readonly ExportArtifact[];
@@ -172,6 +184,14 @@ CREATE TABLE IF NOT EXISTS report_revisions (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS report_revisions_task ON report_revisions (task_id);
+CREATE TABLE IF NOT EXISTS brief_guide (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS brief_guide_task ON brief_guide (task_id);
 `;
 
 export function openResearchRepository(options: { readonly location: string }): ResearchRepository {
@@ -351,6 +371,27 @@ export function openResearchRepository(options: { readonly location: string }): 
         .prepare("SELECT payload FROM report_revisions WHERE task_id = ? ORDER BY rowid ASC")
         .all(taskId) as { payload: string }[];
       return rows.map((row) => readJson<FrozenRevision>(row.payload));
+    },
+
+    saveGuideQuestion(question: GuideQuestion): void {
+      database
+        .prepare(
+          "INSERT INTO brief_guide (id, task_id, status, payload, created_at) VALUES (?, ?, ?, ?, ?)" +
+            " ON CONFLICT(id) DO UPDATE SET status = excluded.status, payload = excluded.payload",
+        )
+        .run(question.id, question.taskId, question.status, JSON.stringify(question), question.createdAt);
+    },
+    getGuideQuestion(questionId: string): GuideQuestion | undefined {
+      const row = database.prepare("SELECT payload FROM brief_guide WHERE id = ?").get(questionId) as
+        | { payload: string }
+        | undefined;
+      return row === undefined ? undefined : readJson<GuideQuestion>(row.payload);
+    },
+    listGuideQuestions(taskId: string): readonly GuideQuestion[] {
+      const rows = database
+        .prepare("SELECT payload FROM brief_guide WHERE task_id = ? ORDER BY rowid ASC")
+        .all(taskId) as { payload: string }[];
+      return rows.map((row) => readJson<GuideQuestion>(row.payload));
     },
 
     saveExport(artifact: ExportArtifact): void {

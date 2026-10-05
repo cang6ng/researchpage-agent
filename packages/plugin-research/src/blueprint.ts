@@ -82,6 +82,20 @@ export interface BlueprintSpec {
   readonly optionalComponents: readonly string[];
   /** Candidate dimensions a card may draw on; not a fixed column set. */
   readonly comparisonDimensions: readonly Dimension[];
+  /**
+   * The floor a Brief draft has to meet before research may start.
+   *
+   * A brief is the user's to edit, but not to edit into something this
+   * blueprint cannot honour: below these counts the report validator would
+   * either have no comparison to check or would be checking a structure that
+   * no longer claims anything. One subject is the floor rather than two,
+   * because a single-object study is a real (if unusual) request; three
+   * dimensions is the floor because that is the point below which "compare
+   * across shared questions" stops being what the document does.
+   */
+  readonly briefMinimums: { readonly subjects: number; readonly dimensions: number };
+  /** What this blueprint normally wants, for the guide and the workspace. */
+  readonly briefRecommended: { readonly subjects: readonly [number, number]; readonly dimensions: readonly [number, number] };
   readonly claimRequirements: readonly ClaimRequirement[];
   readonly comparisonRules: readonly string[];
   readonly evidenceRules: readonly string[];
@@ -215,6 +229,8 @@ export const TECHNICAL_COMPARISON_V2: BlueprintSpec = Object.freeze({
   requiredComponents: ["question-takeaways", "mental-model", "mechanism", "comparison", "evidence-judgment", "implications-gaps"] as const,
   optionalComponents: ["详细实验设置", "贯穿例子", "分类图", "可比的定量图", "扩展术语表", "阅读建议"],
   comparisonDimensions: V2_COMPARISON_DIMENSIONS,
+  briefMinimums: { subjects: 1, dimensions: 3 },
+  briefRecommended: { subjects: [2, 5] as const, dimensions: [3, 6] as const },
   claimRequirements: CLAIM_REQUIREMENTS,
   comparisonRules: [
     "每列必须回答同一个维度问题；不同对象不得各自发挥字段",

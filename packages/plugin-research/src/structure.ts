@@ -15,7 +15,7 @@ import type {
   ResearchSection,
   Subject,
 } from "./domain.js";
-import { DEFAULT_BUDGET, emptyUsage } from "./domain.js";
+import { DEFAULT_BUDGET, emptyUsage, suggestedFieldStates } from "./domain.js";
 import { BLUEPRINT_ID_V2, TECHNICAL_COMPARISON_V2, V2_COMPARISON_DIMENSIONS, blueprintSections } from "./blueprint.js";
 import { newId, type ResearchRepository } from "./repository.js";
 import { ID_PREFIX } from "./domain.js";
@@ -172,6 +172,12 @@ export function createTask(input: {
     subjects: input.card.subjects,
     dimensions: input.card.dimensions,
     matrix: buildMatrix(input.card.subjects, input.card.dimensions, input.now),
+    // A card is a draft the moment it exists: nothing in it has been decided by
+    // a person yet, and every field says so.
+    briefVersion: 1,
+    briefFieldStates: suggestedFieldStates(),
+    briefUpdatedAt: input.now,
+    guideClosed: null,
     budget: DEFAULT_BUDGET,
     usage: emptyUsage(),
     currentReportId: null,

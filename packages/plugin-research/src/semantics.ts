@@ -24,15 +24,17 @@ export type AssistantIntent = "ask" | "research" | "edit";
 /**
  * Every intent a run can be started under.
  *
- * `draft` and `card` are the program's own authorizations: the stage that
- * produces the first research card, and the stage that writes the first report.
+ * `draft`, `card` and `guide` are the program's own authorizations: the stage
+ * that produces the first research card, the stage that writes the first
+ * report, and the stage that writes the next guided question about the brief.
  * They exist so that "the agent may write a report" is never an ambient
- * permission — only the report stage holds it.
+ * permission — only the report stage holds it, and only the guide stage may
+ * change the brief's guided record.
  */
-export type ActionIntent = AssistantIntent | "draft" | "card";
+export type ActionIntent = AssistantIntent | "draft" | "card" | "guide";
 
 /** What a grant lets its run do. Nothing else in the product is writable. */
-export type ActionCapability = "card" | "research" | "report" | "proposal";
+export type ActionCapability = "card" | "brief" | "research" | "report" | "proposal";
 
 export interface GrantBudget {
   readonly maxSearches: number;
@@ -69,6 +71,7 @@ const INTENT_CAPABILITIES: Readonly<Record<ActionIntent, readonly ActionCapabili
   edit: ["proposal"],
   draft: ["report"],
   card: ["card"],
+  guide: ["brief"],
 });
 
 /**
@@ -105,6 +108,7 @@ const SCOPE_TEXT: Readonly<Record<ActionIntent, string>> = Object.freeze({
   edit: "只针对指定目标生成修改提案；接受前报告正文不变",
   draft: "撰写并保存本任务的报告版本",
   card: "建立研究任务卡",
+  guide: "针对研究简报草稿生成下一个引导问题",
 });
 
 /** The default research budget a grant carries: the task's own limits apply too. */

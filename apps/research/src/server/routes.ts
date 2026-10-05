@@ -270,6 +270,10 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
     })),
     budget: task.budget,
     usage: task.usage,
+    // The brief travels with the rest of the project: it is the same draft the
+    // structured editor and the guided assistant write to, so a page that polls
+    // one endpoint sees both ways of working on it.
+    brief: service.briefOf(taskId),
     currentReportId: task.currentReportId,
     currentReportHash: current === undefined ? null : service.contentHashOf(taskId),
     currentReportFrozen: current !== undefined && revisions.some((revision) => revision.reportId === current.id),
@@ -473,17 +477,149 @@ export function createResearchRouter(
     }
 
     // POST /api/research/tasks/:id/confirm — the user's decision, then research.
+    // Confirming is taken on the current draft and nothing else: a draft that is
+    // still incomplete is refused here, before any query is aimed at it.
     const confirmId = taskIdOf(path, "/confirm");
     if (confirmId !== undefined && method === "POST") {
+      const body = asRecord(await readBody(request));
       const task = service.getTask(confirmId);
       if (task === undefined) {
         sendJson(response, 404, { error: "任务不存在" });
         return;
       }
-      service.confirmTask(confirmId);
+      const confirmed = service.confirmTask(confirmId, {
+        ...(typeof body["expectedVersion"] === "number" ? { expectedVersion: body["expectedVersion"] } : {}),
+      });
+      if (!confirmed.ok) {
+        sendJson(response, 409, {
+          error: confirmed.problems.join("；"),
+          guidance: confirmed.guidance,
+          brief: service.briefOf(confirmId),
+        });
+        return;
+      }
       service.startResearch(confirmId);
       runner.startResearch(confirmId);
-      sendJson(response, 202, { ok: true, started: "research" });
+      sendJson(response, 202, { ok: true, started: "research", briefVersion: confirmed.briefVersion, matrixRebuilt: confirmed.matrixRebuilt });
+      return;
+    }
+
+    // ------------------------------------------------------------------ brief --
+    // GET /api/research/tasks/:id/brief — the draft (or the frozen record).
+    const briefId = taskIdOf(path, "/brief");
+    if (briefId !== undefined && method === "GET") {
+      if (service.getTask(briefId) === undefined) {
+        sendJson(response, 404, { error: "任务不存在" });
+        return;
+      }
+      sendJson(response, 200, { brief: service.briefOf(briefId) });
+      return;
+    }
+
+    // PATCH /api/research/tasks/:id/brief {expectedVersion?, patch} — one edit.
+    if (briefId !== undefined && method === "PATCH") {
+      const body = asRecord(await readBody(request));
+      if (service.getTask(briefId) === undefined) {
+        sendJson(response, 404, { error: "任务不存在" });
+        return;
+      }
+      // The patch is either wrapped or sent as the body itself; no brief field
+      // is named "patch", so the two readings can never collide.
+      const patch = body["patch"] !== undefined ? body["patch"] : Object.fromEntries(Object.entries(body).filter(([key]) => key !== "expectedVersion"));
+      const result = service.patchBrief(briefId, {
+        ...(typeof body["expectedVersion"] === "number" ? { expectedVersion: body["expectedVersion"] } : {}),
+        patch,
+      });
+      if (!result.ok) {
+        const stale = "stale" in result && result.stale === true;
+        const conflict = stale || ("conflict" in result && result.conflict === true);
+        sendJson(response, conflict ? 409 : 400, {
+          ok: false,
+          error: result.problems.join("；"),
+          guidance: result.guidance,
+          ...(stale ? { stale: true, brief: (result as { brief: unknown }).brief } : {}),
+        });
+        return;
+      }
+      sendJson(response, 200, { ok: true, brief: result.brief, changedFields: result.changedFields });
+      return;
+    }
+
+    // POST /api/research/tasks/:id/brief/guide/next — the next guided question.
+    // Asking is one bounded stage run: the question appears in the brief, and a
+    // question that is already live is returned rather than paid for again.
+    const guideNextId = taskIdOf(path, "/brief/guide/next");
+    if (guideNextId !== undefined && method === "POST") {
+      const task = service.getTask(guideNextId);
+      if (task === undefined) {
+        sendJson(response, 404, { error: "任务不存在" });
+        return;
+      }
+      const brief = service.briefOf(guideNextId);
+      if (brief.readonly) {
+        sendJson(response, 409, { error: "研究简报已确认，引导式规划结束", brief });
+        return;
+      }
+      if (brief.guide.active !== null) {
+        sendJson(response, 200, { ok: true, complete: false, started: false, question: brief.guide.active });
+        return;
+      }
+      if (brief.guide.complete) {
+        sendJson(response, 200, { ok: true, complete: true, started: false, reason: brief.guide.reason });
+        return;
+      }
+      const started = runner.startGuide(guideNextId);
+      if (started === undefined) {
+        sendJson(response, 200, { ok: true, complete: true, started: false, reason: service.guideTargetOf(guideNextId).reason });
+        return;
+      }
+      sendJson(response, 202, { ok: true, complete: false, started: true, target: started.target, scope: started.scope });
+      return;
+    }
+
+    // POST /api/research/tasks/:id/brief/guide/answer — one decision, applied.
+    const guideAnswerId = taskIdOf(path, "/brief/guide/answer");
+    if (guideAnswerId !== undefined && method === "POST") {
+      const body = asRecord(await readBody(request));
+      const questionId = typeof body["questionId"] === "string" ? body["questionId"].trim() : "";
+      if (questionId.length === 0) {
+        sendJson(response, 400, { error: "缺少 questionId" });
+        return;
+      }
+      if (service.getTask(guideAnswerId) === undefined) {
+        sendJson(response, 404, { error: "任务不存在" });
+        return;
+      }
+      const optionIds = Array.isArray(body["optionIds"])
+        ? (body["optionIds"] as unknown[]).filter((id): id is string => typeof id === "string")
+        : [];
+      const result = service.answerGuideQuestion(guideAnswerId, {
+        questionId,
+        ...(typeof body["expectedVersion"] === "number" ? { expectedVersion: body["expectedVersion"] } : {}),
+        ...(optionIds.length === 0 ? {} : { optionIds }),
+        ...(typeof body["freeText"] === "string" ? { freeText: body["freeText"] } : {}),
+      });
+      if (!result.ok) {
+        const stale = "stale" in result && result.stale === true;
+        const conflict = stale || ("conflict" in result && result.conflict === true);
+        sendJson(response, conflict ? 409 : 400, {
+          ok: false,
+          error: result.problems.join("；"),
+          guidance: result.guidance,
+          ...(stale ? { stale: true, brief: (result as { brief: unknown }).brief } : {}),
+        });
+        return;
+      }
+      // The answer changed the same draft the structured editor writes to, so
+      // the next question — if there is one — is written against the new value.
+      if (!result.complete) runner.startGuide(guideAnswerId);
+      sendJson(response, 200, {
+        ok: true,
+        brief: result.brief,
+        appliedFields: result.appliedFields,
+        complete: result.complete,
+        nextQuestion: result.complete ? "none" : "pending",
+      });
       return;
     }
 

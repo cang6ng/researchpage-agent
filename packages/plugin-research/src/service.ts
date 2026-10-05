@@ -35,7 +35,7 @@ import type {
   AssessmentDirectness,
   AssessmentRelationship,
 } from "./domain.js";
-import { deriveCellCoverage, ID_PREFIX, needsAttention } from "./domain.js";
+import { deriveCellCoverage, ID_PREFIX, needsAttention, suggestedFieldStates } from "./domain.js";
 import { draftEvidence, pickParagraphs, scopeLabel, tokenize, verifyEvidenceText } from "./evidence.js";
 import { hashOf } from "./hash.js";
 import type { FrozenRevision } from "./revision.js";
@@ -56,6 +56,34 @@ import { createGrant, type ActionCapability, type ActionGrant, type GrantInput }
 import { searchArxiv, type SearchOutcome } from "./search.js";
 import { buildMatrix, createTask, normalizeCard, slugId, STRUCTURE_SECTIONS, type ProposedCard } from "./structure.js";
 import { TECHNICAL_COMPARISON_V2, blueprintSections } from "./blueprint.js";
+import {
+  applyBriefPatch,
+  briefBlueprintOf,
+  briefFieldHash,
+  briefFieldStatesOf,
+  briefHashOf,
+  briefStructureView,
+  briefVersionOf,
+  briefWithApplication,
+  EDITABLE_BRIEF_FIELDS,
+  fieldTakesFreeText,
+  GUIDE_DECISION_LIMIT,
+  guideQuestionIsStale,
+  isStructural,
+  lockedFieldStates,
+  nextGuideTarget,
+  patchFromFreeText,
+  readBriefPatch,
+  validateBriefDraft,
+  type BriefFieldName,
+  type BriefFieldStates,
+  type BriefPatch,
+  type BriefValidation,
+  type GuideAnswerRecord,
+  type GuideOption,
+  type GuideQuestion,
+  type GuideTarget,
+} from "./brief.js";
 import {
   buildCitations,
   gapNotesOf,
@@ -102,6 +130,13 @@ export interface Refusal {
   readonly problems: readonly string[];
   /** What the caller can still do, in one sentence. */
   readonly guidance: string;
+  /**
+   * Set when the refusal is about the state the record is in rather than about
+   * the request's shape — a frozen brief, material a rebuild would strand. An
+   * application API answers those with 409, because the same request would be
+   * fine on a different draft.
+   */
+  readonly conflict?: true;
 }
 
 export interface SearchResult {
@@ -218,6 +253,8 @@ export interface WorkspaceState {
   }[];
   readonly usage: ReportTask["usage"];
   readonly budget: ReportTask["budget"];
+  /** The Research Brief: the draft, or the record confirmation froze. */
+  readonly brief: BriefView;
   readonly currentReportId: string | null;
   /** The current report's own content hash, or null when there is no report. */
   readonly currentReportHash: string | null;
@@ -245,11 +282,179 @@ export interface WorkspaceState {
   } | null;
 }
 
+/** One offered answer, as a client sees it: the reasoning, not the patch. */
+export interface GuideOptionView {
+  readonly optionId: string;
+  readonly label: string;
+  readonly description?: string;
+  readonly recommended?: boolean;
+}
+
+/** The question Guided Mode is currently asking, if any. */
+export interface GuideQuestionView {
+  readonly questionId: string;
+  readonly question: string;
+  readonly whyThisMatters: string;
+  readonly fieldTargets: readonly BriefFieldName[];
+  readonly options: readonly GuideOptionView[];
+  readonly allowFreeText: boolean;
+  readonly basedOnBriefVersion: number;
+  readonly createdAt: string;
+}
+
+/** A decision the user already made through Guided Mode. */
+export interface GuideDecisionView {
+  readonly questionId: string;
+  readonly question: string;
+  readonly fieldTargets: readonly BriefFieldName[];
+  readonly optionIds: readonly string[];
+  readonly freeText: string;
+  readonly appliedFields: readonly BriefFieldName[];
+  readonly resultingBriefVersion: number;
+  readonly at: string;
+}
+
+/**
+ * The Brief as the workspace reads it.
+ *
+ * It carries the whole draft — including the derived report structure, which is
+ * shown but never edited, because it is the blueprint's cognitive contract
+ * rather than a heading list — together with what each field's state is and
+ * what the draft still owes before research may start. When the task is already
+ * confirmed the same view is returned with `readonly` set: an old project stays
+ * readable, and nothing about it is re-opened as a draft.
+ */
+export interface BriefView {
+  readonly taskId: string;
+  readonly confirmed: boolean;
+  readonly readonly: boolean;
+  readonly version: number;
+  readonly updatedAt: string | null;
+  readonly blueprint: {
+    readonly id: string;
+    readonly name: string;
+    readonly purpose: string;
+    readonly minimumSubjects: number;
+    readonly minimumDimensions: number;
+    readonly recommendedSubjects: readonly [number, number];
+    readonly recommendedDimensions: readonly [number, number];
+  };
+  readonly topic: string;
+  readonly question: string;
+  readonly purpose: string;
+  readonly audience: string;
+  readonly focus: readonly string[];
+  readonly exclusions: string;
+  readonly lengthTarget: string;
+  readonly subjects: readonly { readonly id: string; readonly name: string; readonly note?: string }[];
+  readonly dimensions: readonly { readonly id: string; readonly name: string; readonly question: string }[];
+  readonly reportStructure: readonly { readonly id: string; readonly title: string; readonly question: string; readonly required: boolean }[];
+  readonly editableFields: readonly BriefFieldName[];
+  readonly fieldStates: BriefFieldStates;
+  readonly validation: BriefValidation;
+  readonly guide: {
+    /** True when Guided Mode has nothing further worth asking. */
+    readonly complete: boolean;
+    /** Why it stopped, in a sentence. */
+    readonly reason: string;
+    readonly decisions: readonly GuideDecisionView[];
+    readonly active: GuideQuestionView | null;
+  };
+  readonly matrix: { readonly subjects: number; readonly dimensions: number; readonly cells: number };
+  readonly contentHash: string;
+}
+
+export interface PatchBriefResult {
+  readonly ok: true;
+  readonly brief: BriefView;
+  readonly changedFields: readonly BriefFieldName[];
+}
+
+export interface ConfirmResult {
+  readonly ok: true;
+  readonly task: ReportTask;
+  readonly briefVersion: number;
+  /** Whether confirming had to reconcile the matrix with the final brief. */
+  readonly matrixRebuilt: boolean;
+}
+
+export interface GuideAnswerInput {
+  readonly questionId: string;
+  readonly expectedVersion?: number;
+  readonly optionIds?: readonly string[];
+  readonly freeText?: string;
+}
+
+export interface GuideAnswerResult {
+  readonly ok: true;
+  readonly brief: BriefView;
+  readonly appliedFields: readonly BriefFieldName[];
+  readonly complete: boolean;
+}
+
+export type ProposeGuideQuestionResult =
+  | { readonly ok: true; readonly complete: true; readonly reason: string; readonly question: null }
+  | { readonly ok: true; readonly complete: false; readonly reason: string; readonly question: GuideQuestion };
+
+/** What Guided Mode would ask about next, before a question has been written. */
+export interface GuideTargetDecision {
+  readonly complete: boolean;
+  readonly reason: string;
+  readonly target: GuideTarget | null;
+  readonly answered: number;
+}
+
+/** A refusal that also hands back the current brief, so a client can resync. */
+export interface BriefConflict {
+  readonly ok: false;
+  readonly stale: true;
+  readonly problems: readonly string[];
+  readonly guidance: string;
+  readonly brief: BriefView;
+}
+
 export interface ResearchService {
   /** The task a session is trusted to: the only way a tool finds its target. */
   taskForSession(sessionId: string): ReportTask | undefined;
   proposeTask(sessionId: string, card: ProposedCard): { readonly ok: true; readonly task: ReportTask; readonly created: boolean } | Refusal;
-  confirmTask(taskId: string): ReportTask;
+  /**
+   * The user's decision to start research, taken on the current draft.
+   *
+   * Confirming is where the draft stops being a draft: the brief is validated
+   * as a whole, its field states are locked, and the matrix is reconciled with
+   * the subjects and dimensions the user finally agreed to. A draft that is
+   * still incomplete is refused here rather than silently researched.
+   */
+  confirmTask(taskId: string, input?: { readonly expectedVersion?: number }): ConfirmResult | Refusal;
+
+  // ------------------------------------------------------------------ brief --
+  /** The Research Brief: the editable draft, or the frozen record once confirmed. */
+  briefOf(taskId: string): BriefView;
+  /**
+   * Applies one structured edit to the draft and returns the resulting brief.
+   *
+   * The patch names the fields it touches; everything else — ids, ordering,
+   * normalization, the matrix — is the server's. A patch that would produce a
+   * structurally unusable matrix is refused outright, while a patch that merely
+   * leaves the draft incomplete is applied and reported as incomplete.
+   */
+  patchBrief(taskId: string, input: { readonly expectedVersion?: number; readonly patch: unknown }): PatchBriefResult | Refusal | BriefConflict;
+  /** The decision Guided Mode would ask about next, or why it has stopped. */
+  guideTargetOf(taskId: string): GuideTargetDecision;
+  activeGuideQuestion(taskId: string): GuideQuestion | undefined;
+  guideQuestionsOf(taskId: string): readonly GuideQuestion[];
+  /**
+   * Stores the question a guide stage wrote, after checking it against the draft.
+   *
+   * The model writes the wording and the offered answers; it does not choose
+   * the target, and every option it offers must carry a patch that the server
+   * can really apply to the field it claims to answer. A question that fails
+   * that check is refused rather than stored and guessed at later.
+   */
+  proposeGuideQuestion(taskId: string, input: unknown): ProposeGuideQuestionResult | Refusal;
+  /** Applies one guided answer to the same draft a structured edit writes to. */
+  answerGuideQuestion(taskId: string, input: GuideAnswerInput): GuideAnswerResult | Refusal | BriefConflict;
+
   startResearch(taskId: string): ReportTask;
   failTask(taskId: string, error: string): void;
   getTask(taskId: string): ReportTask | undefined;
@@ -421,6 +626,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
 
   const CAPABILITY_TEXT: Readonly<Record<ActionCapability, string>> = Object.freeze({
     card: "建立任务卡",
+    brief: "修改研究简报草稿与引导问题",
     research: "检索、读取与保存证据",
     report: "保存报告版本",
     proposal: "生成修改提案",
@@ -652,6 +858,340 @@ export function createResearchService(options: ResearchServiceOptions): Research
     };
   }
 
+  // ------------------------------------------------------------- the brief --
+
+  function requireEditableBrief(task: ReportTask, action: string): Refusal | undefined {
+    if (task.confirmedAt === null) return undefined;
+    return {
+      ok: false,
+      conflict: true,
+      problems: [`研究简报已确认（${task.confirmedAt}），${action}被拒绝`],
+      guidance:
+        "确认后的 Brief 是研究框架的一部分，不再作为草稿存在：需要改变方向请新建研究任务；报告层面的修改属于 Edit 语义。",
+    };
+  }
+
+  /** Whether this task already holds material that a rebuild would strand. */
+  function hasResearchData(task: ReportTask): boolean {
+    return (
+      task.currentReportId !== null ||
+      repo.listEvidence(task.id).length > 0 ||
+      repo.listAssessments(task.id).length > 0 ||
+      repo.listReports(task.id).length > 0 ||
+      repo.listSources(task.id).some((source) => source.readStatus === "ok")
+    );
+  }
+
+  function cellKeyOf(cell: { sectionId: string; subjectId: string; dimensionId: string }): string {
+    return `${cell.sectionId}|${cell.subjectId}|${cell.dimensionId}`;
+  }
+
+  /**
+   * The matrix as the brief's projection.
+   *
+   * Every cell of the new subject×dimension set is present exactly once and in
+   * the brief's order, so a deleted subject takes its row with it instead of
+   * leaving a cell nobody can explain. A cell that still exists *and* carries
+   * work keeps it; a pristine cell is regenerated, which is what lets a rename
+   * reach the wording of its own gap sentence.
+   */
+  function syncMatrix(task: ReportTask, at: string): { readonly matrix: readonly MatrixCell[]; readonly rebuilt: boolean } {
+    const fresh = buildMatrix(task.subjects, task.dimensions, at);
+    const rebuilt =
+      fresh.length !== task.matrix.length ||
+      fresh.some((cell, index) => cellKeyOf(cell) !== cellKeyOf(task.matrix[index] ?? { sectionId: "?", subjectId: "?", dimensionId: "?" }));
+    if (!rebuilt) return { matrix: task.matrix, rebuilt: false };
+    const previous = new Map(task.matrix.map((cell) => [cellKeyOf(cell), cell]));
+    const matrix = fresh.map((cell) => {
+      const before = previous.get(cellKeyOf(cell));
+      if (before === undefined) return cell;
+      if (before.status === "missing" && before.note === "") return cell;
+      return before;
+    });
+    return { matrix, rebuilt: true };
+  }
+
+  function versionConflict(task: ReportTask, expected: number | undefined): BriefConflict | undefined {
+    if (expected === undefined || expected === briefVersionOf(task)) return undefined;
+    return staleConflict(task, `研究简报已更新到版本 ${briefVersionOf(task)}，不是 ${expected}；请按最新草稿重新提交。`);
+  }
+
+  function staleConflict(task: ReportTask, message: string): BriefConflict {
+    return {
+      ok: false,
+      stale: true,
+      problems: [message],
+      guidance: "请重新读取 Brief 与当前引导问题，不要用旧内容覆盖用户刚刚做出的决定。",
+      brief: briefViewOf(task),
+    };
+  }
+
+  type BriefChange = Refusal | { readonly ok: true; readonly task: ReportTask; readonly fields: readonly BriefFieldName[] };
+
+  /**
+   * The one path both ways of editing the brief go through.
+   *
+   * Guided Mode is not a second implementation: an answer becomes a patch, and
+   * that patch is normalized, validated and written exactly as a structured
+   * edit would be. The only difference is the state the touched fields land in
+   * — a person who answered a question decided those fields.
+   */
+  function applyBriefChange(
+    task: ReportTask,
+    patch: BriefPatch,
+    state: "edited" | "confirmed",
+    at: string,
+  ): BriefChange {
+    const applied = applyBriefPatch(task, patch);
+    if (!applied.ok) {
+      return {
+        ok: false,
+        problems: applied.problems.map((entry) => entry.problem),
+        guidance: "请检查对象/维度的 id 是否来自当前 Brief；新增项不要带 id。",
+      };
+    }
+    const structural = isStructural(applied.fields);
+    if (structural && hasResearchData(task)) {
+      return {
+        ok: false,
+        conflict: true,
+        problems: ["该任务已经保存了实际读取的材料或报告，不能再用编辑简报的方式增删对象或维度"],
+        guidance:
+          "不静默删除已保存的研究材料：请恢复原有的对象与维度，或新建一个研究任务重新开始。",
+      };
+    }
+
+    const states: Record<string, BriefFieldStates[keyof BriefFieldStates]> = { ...briefFieldStatesOf(task) };
+    for (const field of applied.fields) states[field] = state;
+
+    let next: ReportTask = {
+      ...briefWithApplication(task, applied.value),
+      briefVersion: briefVersionOf(task) + 1,
+      briefFieldStates: states as BriefFieldStates,
+      briefUpdatedAt: at,
+      updatedAt: at,
+    };
+    if (structural) next = { ...next, matrix: syncMatrix(next, at).matrix };
+    repo.updateTask(next);
+    return { ok: true, task: next, fields: applied.fields };
+  }
+
+  /** Retires any live question whose target the user just changed directly. */
+  function supersedeAffectedQuestions(task: ReportTask, fields: readonly BriefFieldName[]): void {
+    for (const question of repo.listGuideQuestions(task.id)) {
+      if (question.status !== "active") continue;
+      if (question.fieldTargets.some((field) => fields.includes(field))) {
+        repo.saveGuideQuestion({ ...question, status: "superseded" });
+      }
+    }
+  }
+
+  function answeredGuideDecisions(taskId: string): readonly GuideQuestion[] {
+    return repo.listGuideQuestions(taskId).filter((question) => question.status === "answered" && question.answer !== null);
+  }
+
+  /** What Guided Mode would ask about next, and why it stopped when it did. */
+  function guideTargetDecision(task: ReportTask): GuideTargetDecision {
+    if (task.confirmedAt !== null) {
+      return { complete: true, reason: "研究简报已确认，引导式规划结束", target: null, answered: 0 };
+    }
+    const answered = answeredGuideDecisions(task.id).length;
+    const closed = task.guideClosed ?? null;
+    if (closed !== null) {
+      return { complete: true, reason: closed.reason, target: null, answered };
+    }
+    const target = nextGuideTarget({ task, answered });
+    if (target === undefined) {
+      return {
+        complete: true,
+        reason:
+          answered >= GUIDE_DECISION_LIMIT
+            ? `已完成 ${answered} 个引导决策（上限 ${GUIDE_DECISION_LIMIT}）；其余字段可以随时直接编辑`
+            : "所有可引导的字段都已经由用户决定",
+        target: null,
+        answered,
+      };
+    }
+    return { complete: false, reason: "", target, answered };
+  }
+
+  function optionViewOf(option: GuideOption): GuideOptionView {
+    return {
+      optionId: option.optionId,
+      label: option.label,
+      ...(option.description === undefined ? {} : { description: option.description }),
+      ...(option.recommended === undefined ? {} : { recommended: option.recommended }),
+    };
+  }
+
+  /** The Brief as the workspace reads it, derived fresh from the task. */
+  function briefViewOf(task: ReportTask): BriefView {
+    const blueprint = briefBlueprintOf(task);
+    const decision = guideTargetDecision(task);
+    const active = repo.listGuideQuestions(task.id).find((question) => question.status === "active");
+    return {
+      taskId: task.id,
+      confirmed: task.confirmedAt !== null,
+      readonly: task.confirmedAt !== null,
+      version: briefVersionOf(task),
+      updatedAt: task.briefUpdatedAt ?? null,
+      blueprint: {
+        id: blueprint.id,
+        name: blueprint.name,
+        purpose: blueprint.purpose,
+        minimumSubjects: blueprint.briefMinimums.subjects,
+        minimumDimensions: blueprint.briefMinimums.dimensions,
+        recommendedSubjects: blueprint.briefRecommended.subjects,
+        recommendedDimensions: blueprint.briefRecommended.dimensions,
+      },
+      topic: task.topic,
+      question: task.purpose,
+      purpose: task.purpose,
+      audience: task.audience,
+      focus: task.focus,
+      exclusions: task.exclusions,
+      lengthTarget: task.lengthTarget,
+      subjects: task.subjects.map((subject) => ({
+        id: subject.id,
+        name: subject.name,
+        ...(subject.note === undefined ? {} : { note: subject.note }),
+      })),
+      dimensions: task.dimensions.map((dimension) => ({ id: dimension.id, name: dimension.name, question: dimension.question })),
+      reportStructure: briefStructureView(task),
+      editableFields: EDITABLE_BRIEF_FIELDS,
+      fieldStates: briefFieldStatesOf(task),
+      validation: validateBriefDraft(task),
+      guide: {
+        complete: decision.complete,
+        reason: decision.reason,
+        decisions: answeredGuideDecisions(task.id).map((question) => ({
+          questionId: question.id,
+          question: question.question,
+          fieldTargets: question.fieldTargets,
+          optionIds: question.answer?.optionIds ?? [],
+          freeText: question.answer?.freeText ?? "",
+          appliedFields: question.answer?.appliedFields ?? [],
+          resultingBriefVersion: question.answer?.resultingBriefVersion ?? question.basedOnBriefVersion,
+          at: question.answer?.at ?? question.createdAt,
+        })),
+        active:
+          active === undefined
+            ? null
+            : {
+                questionId: active.id,
+                question: active.question,
+                whyThisMatters: active.whyThisMatters,
+                fieldTargets: active.fieldTargets,
+                options: active.options.map(optionViewOf),
+                allowFreeText: active.allowFreeText,
+                basedOnBriefVersion: active.basedOnBriefVersion,
+                createdAt: active.createdAt,
+              },
+      },
+      matrix: { subjects: task.subjects.length, dimensions: task.dimensions.length, cells: task.matrix.length },
+      contentHash: briefHashOf(task),
+    };
+  }
+
+  type GuideReading =
+    | { readonly ok: true; readonly complete: true; readonly reason: string }
+    | {
+        readonly ok: true;
+        readonly complete: false;
+        readonly question: string;
+        readonly whyThisMatters: string;
+        readonly fieldTargets: readonly BriefFieldName[];
+        readonly options: readonly GuideOption[];
+      }
+    | { readonly ok: false; readonly problems: readonly string[] };
+
+  /**
+   * Reads the question a guide stage wrote, and checks it against the draft.
+   *
+   * The checks are the point. The targets must be exactly the field the program
+   * chose, so a model cannot drift the conversation onto something else; every
+   * option must carry a patch that only touches those targets and that the
+   * normalizer really accepts against this draft, so a stored option is an
+   * answer the server can apply without asking anyone what it meant.
+   */
+  function readGuideQuestionInput(value: unknown, target: GuideTarget, task: ReportTask): GuideReading {
+    const record = typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+    if (record === undefined) return { ok: false, problems: ["参数必须是一个对象"] };
+
+    const complete = record["complete"] === true;
+    const reason = typeof record["reason"] === "string" ? record["reason"].trim() : "";
+    if (complete) {
+      if (reason.length === 0) return { ok: false, problems: ["complete=true 时必须给出 reason，说明为什么没有更值得确认的字段"] };
+      return { ok: true, complete: true, reason };
+    }
+
+    const problems: string[] = [];
+    const question = typeof record["question"] === "string" ? record["question"].trim() : "";
+    if (question.length === 0) problems.push("缺少 question");
+    if (question.length > 400) problems.push("question 过长（>400 字）");
+    const whyThisMatters = typeof record["whyThisMatters"] === "string" ? record["whyThisMatters"].trim() : "";
+    if (whyThisMatters.length === 0) problems.push("缺少 whyThisMatters（一句话说明它为什么值得确认）");
+
+    const targets = Array.isArray(record["fieldTargets"])
+      ? record["fieldTargets"].filter((entry): entry is string => typeof entry === "string")
+      : [];
+    const fieldTargets = targets.filter((entry): entry is BriefFieldName => (EDITABLE_BRIEF_FIELDS as readonly string[]).includes(entry));
+    if (fieldTargets.length !== 1 || fieldTargets[0] !== target.field) {
+      problems.push(
+        `fieldTargets 必须正好是本次要确认的字段 ${target.field}（收到：${targets.join("、") || "（空）"}）`,
+      );
+    }
+
+    const rawOptions = Array.isArray(record["options"]) ? record["options"] : [];
+    if (rawOptions.length < 2 || rawOptions.length > 5) {
+      problems.push(`options 需要 2–5 个（收到 ${rawOptions.length} 个）`);
+    }
+
+    const options: GuideOption[] = [];
+    rawOptions.forEach((item, index) => {
+      const entry = typeof item === "object" && item !== null && !Array.isArray(item) ? (item as Record<string, unknown>) : undefined;
+      if (entry === undefined) {
+        problems.push(`options[${index}] 必须是对象`);
+        return;
+      }
+      const label = typeof entry["label"] === "string" ? entry["label"].trim() : "";
+      if (label.length === 0) {
+        problems.push(`options[${index}].label 不能为空`);
+        return;
+      }
+      const value2 = entry["value"];
+      if (typeof value2 !== "object" || value2 === null || Array.isArray(value2)) {
+        problems.push(`options[${index}].value 必须是该字段的取值 patch（例如 {"${target.field}": ...}）`);
+        return;
+      }
+      const keys = Object.keys(value2 as Record<string, unknown>);
+      const outside = keys.filter((key) => key !== target.field);
+      if (outside.length > 0) {
+        problems.push(`options[${index}].value 只能包含字段 ${target.field}，却包含：${outside.join("、")}`);
+        return;
+      }
+      // The option has to be an answer this product can really install against
+      // *this* draft: it is normalized here, once, so answering never becomes a
+      // second guess at what the label meant.
+      const applies = applyBriefPatch(task, value2 as BriefPatch);
+      if (!applies.ok) {
+        problems.push(`options[${index}].value 不是有效取值：${applies.problems.map((entry2) => entry2.problem).join("；")}`);
+        return;
+      }
+      const description = typeof entry["description"] === "string" ? entry["description"].trim() : "";
+      options.push({
+        optionId: `opt_${index + 1}`,
+        label,
+        ...(description.length === 0 ? {} : { description }),
+        ...(entry["recommended"] === true ? { recommended: true } : {}),
+        value: value2 as BriefPatch,
+      });
+    });
+
+    if (problems.length > 0) return { ok: false, problems };
+    return { ok: true, complete: false, question, whyThisMatters, fieldTargets, options };
+  }
+
   return {
     taskForSession: (sessionId) => repo.taskForSession(sessionId),
 
@@ -673,13 +1213,28 @@ export function createResearchService(options: ResearchServiceOptions): Research
         if (existing.confirmedAt !== null) {
           return { ok: true, created: false, task: existing };
         }
+        const at = isoNow();
         const next: ReportTask = {
           ...existing,
           ...normalized.value,
           structure: { sections: blueprintSections(TECHNICAL_COMPARISON_V2) },
-          matrix: buildMatrix(normalized.value.subjects, normalized.value.dimensions, isoNow()),
-          updatedAt: isoNow(),
+          matrix: buildMatrix(normalized.value.subjects, normalized.value.dimensions, at),
+          // A re-proposal is a fresh suggestion: the fields it overwrote are the
+          // agent's again, not the user's, and saying otherwise would claim a
+          // decision about text the user never saw.
+          briefVersion: briefVersionOf(existing) + 1,
+          briefFieldStates: suggestedFieldStates(),
+          briefUpdatedAt: at,
+          guideClosed: null,
+          updatedAt: at,
         };
+        // A proposal that proposes what the card already says changes nothing.
+        // That is not politeness: a model may call propose_task more than once
+        // in a stage, and a version bump for each call would invalidate the
+        // brief version the workspace is holding for no reason at all.
+        if (briefHashOf(next) === briefHashOf(existing) && next.matrix.length === existing.matrix.length) {
+          return { ok: true, created: false, task: existing };
+        }
         repo.updateTask(next);
         return { ok: true, created: false, task: next };
       }
@@ -689,10 +1244,236 @@ export function createResearchService(options: ResearchServiceOptions): Research
       return { ok: true, created: true, task };
     },
 
-    confirmTask(taskId) {
+    confirmTask(taskId, input) {
       const task = requireTask(taskId);
-      if (task.confirmedAt !== null) return task;
-      return updateTask(task, { confirmedAt: isoNow(), status: "confirmed" });
+      if (task.confirmedAt !== null) {
+        return { ok: true, task, briefVersion: briefVersionOf(task), matrixRebuilt: false };
+      }
+      const expected = input?.expectedVersion;
+      if (expected !== undefined && expected !== briefVersionOf(task)) {
+        return {
+          ok: false,
+          problems: [`研究简报已更新到版本 ${briefVersionOf(task)}，不是 ${expected}`],
+          guidance: "请重新读取 Brief 后确认，避免确认一份你没有看过的草稿。",
+        };
+      }
+
+      // The draft has to be whole before research starts on it: a missing
+      // question or an audience-less brief would be discovered only once the
+      // queries were already wrong.
+      const validation = validateBriefDraft(task);
+      if (!validation.valid) {
+        return {
+          ok: false,
+          problems: validation.problems,
+          guidance: "研究简报还不完整：请补齐上面这些问题（可直接编辑字段，或让引导助手逐项确认）后再确认。",
+        };
+      }
+
+      // The matrix is the brief's projection, so it is reconciled here against
+      // the subjects and dimensions the user finally agreed to. What survives
+      // is a cell that still exists: a removed subject or dimension takes its
+      // row or column with it, and no stale cell is left behind.
+      const at = isoNow();
+      const synced = syncMatrix(task, at);
+      if (synced.rebuilt && hasResearchData(task)) {
+        return {
+          ok: false,
+          conflict: true,
+          problems: ["该任务在确认前已经有实际读取的材料或报告，而简报的对象/维度与矩阵不再一致"],
+          guidance:
+            "不静默删除已保存的研究材料：请恢复原有的对象与维度，或新建一个研究任务重新开始。",
+        };
+      }
+
+      const next = updateTask(task, {
+        status: "confirmed",
+        confirmedAt: at,
+        matrix: synced.matrix,
+        briefFieldStates: lockedFieldStates(),
+        briefVersion: briefVersionOf(task) + 1,
+        briefUpdatedAt: at,
+      });
+      return { ok: true, task: next, briefVersion: briefVersionOf(next), matrixRebuilt: synced.rebuilt };
+    },
+
+    // ------------------------------------------------------------- the brief --
+
+    briefOf: (taskId) => briefViewOf(requireTask(taskId)),
+
+    patchBrief(taskId, input) {
+      const task = requireTask(taskId);
+      const frozen = requireEditableBrief(task, "修改研究简报");
+      if (frozen !== undefined) return frozen;
+
+      const reading = readBriefPatch(input.patch);
+      if (!reading.ok) {
+        return {
+          ok: false,
+          problems: reading.problems.map((entry) => entry.problem),
+          guidance: `Brief 只允许修改：${EDITABLE_BRIEF_FIELDS.join(" / ")}。新增比较对象或维度时不要带 id，由服务端生成；修改已有的对象请带上它的 id。`,
+        };
+      }
+
+      const conflict = versionConflict(task, input.expectedVersion);
+      if (conflict !== undefined) return conflict;
+
+      const changed = applyBriefChange(task, reading.patch, "edited", isoNow());
+      if (!changed.ok) return changed;
+      // A question about a field that just changed is already out of date: it
+      // was written against a value that no longer exists.
+      supersedeAffectedQuestions(changed.task, changed.fields);
+      return { ok: true, brief: briefViewOf(requireTask(taskId)), changedFields: changed.fields };
+    },
+
+    guideTargetOf: (taskId) => guideTargetDecision(requireTask(taskId)),
+    activeGuideQuestion: (taskId) =>
+      repo.listGuideQuestions(taskId).find((question) => question.status === "active"),
+    guideQuestionsOf: (taskId) => repo.listGuideQuestions(taskId),
+
+    proposeGuideQuestion(taskId, input) {
+      const task = requireTask(taskId);
+      const authRefusal = requireTaskCapability(taskId, "brief");
+      if (authRefusal !== undefined) return authRefusal;
+      const frozen = requireEditableBrief(task, "写入引导问题");
+      if (frozen !== undefined) return frozen;
+
+      const decision = guideTargetDecision(task);
+      if (decision.complete || decision.target === null) {
+        return { ok: true, complete: true, reason: decision.reason, question: null };
+      }
+
+      const reading = readGuideQuestionInput(input, decision.target, task);
+      if (!reading.ok) {
+        return {
+          ok: false,
+          problems: reading.problems,
+          guidance: `本次只处理字段 ${decision.target.field}（${decision.target.ask}）：question 必须围绕它，fieldTargets 必须正好是它，options 的 value 只能包含这个字段。`,
+        };
+      }
+      if (reading.complete) {
+        const at = isoNow();
+        updateTask(task, { guideClosed: { at, reason: reading.reason }, briefUpdatedAt: at });
+        return { ok: true, complete: true, reason: reading.reason, question: null };
+      }
+
+      // One question at a time: writing a new one retires the one it replaces,
+      // so a client can never answer a question the current draft has moved past.
+      for (const question of repo.listGuideQuestions(task.id)) {
+        if (question.status === "active") repo.saveGuideQuestion({ ...question, status: "superseded" });
+      }
+
+      const at = isoNow();
+      const basedOnFields: Record<string, string> = {};
+      for (const field of reading.fieldTargets) basedOnFields[field] = briefFieldHash(task, field);
+      const record: GuideQuestion = {
+        id: newId(ID_PREFIX.guide),
+        taskId: task.id,
+        question: reading.question,
+        whyThisMatters: reading.whyThisMatters,
+        fieldTargets: reading.fieldTargets,
+        options: reading.options,
+        allowFreeText: true,
+        basedOnBriefVersion: briefVersionOf(task),
+        basedOnFields,
+        status: "active",
+        createdAt: at,
+        answer: null,
+      };
+      repo.saveGuideQuestion(record);
+      return { ok: true, complete: false, reason: "", question: record };
+    },
+
+    answerGuideQuestion(taskId, input) {
+      const task = requireTask(taskId);
+      const frozen = requireEditableBrief(task, "回答引导问题");
+      if (frozen !== undefined) return frozen;
+
+      const question = repo.getGuideQuestion(input.questionId);
+      if (question === undefined || question.taskId !== task.id) {
+        return {
+          ok: false,
+          problems: [`没有找到该引导问题：${input.questionId}`],
+          guidance: "请重新获取当前问题后再回答。",
+        };
+      }
+      if (question.status === "answered") {
+        return {
+          ok: false,
+          problems: ["该引导问题已经回答过（旧答案不会再次应用）"],
+          guidance: "请获取下一个问题。",
+        };
+      }
+      if (question.status !== "active") {
+        return staleConflict(task, "该引导问题已经失效，请获取新的问题。");
+      }
+
+      const expected = input.expectedVersion;
+      if (expected !== undefined && expected !== briefVersionOf(task)) {
+        // The client is holding an older draft than the one on record. That is
+        // not the same as the question being obsolete: the edit that moved the
+        // version may not have touched this question's own field, so the
+        // question stays answerable once the client re-reads the brief.
+        return staleConflict(task, `研究简报已更新到版本 ${briefVersionOf(task)}，不是 ${expected}；请按最新草稿重新提交答案。`);
+      }
+      if (guideQuestionIsStale(question, task)) {
+        repo.saveGuideQuestion({ ...question, status: "superseded" });
+        return staleConflict(task, "研究任务已更新，请获取新的问题。");
+      }
+
+      const optionIds = input.optionIds ?? [];
+      const freeText = (input.freeText ?? "").trim();
+      if (optionIds.length === 0 && freeText.length === 0) {
+        return {
+          ok: false,
+          problems: ["需要选择一个选项，或给出自己的回答"],
+          guidance: "回答至少要包含 optionIds 或 freeText 之一。",
+        };
+      }
+
+      // The patch comes from what the option *means*, never from a second guess
+      // at what the label meant: an option's value was validated when the
+      // question was written, and free text is turned into a patch by this
+      // field's own declared rule.
+      let patch: BriefPatch = {};
+      const chosen: string[] = [];
+      for (const optionId of optionIds) {
+        const option = question.options.find((candidate) => candidate.optionId === optionId);
+        if (option === undefined) {
+          return {
+            ok: false,
+            problems: [`该问题没有这个选项：${optionId}`],
+            guidance: "请使用当前问题返回的 optionId。",
+          };
+        }
+        patch = { ...patch, ...option.value };
+        chosen.push(optionId);
+      }
+      if (freeText.length > 0) {
+        const field = question.fieldTargets[0];
+        if (field === undefined || !fieldTakesFreeText(field)) {
+          return {
+            ok: false,
+            problems: [`该问题不接受自由文本回答（字段 ${field ?? "未知"}）`],
+            guidance: "请从给出的选项中选择。",
+          };
+        }
+        patch = { ...patch, ...patchFromFreeText(task, field, freeText) };
+      }
+
+      const changed = applyBriefChange(task, patch, "confirmed", isoNow());
+      if (!changed.ok) return changed;
+
+      const answer: GuideAnswerRecord = {
+        optionIds: chosen,
+        freeText,
+        appliedFields: changed.fields,
+        resultingBriefVersion: briefVersionOf(changed.task),
+        at: isoNow(),
+      };
+      repo.saveGuideQuestion({ ...question, status: "answered", answer });
+      const brief = briefViewOf(requireTask(taskId));
+      return { ok: true, brief, appliedFields: changed.fields, complete: brief.guide.complete };
     },
 
     startResearch(taskId) {
@@ -1222,6 +2003,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         })),
         usage: task.usage,
         budget: task.budget,
+        brief: briefViewOf(task),
         currentReportId: task.currentReportId,
         currentReportHash: report === undefined ? null : reportContentHash(report),
         reportNeedsReview: task.reportNeedsReview ?? null,

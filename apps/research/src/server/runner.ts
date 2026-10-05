@@ -21,6 +21,8 @@ import type { LiveItem } from "@every-dagent/protocol";
 import type {
   ActionGrant,
   AssistantIntent,
+  BriefFieldName,
+  GuideTarget,
   MatrixCell,
   ReportTask,
   ResearchRunRecord,
@@ -68,6 +70,15 @@ export interface ResearchRunner {
    * it against yet, and the workspace learns about it from the session route.
    */
   startCard(sessionId: string, topicInput: string): void;
+  /**
+   * Writes the next guided question about the brief.
+   *
+   * The program has already decided which field is worth deciding next; this
+   * runs one stage whose only job is to word that question and offer answers
+   * the server can really apply. Returns nothing when Guided Mode has nothing
+   * further to ask — asking is over, and that is a normal outcome.
+   */
+  startGuide(taskId: string): { readonly target: BriefFieldName; readonly scope: string } | undefined;
   /** The main pass: search, read, assess. */
   startResearch(taskId: string): void;
   /** One targeted round at the current gaps. */
@@ -125,7 +136,7 @@ interface StageRequest {
   readonly instruction: string;
   /** What the application authorized for this run; issued right before it starts. */
   readonly grant: {
-    readonly intent: "ask" | "research" | "edit" | "draft" | "card";
+    readonly intent: "ask" | "research" | "edit" | "draft" | "card" | "guide";
     readonly allowResearch: boolean;
     readonly targetType: "none" | "project" | "section" | "report";
     readonly targetId: string | null;
@@ -139,6 +150,7 @@ interface StageRequest {
 
 const STAGE_LABELS: Readonly<Record<ResearchStage, string>> = Object.freeze({
   card: "建立任务卡",
+  guide: "构建引导问题",
   research: "检索与读取",
   gap: "定向补查",
   report: "撰写章节",
@@ -208,6 +220,11 @@ export function stageInstruction(input: {
   readonly topicInput: string;
 }): string;
 export function stageInstruction(input: {
+  readonly stage: "guide";
+  readonly task: ReportTask;
+  readonly guideTarget: GuideTarget;
+}): string;
+export function stageInstruction(input: {
   readonly stage: "research" | "gap" | "report";
   readonly task: ReportTask;
 }): string;
@@ -235,7 +252,32 @@ export function stageInstruction(input: {
   readonly instruction?: string;
   readonly targetSectionId?: string;
   readonly reportBrief?: string;
+  readonly guideTarget?: GuideTarget;
 }): string {
+  if (input.stage === "guide") {
+    const guideTarget = input.guideTarget;
+    const task = input.task;
+    if (guideTarget === undefined || task === undefined) throw new Error("the guide stage needs a target");
+    return [
+      "用户正在用引导模式（Guided Planning）完善研究简报草稿。本次只处理一个决策，不要涉及其他字段，也不要重新讨论已经决定的字段。",
+      `本次要确认的字段：${guideTarget.field}`,
+      `这个字段是什么：${guideTarget.ask}`,
+      `为什么值得确认：${guideTarget.whyItMatters}`,
+      `当前默认值：${guideTarget.currentValue.length === 0 ? "（空）" : guideTarget.currentValue}`,
+      `研究主题：${task.topic}`,
+      `读者（默认）：${task.audience || "（未填写）"}`,
+      "请调用 propose_guide_question 一次：",
+      "- question：一个具体的、只问这一件事的问题；不要「你想改什么」这类空泛问题；",
+      "- whyThisMatters：一句话说明它如何影响检索、比较框架或报告深度；",
+      `- fieldTargets：["${guideTarget.field}"]（必须正好是这一个字段）；`,
+      "- options：2–5 个具体候选项，每项 { label, description?, recommended?, value }；value 是只包含该字段的最小取值 patch，必须是能真正写进简报的取值，不要写占位符；",
+      `  · 如果这个字段是列表（subjects/dimensions/focus），value 要给出完整的列表，而不是增量的一句描述；`,
+      "  · 候选项之间要有真实差别（对应不同的检索与报告取舍），不要给同义改写；",
+      '- 如果当前默认值已经足够具体、不值得占用用户的一次决定，改为返回 { complete: true, reason: "..." } 并说明理由。',
+      "调用一次即结束：不要输出 Markdown，不要调用其他工具，不要追问用户原话。",
+    ].join("\n");
+  }
+
   if (input.stage === "card") {
     return [
       "请为用户的研究主题建立研究任务卡。",
@@ -643,13 +685,22 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
   }
 
   /** What each program-driven stage is allowed to do while it runs. */
-  const STAGE_GRANTS: Readonly<Record<"card" | "research" | "gap" | "report" | "synthesis", StageRequest["grant"]>> = Object.freeze({
+  const STAGE_GRANTS: Readonly<
+    Record<"card" | "guide" | "research" | "gap" | "report" | "synthesis", StageRequest["grant"]>
+  > = Object.freeze({
     card: {
       intent: "card",
       allowResearch: false,
       targetType: "project",
       targetId: null,
       scope: "建立研究任务卡（不检索）",
+    },
+    guide: {
+      intent: "guide",
+      allowResearch: false,
+      targetType: "project",
+      targetId: null,
+      scope: "针对研究简报生成一个引导问题；不检索、不改报告",
     },
     research: {
       intent: "research",
@@ -723,6 +774,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
 
     switch (request.stage) {
       case "card":
+      case "guide":
       case "ask":
       case "edit":
       case "followup":
@@ -860,6 +912,20 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         instruction: stageInstruction({ stage: "card", topicInput }),
         grant: STAGE_GRANTS.card,
       });
+    },
+    startGuide(taskId) {
+      const task = service.getTask(taskId);
+      if (task === undefined) return undefined;
+      const decision = service.guideTargetOf(taskId);
+      if (decision.complete || decision.target === null) return undefined;
+      enqueue({
+        taskId,
+        sessionId: task.sessionId,
+        stage: "guide",
+        instruction: stageInstruction({ stage: "guide", task, guideTarget: decision.target }),
+        grant: STAGE_GRANTS.guide,
+      });
+      return { target: decision.target.field, scope: STAGE_GRANTS.guide.scope };
     },
     startResearch(taskId) {
       const task = service.getTask(taskId);

@@ -71,12 +71,121 @@ export interface RunStepView {
 
 export interface RunView {
   readonly runId: string | null;
-  readonly stage: "card" | "research" | "gap" | "report" | "synthesis" | "ask" | "edit" | "followup";
+  readonly stage: "card" | "guide" | "research" | "gap" | "report" | "synthesis" | "ask" | "edit" | "followup";
   readonly status: "running" | "completed" | "failed" | "interrupted";
   readonly note: string;
   readonly startedAt: string;
   readonly endedAt: string | null;
   readonly activity: readonly RunStepView[];
+}
+
+export type BriefFieldName =
+  | "topic"
+  | "purpose"
+  | "audience"
+  | "subjects"
+  | "dimensions"
+  | "focus"
+  | "exclusions"
+  | "lengthTarget";
+
+/** `suggested` is the agent's default; the other two mean a person decided. */
+export type BriefFieldState = "suggested" | "edited" | "confirmed";
+
+export type BriefFieldStates = Readonly<Record<BriefFieldName, BriefFieldState>>;
+
+/** The value a structured edit sets on one or more fields. */
+export interface BriefPatch {
+  readonly topic?: string;
+  readonly purpose?: string;
+  readonly audience?: string;
+  readonly focus?: readonly string[];
+  readonly exclusions?: string;
+  readonly lengthTarget?: string;
+  /** Existing rows carry their `id`; a new row omits it and the server mints one. */
+  readonly subjects?: readonly { readonly id?: string; readonly name: string; readonly note?: string }[];
+  readonly dimensions?: readonly { readonly id?: string; readonly name: string; readonly question: string }[];
+}
+
+export interface GuideOptionView {
+  readonly optionId: string;
+  readonly label: string;
+  readonly description?: string;
+  readonly recommended?: boolean;
+}
+
+export interface GuideQuestionView {
+  readonly questionId: string;
+  readonly question: string;
+  readonly whyThisMatters: string;
+  readonly fieldTargets: readonly BriefFieldName[];
+  readonly options: readonly GuideOptionView[];
+  readonly allowFreeText: boolean;
+  readonly basedOnBriefVersion: number;
+  readonly createdAt: string;
+}
+
+/** A decision already made through Guided Mode, for the page's own record. */
+export interface GuideDecisionView {
+  readonly questionId: string;
+  readonly question: string;
+  readonly fieldTargets: readonly BriefFieldName[];
+  readonly optionIds: readonly string[];
+  readonly freeText: string;
+  readonly appliedFields: readonly BriefFieldName[];
+  readonly resultingBriefVersion: number;
+  readonly at: string;
+}
+
+/**
+ * The Research Brief as the page reads it.
+ *
+ * It is the same draft the structured editor and the guided answers write to —
+ * there is deliberately no second draft model — so this view is what tells the
+ * page both what the fields are and which of them a person has already decided.
+ * When `readonly` is set the project is confirmed and the brief is frozen.
+ */
+export interface BriefView {
+  readonly taskId: string;
+  readonly confirmed: boolean;
+  readonly readonly: boolean;
+  readonly version: number;
+  readonly updatedAt: string | null;
+  readonly blueprint: {
+    readonly id: string;
+    readonly name: string;
+    readonly purpose: string;
+    readonly minimumSubjects: number;
+    readonly minimumDimensions: number;
+    readonly recommendedSubjects: readonly [number, number];
+    readonly recommendedDimensions: readonly [number, number];
+  };
+  readonly topic: string;
+  readonly question: string;
+  readonly purpose: string;
+  readonly audience: string;
+  readonly focus: readonly string[];
+  readonly exclusions: string;
+  readonly lengthTarget: string;
+  readonly subjects: readonly { readonly id: string; readonly name: string; readonly note?: string }[];
+  readonly dimensions: readonly { readonly id: string; readonly name: string; readonly question: string }[];
+  readonly reportStructure: readonly {
+    readonly id: string;
+    readonly title: string;
+    readonly question: string;
+    readonly required: boolean;
+  }[];
+  readonly editableFields: readonly BriefFieldName[];
+  readonly fieldStates: BriefFieldStates;
+  readonly validation: { readonly valid: boolean; readonly problems: readonly string[] };
+  readonly guide: {
+    readonly complete: boolean;
+    readonly reason: string;
+    readonly decisions: readonly GuideDecisionView[];
+    readonly active: GuideQuestionView | null;
+  };
+  readonly matrix: { readonly subjects: number; readonly dimensions: number; readonly cells: number };
+  readonly contentHash: string;
 }
 
 export interface AssessmentView {
@@ -230,6 +339,8 @@ export interface TaskBundle {
     readonly deadlineMs: number;
   };
   readonly usage: { readonly searches: number; readonly reads: number; readonly gapRounds: number; readonly startedAt?: string };
+  /** The Research Brief: the editable draft, or the frozen record once confirmed. */
+  readonly brief: BriefView;
   readonly currentReportId: string | null;
   /** The current report's own content hash; null when there is no report. */
   readonly currentReportHash: string | null;
@@ -403,8 +514,46 @@ export const api = {
     request(`/api/research/reports/${encodeURIComponent(reportId)}/document`),
   revisionDocument: (revisionId: string): Promise<DocumentView> =>
     request(`/api/research/revisions/${encodeURIComponent(revisionId)}/document`),
-  confirm: (taskId: string): Promise<unknown> =>
-    request(`/api/research/tasks/${encodeURIComponent(taskId)}/confirm`, { method: "POST", body: "{}" }),
+  confirm: (taskId: string, body: { readonly expectedVersion?: number } = {}): Promise<unknown> =>
+    request(`/api/research/tasks/${encodeURIComponent(taskId)}/confirm`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  brief: (taskId: string): Promise<{ readonly brief: BriefView }> =>
+    request(`/api/research/tasks/${encodeURIComponent(taskId)}/brief`),
+  patchBrief: (
+    taskId: string,
+    body: { readonly expectedVersion?: number; readonly patch: BriefPatch },
+  ): Promise<{ readonly ok: boolean; readonly brief: BriefView; readonly changedFields: readonly BriefFieldName[] }> =>
+    request(`/api/research/tasks/${encodeURIComponent(taskId)}/brief`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  guideNext: (
+    taskId: string,
+  ): Promise<{
+    readonly ok: boolean;
+    readonly complete: boolean;
+    readonly started: boolean;
+    readonly reason?: string;
+    readonly target?: BriefFieldName;
+    readonly question?: GuideQuestionView;
+  }> =>
+    request(`/api/research/tasks/${encodeURIComponent(taskId)}/brief/guide/next`, { method: "POST", body: "{}" }),
+  guideAnswer: (
+    taskId: string,
+    body: { readonly questionId: string; readonly expectedVersion?: number; readonly optionIds?: readonly string[]; readonly freeText?: string },
+  ): Promise<{
+    readonly ok: boolean;
+    readonly brief: BriefView;
+    readonly appliedFields: readonly BriefFieldName[];
+    readonly complete: boolean;
+    readonly nextQuestion: "pending" | "none";
+  }> =>
+    request(`/api/research/tasks/${encodeURIComponent(taskId)}/brief/guide/answer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   gap: (taskId: string): Promise<unknown> =>
     request(`/api/research/tasks/${encodeURIComponent(taskId)}/gap`, { method: "POST", body: "{}" }),
   report: (taskId: string): Promise<unknown> =>
@@ -486,6 +635,7 @@ export const STATUS_LABELS: Readonly<Record<string, string>> = Object.freeze({
 
 export const STAGE_LABELS: Readonly<Record<string, string>> = Object.freeze({
   card: "任务卡",
+  guide: "引导问题",
   research: "检索与读取",
   gap: "定向补查",
   report: "撰写章节",
@@ -493,6 +643,24 @@ export const STAGE_LABELS: Readonly<Record<string, string>> = Object.freeze({
   ask: "提问",
   edit: "修改提案",
   followup: "追加指令（旧记录）",
+});
+
+/** What each brief field's state means, in the words the workspace shows. */
+export const BRIEF_FIELD_LABELS: Readonly<Record<BriefFieldName, string>> = Object.freeze({
+  topic: "主题",
+  purpose: "研究问题 / 用途",
+  audience: "读者",
+  subjects: "比较对象",
+  dimensions: "研究维度",
+  focus: "关注点",
+  exclusions: "不研究的内容",
+  lengthTarget: "篇幅目标",
+});
+
+export const BRIEF_STATE_LABELS: Readonly<Record<BriefFieldState, string>> = Object.freeze({
+  suggested: "助手建议",
+  edited: "已修改",
+  confirmed: "已确认",
 });
 
 export const CLAIM_TYPE_LABELS: Readonly<Record<string, string>> = Object.freeze({

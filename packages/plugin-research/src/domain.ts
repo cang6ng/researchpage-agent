@@ -86,6 +86,62 @@ export interface ResearchSection {
   readonly question: string;
 }
 
+/**
+ * The brief fields a person may change before the card is confirmed.
+ *
+ * They are named here, next to the task they live on, because the set is part
+ * of the record: a field state is stored per field, and a client that patches a
+ * field not in this list is refused by name rather than silently ignored.
+ */
+export type BriefFieldName =
+  | "topic"
+  | "purpose"
+  | "audience"
+  | "subjects"
+  | "dimensions"
+  | "focus"
+  | "exclusions"
+  | "lengthTarget";
+
+/**
+ * How far a brief field has got.
+ *
+ * `suggested` is the agent's default, untouched. `edited` means a person
+ * rewrote it. `confirmed` means a person decided it — by choosing an offered
+ * option, or by confirming the card, which decides every field at once.
+ */
+export type BriefFieldState = "suggested" | "edited" | "confirmed";
+
+export type BriefFieldStates = Readonly<Record<BriefFieldName, BriefFieldState>>;
+
+/** The fields a patch may touch, in the order the workspace shows them. */
+export const BRIEF_FIELDS: readonly BriefFieldName[] = Object.freeze([
+  "topic",
+  "purpose",
+  "audience",
+  "subjects",
+  "dimensions",
+  "focus",
+  "exclusions",
+  "lengthTarget",
+] as const);
+
+function allFieldStates(state: BriefFieldState): BriefFieldStates {
+  const states: Record<string, BriefFieldState> = {};
+  for (const field of BRIEF_FIELDS) states[field] = state;
+  return states as BriefFieldStates;
+}
+
+/** A card straight from the agent: every field is its suggestion, none decided. */
+export function suggestedFieldStates(): BriefFieldStates {
+  return allFieldStates("suggested");
+}
+
+/** A confirmed card: every field decided, and frozen with it. */
+export function lockedFieldStates(): BriefFieldStates {
+  return allFieldStates("confirmed");
+}
+
 export interface Subject {
   readonly id: string;
   readonly name: string;
@@ -180,6 +236,35 @@ export interface ReportTask {
   readonly subjects: readonly Subject[];
   readonly dimensions: readonly Dimension[];
   readonly matrix: readonly MatrixCell[];
+  /**
+   * How many times the brief has been formally changed.
+   *
+   * It is the draft's optimistic concurrency token: a patch or a guided answer
+   * states which version it was written against, and a caller holding a stale
+   * one is told so rather than quietly overwriting a decision the user made in
+   * the other mode. Absent on tasks written before the brief was editable; they
+   * are read as version 1.
+   */
+  readonly briefVersion?: number;
+  /**
+   * Which brief fields a person has already decided, and how.
+   *
+   * Kept per field because Guided Mode's whole job is to ask about what is
+   * still open and stay quiet about what is not. Absent on old tasks, where the
+   * states are read from the confirmation: a confirmed card decided everything,
+   * an unconfirmed one decided nothing.
+   */
+  readonly briefFieldStates?: BriefFieldStates;
+  readonly briefUpdatedAt?: string;
+  /**
+   * Set when Guided Mode concluded that no further decision was worth asking.
+   *
+   * It is recorded rather than recomputed because the judgement — "this draft
+   * is already specific enough" — is one a model made about this draft, and
+   * re-deriving it would ask the user the same question again. The reason is
+   * kept so the workspace can say why the guide stopped.
+   */
+  readonly guideClosed?: { readonly at: string; readonly reason: string } | null;
   readonly budget: ResearchBudget;
   readonly usage: ResearchUsage;
   readonly currentReportId: string | null;
@@ -549,10 +634,11 @@ export interface ExportArtifact {
  * whatever section was being written. `ask` and `edit` are the assistant's own
  * actions, which write nothing to the report. The stage is also what the
  * workspace shows the user, so "what is happening" is a fact about the task
- * rather than about a request. `followup` only survives as the value old
- * records carry.
+ * rather than about a request. `guide` is the program's own stage for writing
+ * the next guided question about the brief. `followup` only survives as the
+ * value old records carry.
  */
-export type ResearchStage = "card" | "research" | "gap" | "report" | "synthesis" | "ask" | "edit" | "followup";
+export type ResearchStage = "card" | "guide" | "research" | "gap" | "report" | "synthesis" | "ask" | "edit" | "followup";
 
 /** One stage's execution, as the application recorded it. */
 export interface ResearchRunRecord {
@@ -739,4 +825,5 @@ export const ID_PREFIX = Object.freeze({
   proposal: "prop",
   revision: "rev",
   assessment: "asm",
+  guide: "gq",
 } as const);

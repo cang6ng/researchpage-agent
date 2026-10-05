@@ -241,6 +241,12 @@ export function createResearchTools(service: ResearchService): ResearchTools {
         return boundedJson({ ok: false, problems: result.problems, guidance: result.guidance });
       }
       const task = result.task;
+      // The card is a draft and is validated as one while it is still a draft:
+      // saying so here, while the model is still running, is the moment it can
+      // fix it. A card missing its research question or audience cannot be
+      // confirmed, and the user should never receive a brief that can only be
+      // started after they repair it by hand.
+      const brief = service.briefOf(task.id);
       return boundedJson({
         ok: true,
         created: result.created,
@@ -256,7 +262,13 @@ export function createResearchTools(service: ResearchService): ResearchTools {
         subjects: task.subjects.map((subject) => ({ id: subject.id, name: subject.name })),
         dimensions: task.dimensions.map((dimension) => ({ id: dimension.id, name: dimension.name, question: dimension.question })),
         matrixCells: task.matrix.length,
-        next: task.confirmedAt === null ? "等待用户在界面确认任务卡；确认前不要检索。" : "任务卡已确认，可以开始 search_sources。",
+        briefVersion: brief.version,
+        briefValidation: brief.validation,
+        next: !brief.validation.valid
+          ? `任务卡还不完整：${brief.validation.problems.join("；")}。请再次调用 propose_task 补全这些字段（用户只能在界面确认完整的研究简报）。`
+          : task.confirmedAt === null
+            ? "等待用户在界面确认任务卡；确认前不要检索。"
+            : "任务卡已确认，可以开始 search_sources。",
       });
     },
   };
@@ -828,7 +840,83 @@ export function createResearchTools(service: ResearchService): ResearchTools {
     },
   };
 
-  const tools = [proposeTask, searchSources, readSource, assessCoverage, loadResearchState, saveReport, proposeSectionEdit];
+  /**
+   * The one write Guided Mode makes: the next question about the brief.
+   *
+   * The target is not the model's to choose — the program decided which field
+   * is worth deciding next, and the stage instruction says which — so this tool
+   * checks that the question stayed on it rather than trusting the schema. What
+   * the model *is* responsible for is the wording and the offered answers; and
+   * because every option has to carry the patch it means, the server can apply
+   * a chosen answer without interpreting it a second time.
+   */
+  const proposeGuideQuestion: Tool = {
+    name: "propose_guide_question",
+    description:
+      "为研究简报（Research Brief）写出下一个引导问题。一次只处理一个字段，字段由本次阶段的指令指定。\n" +
+      "输出形状：{ complete: false, question, whyThisMatters, fieldTargets, options }，" +
+      "其中 options 为 2–5 项，每项 { label, description?, recommended?, value }，" +
+      "value 是该字段的最小取值 patch（例如 { \"audience\": \"研究生组会\" }），必须只包含 fieldTargets 里的字段，且是可以真正写进简报的取值。\n" +
+      "如果当前默认值已经足够具体、不值得占用用户的一次决定，返回 { complete: true, reason: \"...\" } 并说明理由。\n" +
+      "不要输出 Markdown 或对话文本；不要调用其他工具。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        complete: { type: "boolean", description: "true 表示没有更值得确认的字段" },
+        reason: { type: "string", description: "complete=true 时说明理由" },
+        question: { type: "string", description: "要问用户的问题（一次只问一个决策）" },
+        whyThisMatters: { type: "string", description: "一句话说明它如何影响检索、比较框架或报告深度" },
+        fieldTargets: {
+          type: "array",
+          items: { type: "string" },
+          description: "本次问题涉及的简报字段；必须正好是阶段指令指定的那一个",
+        },
+        options: {
+          type: "array",
+          description: "2–5 个候选项",
+          items: {
+            type: "object",
+            properties: {
+              label: { type: "string", description: "选项文字" },
+              description: { type: "string", description: "这个选项意味着什么（可选）" },
+              recommended: { type: "boolean", description: "是否是推荐项（可选）" },
+              value: { type: "object", description: "该选项对应的简报取值 patch，只包含 fieldTargets 里的字段" },
+            },
+            required: ["label", "value"],
+          },
+        },
+      },
+      required: ["complete"],
+    },
+    async execute(input, context) {
+      const binding = taskFor(context.sessionId);
+      if (binding === undefined) return noTask();
+      const result = service.proposeGuideQuestion(binding.taskId, input);
+      if (!result.ok) return boundedJson({ ok: false, problems: result.problems, guidance: result.guidance });
+      if (result.complete) {
+        return boundedJson({ ok: true, complete: true, reason: result.reason, next: "引导式规划到此结束，不要再提问。" });
+      }
+      return boundedJson({
+        ok: true,
+        complete: false,
+        questionId: result.question.id,
+        fieldTargets: result.question.fieldTargets,
+        options: result.question.options.map((option) => option.optionId),
+        next: "问题已保存并显示给用户；本轮到此结束，不要重复提问。",
+      });
+    },
+  };
+
+  const tools = [
+    proposeTask,
+    proposeGuideQuestion,
+    searchSources,
+    readSource,
+    assessCoverage,
+    loadResearchState,
+    saveReport,
+    proposeSectionEdit,
+  ];
   const byName: Record<string, Tool> = {};
   for (const tool of tools) byName[tool.name] = tool;
   return { tools, byName };
