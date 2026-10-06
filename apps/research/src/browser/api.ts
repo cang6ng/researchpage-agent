@@ -181,6 +181,8 @@ export interface BriefView {
   readonly guide: {
     readonly complete: boolean;
     readonly reason: string;
+    /** The most decisions Guided Mode will ask for; the page never assumes one. */
+    readonly limit: number;
     readonly decisions: readonly GuideDecisionView[];
     readonly active: GuideQuestionView | null;
   };
@@ -486,6 +488,45 @@ export interface DocumentView {
   } | null;
 }
 
+/**
+ * A refusal, with what the application said about it.
+ *
+ * A stale brief or an incomplete draft is answered with more than a sentence —
+ * which fields are wrong, and what the brief looks like now — and a page that
+ * only saw `error.message` would have to guess where to put the objection. The
+ * message is still exactly the route's own sentence, so a caller that only
+ * wants to show something is unaffected.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly body: Record<string, unknown>;
+
+  constructor(message: string, status: number, body: Record<string, unknown>) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
+
+  /** The problems the route listed, one per thing that has to be fixed. */
+  get problems(): readonly string[] {
+    const listed = this.body["problems"];
+    if (Array.isArray(listed)) return listed.filter((item): item is string => typeof item === "string");
+    return this.message.length === 0 ? [] : [this.message];
+  }
+
+  /** Whether the refusal was about this page's version being out of date. */
+  get stale(): boolean {
+    return this.body["stale"] === true;
+  }
+
+  /** The brief the refusal was taken against, when the route sent it. */
+  get brief(): BriefView | undefined {
+    const brief = this.body["brief"];
+    return typeof brief === "object" && brief !== null ? (brief as BriefView) : undefined;
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -494,8 +535,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const text = await response.text();
   const value = text.length === 0 ? {} : (JSON.parse(text) as unknown);
   if (!response.ok) {
-    const message = (value as { error?: string }).error ?? `HTTP ${response.status}`;
-    throw new Error(message);
+    const body = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+    const message = typeof body["error"] === "string" ? body["error"] : `HTTP ${String(response.status)}`;
+    throw new ApiError(message, response.status, body);
   }
   return value as T;
 }

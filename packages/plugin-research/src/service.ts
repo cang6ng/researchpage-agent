@@ -357,6 +357,8 @@ export interface BriefView {
     readonly complete: boolean;
     /** Why it stopped, in a sentence. */
     readonly reason: string;
+    /** How many decisions Guided Mode asks for at most, so a page need not guess. */
+    readonly limit: number;
     readonly decisions: readonly GuideDecisionView[];
     readonly active: GuideQuestionView | null;
   };
@@ -1064,6 +1066,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
       guide: {
         complete: decision.complete,
         reason: decision.reason,
+        limit: GUIDE_DECISION_LIMIT,
         decisions: answeredGuideDecisions(task.id).map((question) => ({
           questionId: question.id,
           question: question.question,

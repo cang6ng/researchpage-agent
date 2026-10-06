@@ -493,6 +493,10 @@ export function createResearchRouter(
       if (!confirmed.ok) {
         sendJson(response, 409, {
           error: confirmed.problems.join("；"),
+          // The same problems, unjoined: a page puts each one beside the field
+          // it is about, and rejoining a sentence to find them again would be a
+          // guess about punctuation.
+          problems: confirmed.problems,
           guidance: confirmed.guidance,
           brief: service.briefOf(confirmId),
         });
@@ -536,6 +540,7 @@ export function createResearchRouter(
         sendJson(response, conflict ? 409 : 400, {
           ok: false,
           error: result.problems.join("；"),
+          problems: result.problems,
           guidance: result.guidance,
           ...(stale ? { stale: true, brief: (result as { brief: unknown }).brief } : {}),
         });
@@ -605,6 +610,7 @@ export function createResearchRouter(
         sendJson(response, conflict ? 409 : 400, {
           ok: false,
           error: result.problems.join("；"),
+          problems: result.problems,
           guidance: result.guidance,
           ...(stale ? { stale: true, brief: (result as { brief: unknown }).brief } : {}),
         });
