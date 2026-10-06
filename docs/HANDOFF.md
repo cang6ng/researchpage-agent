@@ -10,6 +10,8 @@
 
 ## Current Status（2026-10-06）
 
+- **Step 3.5B（Brief & Studio Interaction Repair）已完成**：简报的两种模式都接到了界面上（结构化编辑 = 直接改助手给出的方案；智能引导 = 一次一个决策，两者写同一份草稿）；报告工作台分成阅读与协作两种布局，助手工作区从 372px 的 Dock 变成 420–520px 的宽栏；AI 文字统一走 RichMarkdown（react-markdown + remark-gfm + rehype-sanitize，无 raw HTML）；交互式报告的比较表重排成可读矩阵，缺口聚合成「研究边界」，机制块按输入 → 步骤 → 输出呈现，内部 id 不再出现在读者看的文字里。
+
 - **Step 3.5A（Editable Research Brief + Guided Planning）已完成**：未确认的 ResearchTask 本身就是可编辑的 **Research Brief Draft**；结构化 PATCH 与引导式（一次一问）两种交互写同一份草稿；确认时按最终草稿校验、冻结字段状态并重建矩阵；历史项目仍按只读返回。
 
 - **Step 3（Frontend Product Redesign）已完成**：产品前端从「最小兼容」重写为 desktop-grade 研究工具——统一设计系统、Start/Library、Research Brief、Evidence Matrix、统一 Context Dock、原生 Report Studio（Editorial / Swiss 两套文档主题）、Source Workspace、Template Gallery、Settings；全部界面连接真实 API，浏览器 gate 逐项验收。
@@ -39,6 +41,70 @@
 - 校验失败与警告分开：`validation.checks` 记录每条 Q 规则的 result（pass/fail/warning/not_applicable），`problems` 阻止发布，`warnings` 随报告保存并显示在工作台。
 - 旧报告与新规则解耦：没有 `blueprintId` 的任务沿用 v1 的「必需章节 + 引用真实」规则，老数据不会因为新义务而无法编辑或导出。
 - 页数不是硬约束：card 的 lengthTarget 与各节 budget 作为写作预算写进阶段指令（实测把同一主题从 15 页收到 11 页），但 validator 不会因为页数拒绝报告。
+## Step 3.5B 新增（本次工作产物）
+
+本轮只修四件事：简报的交互、报告与助手的协作布局、AI 文字的渲染、交互式报告里几处明显的表达问题。没有重做首页 / 矩阵 / 来源 / 设置 / PDF renderer，没有引入 Mermaid、Upload、MCP、第二 Blueprint 或 Tauri。
+
+### Research Brief 页面（`apps/research/src/browser/views/brief.tsx`）
+
+- **两种模式，一次只显示一种**：`[结构化编辑] [智能引导]` 是页面唯一的模式开关，默认结构化。切换模式时向服务端重新读取（`refresh()`），两侧都读 `bundle.brief` —— 没有前端镜像，也没有第二份草稿。
+- **结构化模式不是表单墙**：字段以「可直接改的文档」呈现 —— 研究问题与读者是一段可点击进入编辑的正文（`InlineText`，失焦提交、Esc 放弃、Ctrl/Cmd+Enter 提交），比较对象与维度是可编辑的行（名称 / 说明 / 要回答的问题），关注点是可编辑 chip，篇幅带三个建议值。整页只有报告结构一块是只读的，并写明它由蓝图派生。
+- **保存模型**：改动不逐字符 PATCH；每次提交都带 `expectedVersion`。成功的写入把服务端的值显示出来；**被判定为过期（409 stale）时不覆盖读者输入**——本地的文字留在屏幕上，页面提示「研究任务刚刚发生了变化，请重新确认这一项」，并给出「用最新版本重试 / 放弃我的修改」两个明确动作。列表字段（对象 / 维度）在新增一项还没起名字之前不会提交，已有项允许被清空（那是一次真实编辑，服务端会用问题清单回应）。
+- **验证问题落在字段上**：`brief.validation.problems` 按声明词表映射到字段（`brief-logic.ts: problemFieldOf / problemsByField`），写在该字段下方并把它标红；「确认」在草稿不完整时不发送注定失败的请求，而是滚动并聚焦到第一个有问题的字段。服务端拒绝确认时，返回的问题清单同样按字段映射。
+- **确认区**在页面底部（sticky），用一句话说清这次研究将围绕什么进行（对象数 · 维度数 · 篇幅），主动作是「确认任务并开始研究」；「换一个主题重新建立任务卡」退到「更多」菜单里，不再和主动作竞争。
+- **已确认的简报**是干净的只读记录：没有可编辑控件、没有模式开关，显示「研究任务已确认」，并提供「去研究矩阵 / 打开报告」。
+
+### Guided Mode（`apps/research/src/browser/components/brief-guide.tsx`）
+
+- 一次只呈现一个决策：问题、一句 `whyThisMatters`、2–5 个选项卡（原生 radio，可键盘操作）+ 自由回答框，底部一个提交按钮。没有对话历史、没有气泡。
+- 提交后显示一次回执（`✓ <字段> 已更新：<你选的选项> → 已写入 Research Brief`）并附「查看结构化 Brief」；随后服务端的下一个问题到达就自动接上。进度写「关键决策 n / 最多 5」，上限来自 `brief.guide.limit`（本轮新增的 DTO 便捷字段，不让前端复制服务端常量）。
+- 必须处理的异步：`guide/next` 是 202 + 轮询，页面有明确的「正在准备下一个问题」状态；模型声明 `complete` 时收束成「研究方案已经足够明确」+「查看研究方案 / 确认并开始研究」。过期问题（版本或目标字段变化）显示提示并要求重新确认，不自动重放。
+- 已做过的决定折叠在「已经做过的决定（n）」里。
+
+### Studio：阅读 / 协作（`views/studio.tsx`、`components/dock.tsx`、`components/assistant.tsx`）
+
+- **一种工作区，两种宽度**：右侧仍然只有一个上下文面板，宽度由内容决定 —— 证据 / 来源 / 章节是 376px 的速览 Dock，助手与修改建议是 `clamp(420px, 32vw, 520px)` 的工作区。宽度通过 `--rp-dock-w` 发布，布局与 sticky chrome 读同一个变量。
+- **Reading Mode**：没有面板时文档居中（`data-layout="reading"`）。**Co-edit Mode**：打开助手后文档与宽栏并排，实测 1440 下文档占 66%、正文阅读宽度 755px；1366 下文档 873px / 阅读 729px，无横向滚动、工具栏不被挤成两行；1920 下助手封顶 520px、文档封顶 920px。
+- **布局门槛按测量而不是设备名**：`min-width: 1350px` 时并排，更窄时浮层覆盖（借用既有的 `--rp-dock-offset` 机制）。
+- **助手工作区**（`assistant.tsx`）：顶部一行是作用对象（`项目 / 章节 / 论断 / 比较项` + 具体名字，来自当前选中对象，可一键退回整个项目）；中间是动作记录（Action Card，宽栏里能读 600–1500 字回答）；底部是 composer —— 模式（自动 / 提问 / 补查 / 修改）是 composer 的一部分，提交按钮的文案就是动作本身（提问 / 补查材料 / 生成修改建议），旁边一行说明这条指令会做什么。
+- **Action Preview**：只有 Edit 有副作用提示，提交前在 composer 上方出现一条三行 strip（将修改 / 可能 / 正文），不弹 Modal。没有选中章节时 preview 明写「还没有选择章节」并禁用提交，而不是发一个注定被拒的请求。
+- **动作记录说真话**：Edit 的卡片只在这次 run 真的起草了提案（读 run 自己的 `propose_section_edit` 记录）时才说「已就绪」；没有产生提案时显示「这次没有产生修改建议，报告正文没有变化」，并把工具的拒绝原因（例如「已有待接受的修改提案」）原样转述。
+- **草稿不丢**：composer 的文本 / 模式 / 目标存在 store 里，关闭助手再打开仍在；只有切换项目才清空。
+
+### RichMarkdown（`components/markdown.tsx`，本轮新建）
+
+- `react-markdown` + `remark-gfm` + `rehype-sanitize`；**没有 `rehype-raw`**，raw HTML 从不是元素，再由 sanitize 兜底（`script / iframe / style / 事件属性 / javascript:` 全部被拒）。链接一律新窗口 + `noopener noreferrer`（内部锚点除外）。
+- 支持：段落 / h1–h4 / 粗斜 / 有序无序与嵌套列表 / 引用 / 链接 / 行内代码 / 围栏代码 / GFM 表格 / 分割线 / 删除线 / 任务列表。
+- 视觉按 ResearchPage 的语法写（13.5px / 行高 1.72 / 74ch 上限 / hairline 表格 / 左侧细线引用 / 表格与代码各自横向滚动），不是 GitHub README 默认样式。
+- 用在：Ask 的回答、动作说明、修改建议的理由。（报告正文仍由 document.css 的 artifact 语法渲染，两者不混用。）
+- `RichInline` 是它的行内版本，用来渲染报告正文里模型写的 `**强调**` 与反引号：只允许行内元素，块级结构被 unwrap，因此段落里的 `**` 不会变成星号，也不会把段落变成列表。
+- **AI 文字里的内部 id 会被摘掉**（`document-logic.ts: withoutInternalIds`）：模型看得见它引用的证据 / 对象 id，偶尔会写进回答或表头里；摘掉的是机器标识符本身，句子不动。
+
+### 交互式报告（`components/document.tsx`、`document-logic.ts`、`public/document.css`）
+
+- **比较表重排成矩阵**：报告的表是「一行一个对象、一列一个研究问题」，读起来是六列窄文字；画布上按「行 = 研究问题（名称 + 它要回答的问题）、列 = 比较对象」呈现，单元格只放有界判断，点击进入 Inspector 看证据与条件。表没有声明 `columnDimensions` / `rowSubjects` 时按报告原样呈现，不替它选方向。
+- **空单元格不空着**：报告没写判断的格子显示该格当前的状态词（`待查 / 有材料，待核对 / 有限支持 / 冲突`，取自矩阵），可点击直接打开这一格的证据面板；不可直接比较 / 有限可比由 claim 的 `conditions.comparability` 决定，以文字标在格子里。没有排名、没有绿=好红=坏。
+- **研究边界（Research Boundaries）**：矩阵里所有未确立的格子按研究问题聚合，每项给出状态计数、一句话原因、涉及对象；完整格子列表在「查看全部缺口」里。为此不再把十几个 `A × B limited` 铺在正文里。冻结版本显示自己的快照，不带今天的矩阵状态。
+- **质量提醒**：正文顶部不再打印内部 warning 列表，只留一句用户语言的摘要（`n 处义务未完全达成，正文里已如实写出`）与「n 项需要进一步核验 → 研究边界」；校验明细（原始句子）在核验模式下默认折叠。
+- **机制块**按输入 →（↓）步骤 →（↓）输出呈现，代价与权衡 / 什么时候不成立并列在下方；连接线用 CSS 画，不依赖字体里的箭头字形。步骤自带编号时不重复编号。
+- **内部 id 不再出现在读者看的文字里**：表头与正文里的 `（dim_item1）`、`（sub_graphrag）` 这类括号标识符被摘掉（`readerText`）；对象与维度的名字改用项目自己的简报（`nameMaps`），取不到名字时留空而不是回落到 id。唯一的例外是校验明细里的原始 warning 句子，它按 §37 只出现在核验模式的折叠里，并保留 claim id 以便核对。
+
+### 后端改动（全部是 presentation adapter 或缺陷修复，未触碰语义）
+
+- `apps/research/src/server/routes.ts`：三处拒绝响应在 `error`（拼接后的句子）之外**多带一个 `problems` 数组**，让页面把每条问题放回它所属字段，而不必反过来按标点切分句子。
+- `apps/research/src/server/runner.ts`：**修复 run 的动作记录被清空**。`transcriptOf` 读的是 client 快照里该 run 的 live timeline，而 run 一落地 live 就没有了；原来每次轮询都无条件覆盖 `record.activity`，于是每个 run 最终都记录成 0 步（动作卡里的「这次动作做了什么」永远是空的）。现在只在读到内容时覆盖。
+- `packages/plugin-research/src/service.ts`：`BriefView.guide` 增加 `limit`（引导决策上限），避免前端复制服务端常量。
+- `apps/research/tsconfig.json` 增加 `"jsx": "react-jsx"`：让 Node 那侧的测试项目也能 type-check 被测试 import 的 `.tsx`（`apps/web/tsconfig.json` 早已如此）。
+- `apps/research/package.json` 新增三个依赖：`react-markdown@10.1.0`、`remark-gfm@4.0.1`、`rehype-sanitize@6.0.0`。未引入 Markdown editor、MDX 或任何 HTML 渲染开关。
+
+### 测试与浏览器 gate
+
+- `apps/research/tests/markdown.test.ts`（9 例）：RichMarkdown 的渲染与拒绝——段落 / 标题 / 列表 / GFM 表格 / 引用 / 强调 / 行内与围栏代码 / 外链目标与 `noopener`；`<script>`、`<iframe>`、`<style>`、`onerror`、`onclick`、`javascript:` 一律不出现在产物里，且被拒的标签的**文字仍在**；`RichInline` 不允许句子变成文档；答案里的内部 id 被摘掉。
+- `apps/research/tests/brief-logic.test.ts`（15 例）：服务端问题 → 字段的映射与顺序、第一个要修的字段、行的 patch（保留 id、新增不带 id）、同构判断、未命名的新行不提交、移动行不丢 id、关注点集合、引导决定的回执措辞、确认摘要。
+- `apps/research/tests/artifact-view.test.ts`（13 例，`renderToStaticMarkup`）：两种模式下读者能看到的文字里没有任何内部标识符；比较矩阵的行是维度名 + 研究问题、列是对象名；没有声明框架的表不被强排成矩阵；不可直接比较 / 有限可比出现在格子里；空格子一定写着状态词、并可以打开；研究边界按问题聚合且冻结版本不带今天的覆盖状态；顶部摘要句。
+- `apps/research/scripts/verify-workspace.mjs` **重写**为 50 例真实输入用例（CDP，`Input.dispatchMouseEvent` / `Input.insertText`）：起始页、建立任务卡、简报的两种模式与结构化编辑（真的 PATCH + 版本递增 + 字段状态）、新增维度保留原有 id、不完整草稿把问题写在字段上并拒绝确认、引导问题 / 选项 / 回执 / 切回结构化看到同一份草稿、确认后冻结与矩阵一致、只读记录与写入上锁、报告工作台的阅读 / 核验、比较矩阵、研究边界、机制块、内部 id、质量提醒、证据检查器的两个问题、选中对象的动作栏、协作模式下的宽度与不横向滚动、关闭助手回到阅读且草稿保留、Ask / 补查 / Edit（含提案待接受时正文不变与接受后只有目标章节改变）、来源 / 模板 / 设置。截图写到 `--shots`（gitignored scratch），不进仓库。
+
+
 ## Step 3.5A 新增（本次工作产物）
 
 本轮只解决一件事：**研究开始之前，用户必须能真正参与定义 Research Brief**。不做前端 redesign（正式 Structured / Guided UI 属于 STEP 3.5B）。
@@ -172,6 +238,17 @@
 
 - 前端（Step 3 后仍存在的限制）：任务卡字段不能在界面里直接编辑——后端没有该路由，改结构的方式是改主题重新生成任务卡（会产生新项目，原项目保留）；Ask 的回答只从会话历史读回最近 5 次，界面不提供完整对话列表；PDF 仍只有 Editorial 版式（Swiss 的 PDF 适配属 Step 4）；切主题不产生 Revision，只记录在冻结版本的 themeId 上；1366 窗口下 Dock 为 overlay，会覆盖矩阵最右一列（可 Esc 关闭，Dock 标题与选中态仍表明当前目标）。
 
+- 交互式报告与简报（Step 3.5B 后仍存在的限制）：
+  - **生成的报告里，比较表是空的**（本轮最值得注意的发现）。四份真实 v2 报告（含 Step 3 留下的两份）的比较表全部是「6 个列维度 + 3 个对象行 + 0 个有内容的单元格」：模型写出了表头与行骨架，没有写判断。Q05/Q06 只校验「列维度与行对象声明得对不对、有没有静默省略维度」，不校验单元格有没有内容，所以这种报告是 pass 的，比较内容实际写在正文段落里。交互式画布对此的处理是：仍然画出框架，空格子写该格在矩阵里的状态词（待查 / 有限支持 / 冲突）并可点击打开证据，而不是留空白或假装有判断；**但这是呈现层的兜底，不是修复**。真正修它属于 Step 2 的 artifact 质量（生成侧或校验侧），本轮未动（§41 禁止改 Blueprint / Claim Contract）。
+  - 校验明细里的原始 warning 句子保留 claim id（例如 `Q03：claim clm_mech_index（mechanism）…`）。它们只在核验模式下、默认折叠的「校验明细」里出现；读者正文与阅读模式都不含任何内部标识符。重写这些句子会失去它们作为审计记录的原文价值，所以选择保留。
+  - 比较表在画布上按「行 = 研究问题、列 = 比较对象」呈现，与报告自己写的表（行 = 对象、列 = 问题）是转置关系：六列窄文字的读法确实更差，但报告开头的说明句按的是报告自己的方向，读得仔细的人会注意到这个不一致。
+  - 报告正文里的 `**强调**` 由 `RichInline` 渲染成强调；这不影响 PDF/HTML renderer（那条路径本轮未动），导出文件里仍然是原文。
+  - 引导问题仍然一次只针对一个字段，由一次有界的 stage run 生成（202 + 轮询），模型也可以声明「不值得再问」；`GUIDE_DECISION_LIMIT` 为 5。
+  - **Edit 有可能不产出提案**：模型有时会回答而不是起草，或者 `propose_section_edit` 因为「已有待接受的修改提案」被拒。动作卡现在如实说明这一点并转述拒绝原因，但产品上没有「自动等你处理完再重试」的机制。
+  - `busy` 是**服务端全局**的（一次只跑一个动作），因此一个项目在跑 run 时，另一个项目的动作按钮也是禁用的。
+  - RichMarkdown 没有语法高亮（本轮未要求）；表格与代码靠横向滚动，不做换行重排。
+  - 浏览器 gate 的模型用例需要真实模型、一次跑几分钟；没有模型凭据时这些用例报 SKIP 而不是 PASS。
+
 - 简报与引导（Step 3.5A 后仍存在的限制）：
   - **界面未接**：本轮只做了 API，Brief 页面仍是只读卡片 + 「换个说法重新生成」；正式 Structured / Guided UI 属于 STEP 3.5B。因此现在通过界面**无法**编辑简报，也**无法**手动引导——必须走 API 或 3.5B。
   - 引导问题**一次只能针对一个字段**（`fieldTargets` 长度为 1），不支持「一个问题同时决定目标与关注点」。`GUIDE_DECISION_LIMIT` 为 5，之后其余字段只能靠结构化编辑。
@@ -183,17 +260,19 @@
 
 ## Next Action
 
-**STEP 3.5B — Brief & Studio Interaction Repair**（下一步，本轮未做）。
+**STEP 4 — Artifact Delivery & Semantic Visualization**（后续步骤）：
 
-需要 3.5B 处理的是「语义已经有了、界面还没接上」的那一段：
+- **PDF 双主题适配**：把 ThemeSpec 映射到 plugin 的 HTML/PDF renderer，使 Editorial / Swiss 在导出文件里也成立（现在只有 Editorial 有 PDF 版式）。主题已经在冻结版本里记录 `themeId`，位置留好了。
+- **Mermaid / DiagramSpec 机制图**：机制块的结构化数据（input / intermediate / steps / output / tradeoff / failure）已经完整保留，本轮只做了 CSS 步骤流，替换成图形渲染不需要改数据。
+- **File Upload 作为来源**、**第二 Blueprint**、**MCP 集成**：Source Workspace 与 Settings 对未接入能力已如实标注，模板页的 Blueprint/Theme 分离留好了位置。
 
-- **Structured Mode UI**：Brief 页面的字段真正可编辑（inline 编辑 / segmented / editable chips，不要 full-width 表单墙），带 `fieldStates` 的 suggested/edited/confirmed 视觉区分与 400–600ms 更新提示、`expectedVersion` 409 的重新同步路径。现在页面上唯一的修改方式是「换个说法重新生成」（会产生新项目）——这正是本轮要消灭的产品缺陷，但**只在 API 层消灭了，界面还没换**。
-- **Guided Mode UI**：一次一问的引导面板（question / whyThisMatters / 2–5 个选项 + free text / 已做决定的回看），`POST brief/guide/next` 是异步的（202 + 轮询 brief），UI 需要处理「问题生成中」这一状态；模型声明 `complete` 后要能自然收束，并允许用户「默认方案已经够好 → 一键确认」。
-- **旧 Brief 页面的确认按钮**：`POST /confirm` 现在会因草稿不完整返回 409。store 会把它显示成错误提示，但页面无法据此引导用户补齐字段——3.5B 必须把 409 的问题清单接到可编辑字段上。
-- **Studio 双栏**：Assistant 与 Brief 的联动（conversation shapes structure），字段更新后的轻微高亮与可撤销。
-- 仍需遵守既有取舍：Report Structure 由 Blueprint 派生、只读；不引入 Markdown renderer / Mermaid；本轮遗留的 `reportNeedsReview`、冻结版本与主题切换语义不变。
+3.5B 交付后，界面与语义已经对齐；STEP 4 之前没有新的「语义有了、界面没接」的缺口。
 
-**STEP 4**（后续步骤）：PDF 双主题适配（把 ThemeSpec 映射到 plugin 的 HTML/PDF renderer，使 Editorial/Swiss 在导出文件里也成立）、Mermaid / DiagramSpec 机制图、File Upload 作为来源、第二 Blueprint、MCP 集成。第 3 轮已经把这些位置留好：主题在版本里记录 themeId，机制块保留结构化数据，Source Workspace 与 Settings 对未接入能力如实标注。
+## Step 3.5B 的验证入口
+
+- 页面纯逻辑与渲染：`npx vitest run apps/research/tests/markdown.test.ts apps/research/tests/brief-logic.test.ts apps/research/tests/artifact-view.test.ts apps/research/tests/frontend-logic.test.ts apps/research/tests/bundle.test.ts`。
+- 浏览器 gate（真实输入，非 DOM stub）：`node apps/research/scripts/verify-workspace.mjs --url <product url> --model --shots <gitignored dir>`；不加 `--model` 时跳过需要真实模型的用例并如实报 SKIP（不报 PASS）。没有未确认项目时 gate 会自己通过 composer 建一个（需要模型）。
+- 离线全量与类型检查同 Step 2：`pnpm typecheck`、`pnpm build:research`、`EVERY_DAGENT_NO_BROWSER=1 npx vitest run --exclude ...`。
 
 ## Step 3.5A 的验证入口
 
