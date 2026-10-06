@@ -10,6 +10,8 @@
 
 ## Current Status（2026-10-06）
 
+- **Step 3.5C-A（Guided Conversation & User Research Budget）已完成**：引导式规划有了深度契约（至少 5 个、最多 7 个关键决策，Agent 不能提前收尾，用户随时可以确认开始），引导问题带上 leadIn / 答案带上 answerText（下一轮做对话式界面所需的数据），用户明确发起的补查拿到自己的一次性 Action Budget，不再被项目的自动研究预算与 deadline 永久挡住。
+
 - **Step 3.5B（Brief & Studio Interaction Repair）已完成**：简报的两种模式都接到了界面上（结构化编辑 = 直接改助手给出的方案；智能引导 = 一次一个决策，两者写同一份草稿）；报告工作台分成阅读与协作两种布局，助手工作区从 372px 的 Dock 变成 420–520px 的宽栏；AI 文字统一走 RichMarkdown（react-markdown + remark-gfm + rehype-sanitize，无 raw HTML）；交互式报告的比较表重排成可读矩阵，缺口聚合成「研究边界」，机制块按输入 → 步骤 → 输出呈现，内部 id 不再出现在读者看的文字里。
 
 - **Step 3.5A（Editable Research Brief + Guided Planning）已完成**：未确认的 ResearchTask 本身就是可编辑的 **Research Brief Draft**；结构化 PATCH 与引导式（一次一问）两种交互写同一份草稿；确认时按最终草稿校验、冻结字段状态并重建矩阵；历史项目仍按只读返回。
@@ -41,6 +43,42 @@
 - 校验失败与警告分开：`validation.checks` 记录每条 Q 规则的 result（pass/fail/warning/not_applicable），`problems` 阻止发布，`warnings` 随报告保存并显示在工作台。
 - 旧报告与新规则解耦：没有 `blueprintId` 的任务沿用 v1 的「必需章节 + 引用真实」规则，老数据不会因为新义务而无法编辑或导出。
 - 页数不是硬约束：card 的 lengthTarget 与各节 budget 作为写作预算写进阶段指令（实测把同一主题从 15 页收到 11 页），但 validator 不会因为页数拒绝报告。
+## Step 3.5C-A 新增（本次工作产物）
+
+本轮只改后端语义，不动正式前端视觉。三件事：引导式规划的深度契约、引导对话的数据、用户自己发起的 Research 的预算。没有做前端对话界面、Studio 50/50、Report renderer、PDF、Mermaid、Upload、MCP、第二 Blueprint、Tauri，也没有改 Claim Contract / Frozen Revision / Proposal semantics。
+
+### 引导深度契约（`brief.ts` / `service.ts`）
+
+- `GUIDE_MIN_DECISIONS = 5`、`GUIDE_MAX_DECISIONS = 7`（替换原来的单一 `GUIDE_DECISION_LIMIT = 5`）。承诺是**下限**：不足 5 个真实决策，Agent 不能结束引导；上限 7 由程序自动收尾，避免变成 endless onboarding。
+- **提前 complete 会被拒绝，而且是可重试的**：`proposeGuideQuestion` 在 `readiness < GUIDE_MIN_DECISIONS` 时返回 `ok:false`（模型可读的 problems + guidance：「当前只完成 n/5 个关键决策…请继续围绕程序指定的字段 X 生成一个真正有区分度的问题」），**不写 `guideClosed`**，同一个 run 里模型可以再次调用 `propose_guide_question` 写出真问题（`brief-api.test.ts` 用脚本化模型验证了这条同 run 重试路径）。
+- **`guideReadinessDecisions(task)`**（`brief.ts`）：把阶梯字段里状态不是 `suggested` 的个数算作「人做过的决定」——引导答案把字段置为 `confirmed`，结构化编辑置为 `edited`，两者都算；Agent 的默认 `suggested` 一个都不算。没有 score、没有权重。混合使用两种模式的人因此不会被机械重复提问：结构化改过的字段直接被阶梯跳过，同时计入 readiness。
+- **用户自己的出口不受下限约束**：`BriefView.canConfirm`（= 未确认 && 草稿有效）随 DTO 下发；第 3 问就确认开始研究是允许的，第 5 问之后才出现 `guide.complete`。
+
+### 引导对话数据（`guide` DTO / `GuideQuestion`）
+
+- `GuideQuestion.leadIn`（可选，历史问题读为空字符串）：1–3 句对话过渡，由模型在写问题时一起给出，服务端限长 500 字并拒绝 HTML 标签（普通 Markdown 文本允许）；它不写简报、不是研究数据，STEP 3.5C-B 的对话界面用 RichMarkdown 渲染它。
+- `GuideAnswerRecord.answerText` / `selectedOptionLabels`：答案以用户当时选的措辞记录（选了选项就是选项 label，自由回答就是原文）。历史记录**不做迁移**，读取时从 optionIds → 当前问题的 option label 推导（`guideAnswerTextOf` / `guideAnswerLabelsOf`）。原始 ids 保留用于审计。
+- 所有 DTO 新增字段都在 `BriefView.guide`：`minDecisions` / `maxDecisions` / `readiness`（`limit` 保留 = maxDecisions，3.5B 页面继续可用），decisions 每条带 `leadIn` / `answerText` / `selectedOptionLabels`，active 带 `leadIn`。
+- **下一问的 prompt 带上下文**（`runner.ts: stageInstruction({stage:"guide"})`）：当前简报的 topic / purpose / audience / subjects / dimensions / focus / exclusions / lengthTarget，加上最近 2 个已回答决策（问题 + 用户选择 + 写入字段，`GUIDE_CONTEXT_DECISIONS = 2`），并写明「至少 5 个、最多 7 个」的深度契约。问题因此是在承接刚才的回答，而不是每次重新发问卷。
+
+### 用户动作预算（`semantics.ts` / `service.ts` / `runner.ts`）
+
+- **两套预算分开**：项目预算（`task.budget` / `task.usage`）只约束 Agent 自主的研究（initial research 与自动 gap 轮）；用户明确发起的动作（Research 动作、Edit 的 allowResearch 补查）走**自己的 Action Grant budget**。
+- `ActionGrant.origin: "pipeline" | "user"`（`createGrant` 默认 `pipeline`，只有应用为用户动作签发时才写 `user`）；`ActionUsage { searches, reads, gapRounds }` 活在 service 内存里，key 是 grant id，随 grant 一起产生与消失（重启即失效，与既有授权语义一致，不做 quota ledger）。
+- 默认额度（`semantics.ts`）：`USER_RESEARCH_BUDGET = { 2 searches, 4 reads, 2 gapRounds }`、`EDIT_RESEARCH_BUDGET = { 1 search, 2 reads, 1 gapRound }`。一条指令有界，下一条明确指令重新获得新的一份。
+- `budgetRefusal` 按 active grant 分流：user 动作只检查该动作自己的用量（"本次补查的检索次数已用完（2/2）"），**不检查** task 的 deadline / maxSearches / maxReads / maxGapRounds；pipeline 行为一字未变。因此「自动研究花完额度」不再导致「用户以后再也无法补查」，一个几小时前完成的项目仍然能继续补查（仍受 runner 的 stage timeout 约束）。
+- **gapRounds 语义**：`assess_coverage(gapRound=true)` 只有在 pipeline 授权下才增加 `task.usage.gapRounds`；用户动作下改为记在该动作自己的 usage 上，不污染自动补查计数。
+- 工具结果的分账：`search_sources` / `read_source` / `assess_coverage` 返回 `budgetScope: "project" | "user-action"`，`searchesRemaining` / `readsRemaining` / `gapRoundsRemaining` 反映**当前生效的那一份**；`load_research_state` 额外给出 `actionBudget`（只在用户动作里非空），项目 usage 继续作为累计 telemetry 累加。
+- `startResearchAction` 删掉了「`usage.gapRounds >= maxGapRounds` → 永久拒绝」这条判断：每次用户发起都签发新的 user-action grant，返回 `actionBudget: { searchesRemaining, readsRemaining, gapRoundsRemaining }`（不再是 `gapRoundsRemaining` 这种项目口径）。route 的 409「补查轮次预算已用完」分支随之删除，任务不存在才 404。
+- **Step 1 的安全边界没变**：用户 Research 依然只能改 Source / Snapshot / Evidence / Assessment，不写报告正文，完成后 `reportNeedsReview` 照常置位，Frozen Revision 不动；Edit 的补查仍然只为目标章节服务，接受前正文不变。
+
+### 测试
+
+- `packages/plugin-research/tests/brief-guide.test.ts`（40 例，+7）：O 段（深度下限 / 上限自动收尾 / 用户自己的出口 / 结构化编辑计入 readiness 且不被重复提问）与 P 段（leadIn、answerText、选项 label、历史记录读取时推导、HTML 与超长 leadIn 拒绝）。旧的「5 个决策后停止」改写为「到 7 个上限由程序自己收尾」。
+- `packages/plugin-research/tests/editing-semantics.test.ts`（21 例，+5）：J 段覆盖 I–O——项目预算与 deadline 都花光后用户动作仍能跑且不动正文（I/M/O）、一次动作的 2 次检索 / 4 次读取边界（J，超出只拒绝本次动作的额外调用）、第二条指令重新拿到额度（K）、用户 `gapRound` 不增加自动计数而 pipeline 仍按 task 预算拒绝（L/N）。
+- `apps/research/tests/brief-api.test.ts`（6 例，改写 2）：真实 HTTP 链路上验证深度下限——第 2 个决策后模型声明 complete 被拒（`4/5`，其中 2 个来自结构化编辑），同一 run 里被纠正后写出真问题；`canConfirm` / `minDecisions` / `maxDecisions` / `readiness` / `leadIn` 都在 DTO 上；下一个 guide stage 的指令确实包含上一个决策的答案文本与深度契约（用例 H）。
+- `apps/research/tests/editing-api.test.ts`（5 例，改写 1）：删掉了「测试先把 maxGapRounds 抬高到 4」这个为了绕开旧 bug 的补丁——现在把项目 usage 推到 gapRounds 满 + deadline 过期，用户补查仍然 202，`actionBudget` 如实返回，报告 hash 不变、`reportNeedsReview` 置位、自动 gapRounds 不动；第二条指令再拿一份新额度；Edit 的两次查找第二次被 `（1/1）` 拒绝，提案照常生成且只作用于目标章节。
+
 ## Step 3.5B 新增（本次工作产物）
 
 本轮只修四件事：简报的交互、报告与助手的协作布局、AI 文字的渲染、交互式报告里几处明显的表达问题。没有重做首页 / 矩阵 / 来源 / 设置 / PDF renderer，没有引入 Mermaid、Upload、MCP、第二 Blueprint 或 Tauri。
@@ -57,7 +95,7 @@
 ### Guided Mode（`apps/research/src/browser/components/brief-guide.tsx`）
 
 - 一次只呈现一个决策：问题、一句 `whyThisMatters`、2–5 个选项卡（原生 radio，可键盘操作）+ 自由回答框，底部一个提交按钮。没有对话历史、没有气泡。
-- 提交后显示一次回执（`✓ <字段> 已更新：<你选的选项> → 已写入 Research Brief`）并附「查看结构化 Brief」；随后服务端的下一个问题到达就自动接上。进度写「关键决策 n / 最多 5」，上限来自 `brief.guide.limit`（本轮新增的 DTO 便捷字段，不让前端复制服务端常量）。
+- 提交后显示一次回执（`✓ <字段> 已更新：<你选的选项> → 已写入 Research Brief`）并附「查看结构化 Brief」；随后服务端的下一个问题到达就自动接上。进度写「关键决策 n / 最多 limit」，上限来自 `brief.guide.limit`（DTO 便捷字段，不让前端复制服务端常量；Step 3.5C-A 之后它等于 `maxDecisions` = 7，同时下发了 5 这个下限与 `readiness`，正式对话界面的呈现属于 STEP 3.5C-B）。
 - 必须处理的异步：`guide/next` 是 202 + 轮询，页面有明确的「正在准备下一个问题」状态；模型声明 `complete` 时收束成「研究方案已经足够明确」+「查看研究方案 / 确认并开始研究」。过期问题（版本或目标字段变化）显示提示并要求重新确认，不自动重放。
 - 已做过的决定折叠在「已经做过的决定（n）」里。
 
@@ -126,7 +164,7 @@
 
 ### Guided Planning（一次一问）
 
-- **问题由程序选题、模型写题**：新增 `guide` stage（`ResearchStage`）与 `propose_guide_question` 工具。程序按固定阶梯（purpose → audience → subjects → dimensions → focus → exclusions → lengthTarget）决定「下一件最值得确认的事」，**跳过用户已经决定的字段**，并在 5 个决策后停止（`GUIDE_DECISION_LIMIT`）；模型只负责措辞、`whyThisMatters` 和 2–5 个候选选项，也可以返回 `{ complete: true, reason }` 表示「默认已经足够具体，不值得再问」（§17 的跳过低价值问题）。
+- **问题由程序选题、模型写题**：新增 `guide` stage（`ResearchStage`）与 `propose_guide_question` 工具。程序按固定阶梯（purpose → audience → subjects → dimensions → focus → exclusions → lengthTarget）决定「下一件最值得确认的事」，**跳过用户已经决定的字段**；模型只负责措辞、`whyThisMatters` 和 2–5 个候选选项。当年的收尾规则是「5 个决策后停止或由模型声明不值得再问」，该规则已被 Step 3.5C-A 的深度契约取代（下限 5、上限 7、提前 complete 会被拒；见上）。
 - **服务端校验**：`fieldTargets` 必须**正好**是程序指定的那一个字段（多字段问题本轮不支持）；`options` 必须 2–5 项；**每个选项必须带 `value`**——它是该字段的最小 patch，创建问题时就按同一套 normalizer 对着当前草稿验证过，`value` 只能包含 `fieldTargets` 里的字段。因此「选中一个选项」不是一个需要再猜一次的标签（§20）。
 - **一次一问**：一个任务同时只有一个 `active` 问题；写新问题会把旧的置为 `superseded`。`allowFreeText` 固定为 `true`。
 - **自由文本有声明式规则**（不是让模型猜）：文本字段（topic/purpose/audience/exclusions/lengthTarget）回答即取值；`focus` 按行/顿号/逗号切分；`subjects` 每行 `名称 | 说明`（同一行内也支持逗号分隔）；`dimensions` 每行 `名称 | 要回答的问题`。名称能对上现有对象时**保留其 id**。
@@ -223,7 +261,7 @@
 
 ## 已知限制
 
-- 补查轮次上限 2、搜索 ≤6、读取 ≤10、单任务 8 分钟窗口（SPEC 初值，未收紧也未扩大）。任务已有报告后，assistant 的 Research 动作同样消耗补查轮次预算。
+- 补查轮次上限 2、搜索 ≤6、读取 ≤10、单任务 8 分钟窗口（SPEC 初值，未收紧也未扩大）。这些是**项目预算**，只约束 Agent 自主的研究；用户明确发起的补查/Edit 补查走各自的一次性 Action Budget（Step 3.5C-A，见上）。
 - Edit 只支持 Section 级替换（可显式附带 summary 目标）；不做 Claim/图/任意文本范围编辑、不做字符 diff 与三方合并。
 - 冻结包不复制全文，只保存引用到的 evidence 定位与片段、来源元数据与 read id；历史报告若没有缺口快照，revision 如实标 `gapsCaptured=false`，不伪造。
 - Theme 仍只有 `editorial` 一个；切主题不产生新 Revision（后续步骤）。
@@ -243,7 +281,7 @@
   - 校验明细里的原始 warning 句子保留 claim id（例如 `Q03：claim clm_mech_index（mechanism）…`）。它们只在核验模式下、默认折叠的「校验明细」里出现；读者正文与阅读模式都不含任何内部标识符。重写这些句子会失去它们作为审计记录的原文价值，所以选择保留。
   - 比较表在画布上按「行 = 研究问题、列 = 比较对象」呈现，与报告自己写的表（行 = 对象、列 = 问题）是转置关系：六列窄文字的读法确实更差，但报告开头的说明句按的是报告自己的方向，读得仔细的人会注意到这个不一致。
   - 报告正文里的 `**强调**` 由 `RichInline` 渲染成强调；这不影响 PDF/HTML renderer（那条路径本轮未动），导出文件里仍然是原文。
-  - 引导问题仍然一次只针对一个字段，由一次有界的 stage run 生成（202 + 轮询），模型也可以声明「不值得再问」；`GUIDE_DECISION_LIMIT` 为 5。
+  - 引导问题仍然一次只针对一个字段，由一次有界的 stage run 生成（202 + 轮询）；模型声明「不值得再问」是否被接受由 Step 3.5C-A 的深度契约决定（readiness < 5 时拒绝并让模型改问，≥ 5 时接受，到 7 由程序收尾）。
   - **Edit 有可能不产出提案**：模型有时会回答而不是起草，或者 `propose_section_edit` 因为「已有待接受的修改提案」被拒。动作卡现在如实说明这一点并转述拒绝原因，但产品上没有「自动等你处理完再重试」的机制。
   - `busy` 是**服务端全局**的（一次只跑一个动作），因此一个项目在跑 run 时，另一个项目的动作按钮也是禁用的。
   - RichMarkdown 没有语法高亮（本轮未要求）；表格与代码靠横向滚动，不做换行重排。
@@ -251,7 +289,7 @@
 
 - 简报与引导（Step 3.5A 后仍存在的限制）：
   - **界面未接**：本轮只做了 API，Brief 页面仍是只读卡片 + 「换个说法重新生成」；正式 Structured / Guided UI 属于 STEP 3.5B。因此现在通过界面**无法**编辑简报，也**无法**手动引导——必须走 API 或 3.5B。
-  - 引导问题**一次只能针对一个字段**（`fieldTargets` 长度为 1），不支持「一个问题同时决定目标与关注点」。`GUIDE_DECISION_LIMIT` 为 5，之后其余字段只能靠结构化编辑。
+  - 引导问题**一次只能针对一个字段**（`fieldTargets` 长度为 1），不支持「一个问题同时决定目标与关注点」。决策数量由 Step 3.5C-A 的深度契约管理（下限 5、上限 7），第 5 个之后模型的收尾判断才会被接受，用户也可以在此之前直接确认。
   - 引导问题由**一个 stage run** 生成，不是即时返回：`guide/next` 是 202 + 轮询，模型不可用时该轮不会产生问题（返回 409/空），不伪造问题。
   - 自由文本对 `subjects` / `dimensions` 是**整体替换**语义（按行解析），不是增量编辑；已存在的对象按名称匹配复用 id，改名同时改列表需要显式带 id（结构化 PATCH 可以精确做到）。
   - 结构性编辑（增删/重排对象或维度）在任务**已有实际读取材料**时被拒绝并返回 409，而不是静默删除证据；正常流程里未确认任务没有材料，所以这条只在异常数据上生效。
@@ -260,6 +298,11 @@
 
 ## Next Action
 
+**STEP 3.5C-B — Conversational Planning & 50/50 Co-edit UI**（下一步）：
+
+- 把 Guided Mode 做成真正的对话式规划：用本轮下发的 `leadIn` / `answerText` / `selectedOptionLabels`（RichMarkdown 渲染 leadIn）呈现助手与用户的来回，而不是一张问卷；进度按 `readiness / minDecisions / maxDecisions` 说真话，`canConfirm` 明确给出用户随时可以开始的出口。
+- Studio 的 50/50 协作布局（本轮未动前端视觉）。
+
 **STEP 4 — Artifact Delivery & Semantic Visualization**（后续步骤）：
 
 - **PDF 双主题适配**：把 ThemeSpec 映射到 plugin 的 HTML/PDF renderer，使 Editorial / Swiss 在导出文件里也成立（现在只有 Editorial 有 PDF 版式）。主题已经在冻结版本里记录 `themeId`，位置留好了。
@@ -267,6 +310,14 @@
 - **File Upload 作为来源**、**第二 Blueprint**、**MCP 集成**：Source Workspace 与 Settings 对未接入能力已如实标注，模板页的 Blueprint/Theme 分离留好了位置。
 
 3.5B 交付后，界面与语义已经对齐；STEP 4 之前没有新的「语义有了、界面没接」的缺口。
+
+## Step 3.5C-A 的验证入口
+
+- 引导深度契约与对话数据（服务层）：`npx vitest run packages/plugin-research/tests/brief-guide.test.ts`（O/P 两段）。
+- 用户动作预算（服务层）：`npx vitest run packages/plugin-research/tests/editing-semantics.test.ts`（J 段）。
+- 全链路（HTTP → runner → tool → service，脚本化模型与本地 fixture，不需要网络或凭据）：`npx vitest run apps/research/tests/brief-api.test.ts apps/research/tests/editing-api.test.ts`。
+- 离线全量、类型检查与构建：`pnpm typecheck`、`pnpm build:research`、`npx vitest run`。本轮没有跑真实模型 Demo 与浏览器 gate（未改前端视觉）。
+- 已知的既有 flaky（与本次改动无关，单独重跑即过）：`packages/host/tests/tool-policy.test.ts` 有一条与 deadline 毫秒取整有关的断言；`apps/web/tests/shell-*.browser.test.ts` 在整仓并行跑时偶尔会在 CDP 等待上超时。
 
 ## Step 3.5B 的验证入口
 

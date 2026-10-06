@@ -70,19 +70,123 @@ function guideTargetOf(instruction: string): string {
   return /本次要确认的字段：(\S+)/.exec(instruction)?.[1] ?? "";
 }
 
+/** The current value of a bulleted line in the guide instruction. */
+function lineOf(instruction: string, label: string): string {
+  return new RegExp(`^- ${label}：(.*)$`, "m").exec(instruction)?.[1]?.trim() ?? "";
+}
+
+/**
+ * A real question for whatever field the program picked.
+ *
+ * The fixture answers from the instruction's own view of the brief — the same
+ * view the model gets — so the options it offers are values the service can
+ * really install against this draft, which is what a stored option has to be.
+ */
+function questionFor(field: string, instruction: string): Record<string, unknown> | undefined {
+  const lead = (text: string): Record<string, unknown> => ({ complete: false, leadIn: text, fieldTargets: [field] });
+  if (field === "purpose") {
+    return {
+      ...lead("明白，这份材料要用来支撑一次选型，而不是只解释机制。"),
+      question: "这次研究最重要的目标是什么？",
+      whyThisMatters: "它决定检索方向、比较框架与结论的写法",
+      options: [
+        { label: "理解机制", value: { purpose: "理解机制：弄清三种方法的构建与检索机制差异" } },
+        {
+          label: "为技术选型提供依据",
+          description: "在长文档问答场景比较工程成本与效果",
+          recommended: true,
+          value: { purpose: "为技术选型提供依据：在长文档问答场景比较工程成本与效果" },
+        },
+      ],
+    };
+  }
+  if (field === "subjects") {
+    const names = lineOf(instruction, "比较对象")
+      .split("、")
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0);
+    return {
+      ...lead("明白了。既然要看工程成本，比较对象就要覆盖你真正会选的几种方案。"),
+      question: "这次要比较哪些方案？",
+      whyThisMatters: "对象是证据矩阵的行，也决定检索与读取的目标",
+      options: [
+        { label: `保持当前对象（${names.join("、")}）`, value: { subjects: names.map((name) => ({ name })) } },
+        {
+          label: "把传统 RAG 也纳入比较",
+          value: { subjects: [...names.map((name) => ({ name })), { name: "传统 RAG" }] },
+        },
+      ],
+    };
+  }
+  if (field === "audience") {
+    return {
+      ...lead("接下来确认读者是谁。"),
+      question: "这份材料主要给谁看？",
+      whyThisMatters: "读者决定解释深度与术语密度",
+      options: [
+        { label: "工程团队", value: { audience: "工程团队" } },
+        { label: "导师与同行", value: { audience: "导师与同行" } },
+      ],
+    };
+  }
+  if (field === "focus") {
+    return {
+      ...lead("接下来确认这次要重点看什么。"),
+      question: "这次最需要证据支撑的是哪些方面？",
+      whyThisMatters: "重点决定哪些维度需要更深、更直接的证据",
+      options: [
+        { label: "只看机制差异", value: { focus: ["机制差异"] } },
+        { label: "机制与工程成本并重", value: { focus: ["机制差异", "工程成本"] } },
+      ],
+    };
+  }
+  if (field === "exclusions") {
+    return {
+      ...lead("接下来确认这次明确不做什么。"),
+      question: "哪些内容这次不研究？",
+      whyThisMatters: "排除项决定检索与报告不去做的事情",
+      options: [
+        { label: "不额外限定", value: { exclusions: "" } },
+        { label: "排除私有化部署与合规", value: { exclusions: "不涉及私有化部署与合规问题" } },
+      ],
+    };
+  }
+  if (field === "lengthTarget") {
+    return {
+      ...lead("最后一件事：篇幅。"),
+      question: "这份材料大概需要多长？",
+      whyThisMatters: "篇幅是写作预算，决定章节取舍的详略",
+      options: [
+        { label: "约 4–6 页", value: { lengthTarget: "约 4–6 页" } },
+        { label: "约 8–10 页", value: { lengthTarget: "约 8–10 页" } },
+      ],
+    };
+  }
+  return undefined;
+}
+
 interface Scripted {
   readonly client: ModelClient;
   /** The field each guided question was asked about, in the order asked. */
   readonly guideTargets: readonly string[];
+  /** The instruction each guide stage ran under, so the context is checkable. */
+  readonly guideInstructions: readonly string[];
+  /** Refusals the model received, as the tool answered them. */
+  readonly refusals: { readonly name: string; readonly problems: readonly string[] }[];
 }
 
 /**
- * A model that does exactly three things: propose the card, ask one guided
- * question about the purpose, and then report that nothing further is worth
- * asking. Everything else in this test is the product's own code.
+ * A model that proposes the card, asks about the purpose, asks about the
+ * audience, and then insists that nothing further is worth asking — which is
+ * the judgement the depth floor exists to refuse. Everything else here is the
+ * product's own code.
  */
 function scriptedModel(): Scripted {
   const guideTargets: string[] = [];
+  const guideInstructions: string[] = [];
+  const refusals: { name: string; problems: readonly string[] }[] = [];
+  /** The instruction whose guide run is being served, so a retry is not a rerun. */
+  let seenInstruction = "";
   let step = 0;
   const next = (events: readonly ModelEvent[]): AsyncIterable<ModelEvent> =>
     (async function* () {
@@ -123,38 +227,30 @@ function scriptedModel(): Scripted {
       }
 
       if (instruction.includes("引导模式")) {
-        if (results.some((result) => result.name === "propose_guide_question")) {
+        for (const result of results) {
+          if (result.value["ok"] !== false) continue;
+          const problems = (result.value["problems"] ?? []) as string[];
+          if (refusals.some((entry) => entry.problems.join("；") === problems.join("；"))) continue;
+          refusals.push({ name: result.name, problems });
+        }
+        const attempts = results.filter((result) => result.name === "propose_guide_question");
+        if (attempts.some((result) => result.value["ok"] !== false)) {
           return next(say("问题已提交，等待用户回答。"));
         }
         const target = guideTargetOf(instruction);
-        guideTargets.push(target);
-        if (target !== "purpose") {
-          // A field the model judges need no decision: it says so rather than
-          // inventing a question the user would have to read.
-          return next(call("propose_guide_question", { complete: true, reason: "其余默认值已经足够具体" }));
+        if (seenInstruction !== instruction) {
+          seenInstruction = instruction;
+          guideTargets.push(target);
+          guideInstructions.push(instruction);
         }
-        return next(
-          call("propose_guide_question", {
-            complete: false,
-            question: "这次研究最重要的目标是什么？",
-            whyThisMatters: "它决定检索方向、比较框架与结论的写法",
-            fieldTargets: ["purpose"],
-            options: [
-              {
-                label: "理解机制",
-                description: "弄清三种方法各自如何构建与检索",
-                value: { purpose: "理解机制：弄清三种方法的构建与检索机制差异" },
-              },
-              {
-                label: "为技术选型提供依据",
-                description: "在长文档问答场景比较工程成本与效果",
-                recommended: true,
-                value: { purpose: "为技术选型提供依据：在长文档问答场景比较工程成本与效果" },
-              },
-              { label: "准备组会综述", value: { purpose: "准备组会综述：讲清三类方法的现状与边界" } },
-            ],
-          }),
-        );
+        // Two questions, and then the model judges that nothing further is
+        // worth asking — a judgement the depth floor refuses. Told why, it
+        // writes the question the program asked for, in the same run.
+        const refused = attempts.filter((result) => result.value["ok"] === false).length;
+        const question = refused > 0 || guideTargets.length <= 2 ? questionFor(target, instruction) : undefined;
+        if (question !== undefined) return next(call("propose_guide_question", question));
+        if (refused > 0) return next(say("（脚本化模型：无法为这个字段写出更合适的问题）"));
+        return next(call("propose_guide_question", { complete: true, reason: "其余默认值已经足够具体" }));
       }
 
       // The research stage starts after confirmation; this test is about the
@@ -162,7 +258,7 @@ function scriptedModel(): Scripted {
       return next(say("（脚本化模型：本测试不进行检索）"));
     },
   };
-  return { client, guideTargets };
+  return { client, guideTargets, guideInstructions, refusals };
 }
 
 function offlineComposition(scripted: Scripted): TrustedComposition {
@@ -228,12 +324,25 @@ interface BriefShape {
   readonly fieldStates: Readonly<Record<string, string>>;
   readonly editableFields: readonly string[];
   readonly validation: { readonly valid: boolean; readonly problems: readonly string[] };
+  readonly canConfirm: boolean;
   readonly guide: {
     readonly complete: boolean;
     readonly reason: string;
-    readonly decisions: readonly { readonly questionId: string; readonly question: string; readonly appliedFields: readonly string[] }[];
+    readonly limit: number;
+    readonly minDecisions: number;
+    readonly maxDecisions: number;
+    readonly readiness: number;
+    readonly decisions: readonly {
+      readonly questionId: string;
+      readonly leadIn: string;
+      readonly question: string;
+      readonly appliedFields: readonly string[];
+      readonly selectedOptionLabels: readonly string[];
+      readonly answerText: string;
+    }[];
     readonly active: {
       readonly questionId: string;
+      readonly leadIn: string;
       readonly question: string;
       readonly whyThisMatters: string;
       readonly fieldTargets: readonly string[];
@@ -318,6 +427,14 @@ describe("the research brief, over HTTP", () => {
     expect(Object.values(current.brief.fieldStates).every((state) => state === "suggested")).toBe(true);
     expect(current.brief.matrix).toEqual({ subjects: 2, dimensions: 3, cells: 6 });
 
+    // The depth contract travels with the brief, so a page need not guess it,
+    // and the user's own exit is stated rather than inferred from validation.
+    expect(current.brief.guide.minDecisions).toBe(5);
+    expect(current.brief.guide.maxDecisions).toBe(7);
+    expect(current.brief.guide.limit).toBe(current.brief.guide.maxDecisions);
+    expect(current.brief.guide.readiness).toBe(0);
+    expect(current.brief.canConfirm).toBe(true);
+
     const response = await get(`/api/research/tasks/${taskId}/brief`);
     expect(response.status).toBe(200);
     const body = JSON.parse(response.text) as { brief: BriefShape };
@@ -391,6 +508,9 @@ describe("the research brief, over HTTP", () => {
     expect(question.allowFreeText).toBe(true);
     expect(question.basedOnBriefVersion).toBe(withQuestion.brief.version);
     expect(question.question).toContain("目标");
+    // The lead-in is conversation, not a decision: it arrives with the question
+    // and changes nothing in the draft.
+    expect(question.leadIn).toBe("明白，这份材料要用来支撑一次选型，而不是只解释机制。");
 
     // Asking again while a question is live returns it rather than paying for
     // a second model run.
@@ -432,17 +552,60 @@ describe("the research brief, over HTTP", () => {
     expect((await bundle()).brief.purpose).toBe("为技术选型提供依据：在长文档问答场景比较工程成本与效果");
   });
 
-  it("asks the next question about what is still open, and stops when the model says so", async () => {
-    await waitUntil(async () => (await bundle()).brief.guide.complete, "the guide to conclude");
-    const brief = (await bundle()).brief;
-    expect(brief.guide.reason).toBe("其余默认值已经足够具体");
-    expect(brief.guide.active).toBeNull();
-    expect(brief.guide.decisions).toHaveLength(1);
-
-    // The field the user settled is behind the ladder: the second question was
-    // about the subjects, never about the audience they had already rewritten.
+  it("asks the next question about what is still open, and refuses to stop before the floor", async () => {
+    // The question the answer triggered, written from the decision before it.
+    await waitUntil(async () => (await bundle()).brief.guide.active !== null, "the next question to appear");
+    const second = (await bundle()).brief.guide.active;
+    if (second === null) throw new Error("expected a second question");
+    // The fields the user already settled are behind the ladder: the audience
+    // was edited in the structured editor, so the next decision is the objects.
+    expect(second.fieldTargets).toEqual(["subjects"]);
+    expect(second.leadIn.length).toBeGreaterThan(0);
     expect(scripted.guideTargets).toEqual(["purpose", "subjects"]);
-  });
+    // The stage that wrote it was told what the user had just decided, so the
+    // conversation continues instead of restarting as a questionnaire.
+    expect(scripted.guideInstructions[1]).toContain("为技术选型提供依据");
+    expect(scripted.guideInstructions[1]).toContain("至少要完成 5 个关键决策");
+
+    const answered = await post(`/api/research/tasks/${taskId}/brief/guide/answer`, {
+      questionId: second.questionId,
+      optionIds: ["opt_1"],
+    });
+    expect(answered.status).toBe(200);
+    const decisions = ((answered.json as { brief: BriefShape }).brief.guide).decisions;
+    expect(decisions).toHaveLength(2);
+    expect(decisions[0]).toMatchObject({
+      leadIn: "明白，这份材料要用来支撑一次选型，而不是只解释机制。",
+      question: "这次研究最重要的目标是什么？",
+      selectedOptionLabels: ["为技术选型提供依据"],
+      answerText: "为技术选型提供依据",
+      appliedFields: ["purpose"],
+    });
+    // Readiness counts what the *user* decided, whichever way they decided it:
+    // two guided answers plus the audience and dimensions they edited by hand.
+    expect((answered.json as { brief: BriefShape }).brief.guide.readiness).toBe(4);
+
+    // Two decisions in, the model declared the draft specific enough. The
+    // service refused, told it why — and the same run answered with the
+    // question the program asked for instead of ending the conversation.
+    await waitUntil(async () => scripted.refusals.length > 0, "the model's early stop to be refused");
+    expect(scripted.refusals[0]?.name).toBe("propose_guide_question");
+    expect(scripted.refusals[0]?.problems.join("；")).toContain("4/5");
+    expect(scripted.refusals[0]?.problems.join("；")).toContain("不能结束引导式规划");
+
+    await waitUntil(async () => (await bundle()).brief.guide.active !== null, "the corrected question to appear");
+    const third = (await bundle()).brief.guide.active;
+    if (third === null) throw new Error("expected a third question");
+    expect(third.fieldTargets).toEqual(["focus"]);
+    expect(third.leadIn.length).toBeGreaterThan(0);
+    expect(scripted.guideTargets).toEqual(["purpose", "subjects", "focus"]);
+
+    const brief = (await bundle()).brief;
+    expect(brief.guide.complete).toBe(false);
+    expect(brief.guide.readiness).toBe(4);
+    // The user's own exit does not wait for the agent's floor.
+    expect(brief.canConfirm).toBe(true);
+  }, 60_000);
 
   it("confirms the latest draft, rebuilds the matrix from it, and then locks everything", async () => {
     const before = await bundle();

@@ -142,7 +142,16 @@ interface Scripted {
 function scriptedModel(): Scripted {
   const attempts: string[] = [];
   const refusals: { name: string; problems: readonly string[] }[] = [];
+  /** Keyed by what was refused, so the same refusal is recorded once. */
   const seenRefusals = new Set<string>();
+  const note = (result: { readonly name: string; readonly value: Record<string, unknown> }): void => {
+    if (result.value["ok"] !== false) return;
+    const problems = (result.value["problems"] ?? []) as string[];
+    const key = `${result.name}|${problems.join("；")}`;
+    if (seenRefusals.has(key)) return;
+    seenRefusals.add(key);
+    refusals.push({ name: result.name, problems });
+  };
   /**
    * The card as it was proposed.
    *
@@ -536,11 +545,7 @@ function scriptedModel(): Scripted {
       }
       // An Ask run: the model tries to write anyway, and is refused.
       if (instruction.includes("用户提出了一个问题")) {
-        for (const result of results) {
-          if (result.value["ok"] !== false || seenRefusals.has(result.name)) continue;
-          seenRefusals.add(result.name);
-          refusals.push({ name: result.name, problems: (result.value["problems"] ?? []) as string[] });
-        }
+        for (const result of results) note(result);
         const writes = results.filter((result) => result.name === "search_sources" || result.name === "save_report");
         if (writes.length === 0) {
           return next(call("search_sources", { query: "unrelated side quest", limit: 1 }));
@@ -560,8 +565,15 @@ function scriptedModel(): Scripted {
 
       // An Edit run: submit a proposal for the target section only.
       if (instruction.includes("用户要求修改当前报告的指定目标")) {
+        for (const result of results) note(result);
         const proposed = results.some((result) => result.name === "propose_section_edit");
         if (proposed) return next(say("修改提案已提交，等待接受。"));
+        // The Edit is authorized to look things up, and tries twice: the second
+        // lookup is refused by the Edit's own allowance, and the proposal is
+        // still written from what it has.
+        const lookups = results.filter((result) => result.name === "search_sources");
+        if (lookups.length === 0) return next(call("search_sources", { query: "cost reporting conventions", limit: 1 }));
+        if (lookups.length === 1) return next(call("search_sources", { query: "another angle on cost", limit: 1 }));
         const match = /章节当前内容：(\{.*?\})\n/s.exec(instruction);
         const section = match === null ? undefined : (JSON.parse(match[1]!) as { id: string; title: string });
         const target = section ?? { id: "comparison", title: "四、共同维度比较" };
@@ -677,6 +689,8 @@ interface Bundle {
   readonly revisions: readonly { readonly revisionId: string; readonly revision: number; readonly isCurrentReport: boolean }[];
   readonly exports: readonly { readonly exportId: string; readonly revisionId: string | null; readonly status: string }[];
   readonly runs: readonly { readonly stage: string; readonly status: string }[];
+  readonly budget: { readonly maxSearches: number; readonly maxReads: number; readonly maxGapRounds: number };
+  readonly usage: { readonly searches: number; readonly reads: number; readonly gapRounds: number };
   readonly currentReportId: string | null;
   readonly currentReportHash: string | null;
   readonly currentReportFrozen: boolean;
@@ -822,6 +836,13 @@ describe("the assistant's three intents, over HTTP", () => {
     expect(again.status).toBe(200);
     expect(again.json["alreadyApplied"]).toBe(true);
     expect((await bundle()).currentReportId).toBe(after.currentReportId);
+
+    // The Edit's own lookups were bounded: the second search is refused by the
+    // Edit's allowance, and the refusal is what the model was told.
+    const lookupRefusal = scripted.refusals.find((entry) =>
+      entry.problems.some((problem) => problem.includes("本次补查的检索次数已用完")),
+    );
+    expect(lookupRefusal?.problems.join("；")).toContain("本次补查的检索次数已用完（1/1）");
   }, 120_000);
 
   it("freezes a revision, exports it, and keeps the file stable across later research", async () => {
@@ -850,18 +871,27 @@ describe("the assistant's three intents, over HTTP", () => {
 
     // More research: the material grows and the report is flagged, but the
     // frozen document and the file that was already written do not move.
-    // The first pass already spent the two gap rounds. The test grants a larger
-    // budget the way an operator would configure one, rather than pretending a
-    // spent budget still has room in it.
-    const budgetTask = app.service.getTask(taskId)!;
-    app.repository.updateTask({ ...budgetTask, budget: { ...budgetTask.budget, maxGapRounds: 4 } });
-    const beforeResearchRuns = app.service.runsOf(taskId).filter((run) => run.stage === "gap").length;
+    // The project's automatic research is closed first — every gap round spent
+    // and the deadline long past — because that is the state a returning user
+    // is actually in, and the state the old rule mistook for a reason to refuse
+    // them.
+    const before = app.service.getTask(taskId)!;
+    app.repository.updateTask({
+      ...before,
+      usage: { ...before.usage, gapRounds: before.budget.maxGapRounds, searches: before.budget.maxSearches, startedAt: new Date(Date.now() - 3_600_000).toISOString() },
+    });
+    const spent = await bundle();
+    expect(spent.usage.gapRounds).toBe(spent.budget.maxGapRounds);
+    const beforeResearchRuns = spent.runs.filter((run) => run.stage === "gap").length;
 
     const researched = await post(`/api/research/tasks/${taskId}/assistant`, {
       text: "再找独立证据验证构建成本",
       intent: "research",
     });
     expect(researched.status, JSON.stringify(researched.json)).toBe(202);
+    // What the workspace is told is this instruction's allowance, not what is
+    // left of the project.
+    expect(researched.json["actionBudget"]).toEqual({ searchesRemaining: 2, readsRemaining: 4, gapRoundsRemaining: 2 });
     await waitUntil(async () => {
       const current = await bundle();
       const gaps = current.runs.filter((run) => run.stage === "gap").length;
@@ -872,10 +902,32 @@ describe("the assistant's three intents, over HTTP", () => {
     expect(after.currentReportId).toBe(bundleAfterExport.currentReportId);
     expect(after.currentReportHash).toBe(bundleAfterExport.currentReportHash);
     expect(after.task.reportNeedsReview?.reason).toContain("复核");
+    // The instruction spent its own allowance and none of the project's:
+    // searches accumulate as telemetry, the automatic gap count does not move.
+    expect(after.usage.gapRounds).toBe(spent.usage.gapRounds);
+    expect(after.usage.searches).toBeGreaterThan(spent.usage.searches);
     // Research on a task that has a report does not write another one.
     expect(after.runs.filter((run) => run.stage === "report").length).toBe(1);
     expect((await get(`/api/research/revisions/${revisionId}/html`)).text).toBe(beforeHtml);
-  }, 180_000);
+
+    // A second instruction gets its own allowance: a project out of automatic
+    // rounds is not a reason to refuse the person twice.
+    const again = await post(`/api/research/tasks/${taskId}/assistant`, {
+      text: "再补查一次这两条成本口径的出处",
+      intent: "research",
+    });
+    expect(again.status, JSON.stringify(again.json)).toBe(202);
+    expect(again.json["actionBudget"]).toEqual({ searchesRemaining: 2, readsRemaining: 4, gapRoundsRemaining: 2 });
+    await waitUntil(async () => {
+      const current = await bundle();
+      const gaps = current.runs.filter((run) => run.stage === "gap").length;
+      return gaps > beforeResearchRuns + 1 && !current.busy;
+    }, "the second research action to settle", 120_000);
+    const settled = await bundle();
+    expect(settled.currentReportId).toBe(bundleAfterExport.currentReportId);
+    expect(settled.currentReportHash).toBe(bundleAfterExport.currentReportHash);
+    expect(settled.usage.gapRounds).toBe(spent.usage.gapRounds);
+  }, 240_000);
 
   it("refuses to export without a report and reports the frozen state honestly", async () => {
     const other = await post("/api/research/tasks", { topic: "一个还没有报告的主题" });

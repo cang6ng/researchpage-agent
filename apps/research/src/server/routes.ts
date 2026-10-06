@@ -697,17 +697,17 @@ export function createResearchRouter(
       }
 
       if (reading.intent === "research") {
+        // A user's补查 gets its own action budget, so it is never refused
+        // because the project's automatic rounds or deadline are spent: what it
+        // may spend is one instruction's worth, and the next instruction gets
+        // its own.
         const view = runner.startResearchAction(task.id, {
           text,
           reading: reading.reason,
           allowResearch: true,
         });
         if (view === undefined) {
-          sendJson(response, 409, {
-            error: "补查轮次预算已用完，无法开始新的补查；请在报告中如实标注缺口",
-            gapRounds: task.usage.gapRounds,
-            maxGapRounds: task.budget.maxGapRounds,
-          });
+          sendJson(response, 404, { error: "任务不存在" });
           return;
         }
         sendJson(response, 202, { ok: true, started: "research", ...view, reading: reading.reason });

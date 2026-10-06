@@ -19,9 +19,12 @@
 import type { Client } from "@every-dagent/client";
 import type { LiveItem } from "@every-dagent/protocol";
 import type {
+  ActionBudgetView,
   ActionGrant,
   AssistantIntent,
   BriefFieldName,
+  GrantBudget,
+  GrantOrigin,
   GuideTarget,
   MatrixCell,
   ReportTask,
@@ -29,7 +32,16 @@ import type {
   ResearchService,
   ResearchStage,
 } from "@every-dagent/plugin-research";
-import { ID_PREFIX, blueprintById, needsAttention, newId } from "@every-dagent/plugin-research";
+import {
+  EDIT_RESEARCH_BUDGET,
+  GUIDE_MAX_DECISIONS,
+  GUIDE_MIN_DECISIONS,
+  ID_PREFIX,
+  blueprintById,
+  needsAttention,
+  newId,
+  USER_RESEARCH_BUDGET,
+} from "@every-dagent/plugin-research";
 
 export interface ResearchRunnerOptions {
   readonly client: Client;
@@ -97,15 +109,18 @@ export interface ResearchRunner {
   /**
    * A user-asked research action on a task that already exists.
    *
-   * It runs under the same budget a gap round does, and — critically — a task
-   * that already has a report does not get a new one written at the end: the
-   * material changes, the report is marked for review, and its text and hash
-   * stay exactly as they were.
+   * It runs like a gap round in shape and differently in budget: the run acts
+   * under a grant minted for *this instruction*, so a project whose automatic
+   * rounds are spent still answers「再补查一些资料」— bounded by what one
+   * instruction may spend rather than by what is left of the project. And a
+   * task that already has a report does not get a new one written at the end:
+   * the material changes, the report is marked for review, and its text and
+   * hash stay exactly as they were.
    */
   startResearchAction(
     taskId: string,
     input: { readonly text: string; readonly reading: string; readonly allowResearch?: boolean },
-  ): { readonly intent: "research"; readonly scope: string; readonly gapRoundsRemaining: number } | undefined;
+  ): { readonly intent: "research"; readonly scope: string; readonly actionBudget: ActionBudgetView } | undefined;
   /** Marks records left `running` by a previous process as interrupted. */
   reconcileInterrupted(): void;
   /**
@@ -141,6 +156,10 @@ interface StageRequest {
     readonly targetType: "none" | "project" | "section" | "report";
     readonly targetId: string | null;
     readonly scope: string;
+    /** Set to `user` only for a stage a person explicitly asked for. */
+    readonly origin?: GrantOrigin;
+    /** What this action may spend; absent means the grant's own default. */
+    readonly budget?: GrantBudget;
   };
   /** Set for an Edit: the section the proposal must be limited to. */
   readonly targetSectionId?: string | null;
@@ -163,6 +182,23 @@ const STAGE_LABELS: Readonly<Record<ResearchStage, string>> = Object.freeze({
 function stageLabel(stage: ResearchStage): string {
   return STAGE_LABELS[stage] ?? stage;
 }
+
+/**
+ * One decision a person already made, as the next question's context.
+ *
+ * A guided conversation that does not carry this is a questionnaire: each
+ * question would be written against the brief alone and would ignore what the
+ * person just said. Two or three of these are enough for continuity — the
+ * whole history would push the current draft out of the prompt.
+ */
+export interface GuideDecisionContext {
+  readonly question: string;
+  readonly answerText: string;
+  readonly fields: readonly BriefFieldName[];
+}
+
+/** How many past decisions the next question is written with. */
+const GUIDE_CONTEXT_DECISIONS = 2;
 
 const STATUS_LABELS: Readonly<Record<MatrixCell["status"], string>> = Object.freeze({
   missing: "无依据",
@@ -223,6 +259,10 @@ export function stageInstruction(input: {
   readonly stage: "guide";
   readonly task: ReportTask;
   readonly guideTarget: GuideTarget;
+  /** How many guided questions this task has already had answered. */
+  readonly answered: number;
+  /** The last decisions, so the next question can continue the conversation. */
+  readonly recentDecisions?: readonly GuideDecisionContext[];
 }): string;
 export function stageInstruction(input: {
   readonly stage: "research" | "gap" | "report";
@@ -253,28 +293,50 @@ export function stageInstruction(input: {
   readonly targetSectionId?: string;
   readonly reportBrief?: string;
   readonly guideTarget?: GuideTarget;
+  readonly answered?: number;
+  readonly recentDecisions?: readonly GuideDecisionContext[];
 }): string {
   if (input.stage === "guide") {
     const guideTarget = input.guideTarget;
     const task = input.task;
     if (guideTarget === undefined || task === undefined) throw new Error("the guide stage needs a target");
+    const answered = input.answered ?? 0;
+    const recent = input.recentDecisions ?? [];
     return [
-      "用户正在用引导模式（Guided Planning）完善研究简报草稿。本次只处理一个决策，不要涉及其他字段，也不要重新讨论已经决定的字段。",
+      "用户正在用引导模式（Guided Planning）完善研究简报草稿。这是一段对话，不是问卷：本次只处理一个决策，不要涉及其他字段，也不要重新讨论已经决定的字段。",
+      `这将是第 ${answered + 1} 个关键决策；引导式规划至少要完成 ${GUIDE_MIN_DECISIONS} 个关键决策，最多 ${GUIDE_MAX_DECISIONS} 个。`,
       `本次要确认的字段：${guideTarget.field}`,
       `这个字段是什么：${guideTarget.ask}`,
       `为什么值得确认：${guideTarget.whyItMatters}`,
       `当前默认值：${guideTarget.currentValue.length === 0 ? "（空）" : guideTarget.currentValue}`,
-      `研究主题：${task.topic}`,
-      `读者（默认）：${task.audience || "（未填写）"}`,
+      "当前简报（写问题时必须以它为准，不要问用户已经定下的东西）：",
+      `- 主题：${task.topic}`,
+      `- 研究问题 / 用途：${task.purpose || "（未填写）"}`,
+      `- 读者：${task.audience || "（未填写）"}`,
+      `- 比较对象：${task.subjects.map((subject) => subject.name).join("、") || "（无）"}`,
+      `- 研究维度：${task.dimensions.map((dimension) => `${dimension.name}（${dimension.question}）`).join("；") || "（无）"}`,
+      `- 重点：${task.focus.join("、") || "（未填写）"}`,
+      `- 排除项：${task.exclusions || "（未填写）"}`,
+      `- 篇幅目标：${task.lengthTarget || "（未填写）"}`,
+      ...(recent.length === 0
+        ? []
+        : [
+            "用户刚刚做出的决定（leadIn 要接住它们，问题要往下推进，不要重复追问）：",
+            ...recent.map(
+              (decision) =>
+                `- 问题：${decision.question}／用户选择：${decision.answerText || "（未记录）"} → 写入字段：${decision.fields.join("、")}`,
+            ),
+          ]),
       "请调用 propose_guide_question 一次：",
+      "- leadIn：1–3 句自然语言过渡——先说明你如何理解用户刚才的决定（第一问则说明你对主题的理解），再说明接下来要确认什么；它是对话呈现，不是研究数据，也不能改写简报；使用普通文本或 Markdown，不要写 HTML 标签；",
       "- question：一个具体的、只问这一件事的问题；不要「你想改什么」这类空泛问题；",
       "- whyThisMatters：一句话说明它如何影响检索、比较框架或报告深度；",
       `- fieldTargets：["${guideTarget.field}"]（必须正好是这一个字段）；`,
       "- options：2–5 个具体候选项，每项 { label, description?, recommended?, value }；value 是只包含该字段的最小取值 patch，必须是能真正写进简报的取值，不要写占位符；",
       `  · 如果这个字段是列表（subjects/dimensions/focus），value 要给出完整的列表，而不是增量的一句描述；`,
       "  · 候选项之间要有真实差别（对应不同的检索与报告取舍），不要给同义改写；",
-      '- 如果当前默认值已经足够具体、不值得占用用户的一次决定，改为返回 { complete: true, reason: "..." } 并说明理由。',
-      "调用一次即结束：不要输出 Markdown，不要调用其他工具，不要追问用户原话。",
+      `- 只有确实已经完成至少 ${GUIDE_MIN_DECISIONS} 个关键决策，才允许返回 { complete: true, reason: "..." }；在此之前服务端会拒绝它，你必须围绕本次指定字段提出一个真正有区分度的问题。`,
+      "调用一次即结束：不要输出 Markdown 正文，不要调用其他工具，不要追问用户原话。",
     ].join("\n");
   }
 
@@ -539,6 +601,8 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       targetId: request.grant.targetId,
       scope: request.grant.scope,
       allowResearch: request.grant.allowResearch,
+      ...(request.grant.origin === undefined ? {} : { origin: request.grant.origin }),
+      ...(request.grant.budget === undefined ? {} : { budget: request.grant.budget }),
       ...(task === undefined || task.currentReportId === null ? {} : { baseReportId: task.currentReportId }),
     });
 
@@ -922,11 +986,28 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       if (task === undefined) return undefined;
       const decision = service.guideTargetOf(taskId);
       if (decision.complete || decision.target === null) return undefined;
+      // The conversation's own memory: the last decisions, read from the same
+      // record the workspace shows, so the next question continues from them
+      // instead of being a questionnaire item written against the brief alone.
+      const recentDecisions: GuideDecisionContext[] = service
+        .briefOf(taskId)
+        .guide.decisions.slice(-GUIDE_CONTEXT_DECISIONS)
+        .map((entry) => ({
+          question: entry.question,
+          answerText: entry.answerText,
+          fields: entry.appliedFields,
+        }));
       enqueue({
         taskId,
         sessionId: task.sessionId,
         stage: "guide",
-        instruction: stageInstruction({ stage: "guide", task, guideTarget: decision.target }),
+        instruction: stageInstruction({
+          stage: "guide",
+          task,
+          guideTarget: decision.target,
+          answered: decision.answered,
+          recentDecisions,
+        }),
         grant: STAGE_GRANTS.guide,
       });
       return { target: decision.target.field, scope: STAGE_GRANTS.guide.scope };
@@ -998,13 +1079,23 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           taskId,
           sessionId: task.sessionId,
           stage: "edit",
-          instruction: stageInstruction({ stage: "edit", task, instruction: payload, targetSectionId: section.id }),
+          instruction: [
+          stageInstruction({ stage: "edit", task, instruction: payload, targetSectionId: section.id }),
+          view.allowResearch
+            ? `本次动作的补查预算独立计算：最多检索 ${EDIT_RESEARCH_BUDGET.maxSearches} 次、读取 ${EDIT_RESEARCH_BUDGET.maxReads} 个来源，与项目的自动研究预算无关。`
+            : "本次动作没有补查授权：只能使用上面列出的已有材料。",
+        ].join("\n"),
           grant: {
             intent: "edit",
             allowResearch: view.allowResearch,
             targetType: "section",
             targetId: section.id,
             scope: view.scope,
+            // The errand the user authorized the Edit to run is bounded by the
+            // Edit's own budget, not by what the project has left: looking
+            // something up for one section is not a research pass.
+            origin: "user",
+            ...(view.allowResearch ? { budget: EDIT_RESEARCH_BUDGET } : {}),
           },
           targetSectionId: section.id,
         });
@@ -1022,7 +1113,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         sessionId: task.sessionId,
         stage: "ask",
         instruction: stageInstruction({ stage: "ask", task, question: input.text }),
-        grant: { intent: "ask", allowResearch: false, targetType: "project", targetId: null, scope: view.scope },
+        grant: { intent: "ask", allowResearch: false, targetType: "project", targetId: null, scope: view.scope, origin: "user" },
         question: input.text,
       });
       return view;
@@ -1031,11 +1122,16 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     startResearchAction(taskId, input) {
       const task = service.getTask(taskId);
       if (task === undefined) return undefined;
-      if (task.usage.gapRounds >= task.budget.maxGapRounds) return undefined;
+      // A user's instruction is not a gap round the pipeline decided on: it
+      // gets its own grant and its own budget, and it is never refused because
+      // the project's automatic rounds or its deadline are used up.
+      const scope = "围绕用户提出的问题定向补查；不修改报告正文";
       const instruction = [
         stageInstruction({ stage: "gap", task }),
         "",
-        `用户提出的补查要求（${input.reading}）：`,
+        `本次是用户明确发起的补查动作（${input.reading}），有它自己的资源预算：`,
+        `本次动作最多检索 ${USER_RESEARCH_BUDGET.maxSearches} 次、读取 ${USER_RESEARCH_BUDGET.maxReads} 个来源，与项目的自动研究预算分账；用完即止，用户还可以再发起下一次。`,
+        `用户提出的补查要求：`,
         `"""${input.text}"""`,
         task.currentReportId === null
           ? "完成后由程序决定是否继续补查或生成报告。"
@@ -1046,12 +1142,16 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         sessionId: task.sessionId,
         stage: "gap",
         instruction,
-        grant: STAGE_GRANTS.gap,
+        grant: { ...STAGE_GRANTS.gap, origin: "user", budget: USER_RESEARCH_BUDGET, scope },
       });
       return {
         intent: "research",
-        scope: "围绕用户提出的问题定向补查；不修改报告正文",
-        gapRoundsRemaining: Math.max(0, task.budget.maxGapRounds - task.usage.gapRounds),
+        scope,
+        actionBudget: {
+          searchesRemaining: USER_RESEARCH_BUDGET.maxSearches,
+          readsRemaining: USER_RESEARCH_BUDGET.maxReads,
+          gapRoundsRemaining: USER_RESEARCH_BUDGET.maxGapRounds,
+        },
       };
     },
 

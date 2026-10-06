@@ -42,6 +42,20 @@ export interface GrantBudget {
   readonly maxGapRounds: number;
 }
 
+/**
+ * Who asked for the action a grant authorizes.
+ *
+ * The distinction exists because two budgets bound two different things. The
+ * pipeline — the initial research pass and the gap rounds the program schedules
+ * for itself — spends the *task's* budget, because what is being bounded there
+ * is the agent researching on its own initiative. A user action spends its own
+ * grant's budget, because what is being bounded there is one instruction the
+ * person gave: a project whose automatic rounds are all spent must still be
+ * able to answer「再补查一些资料」, and that answer is bounded by the action it
+ * belongs to rather than by the project's lifetime.
+ */
+export type GrantOrigin = "pipeline" | "user";
+
 /** What a grant's write is aimed at. */
 export type GrantTargetType = "none" | "project" | "section" | "report";
 
@@ -51,6 +65,7 @@ export interface ActionGrant {
   /** The task this action belongs to; `null` only for the card stage. */
   readonly taskId: string | null;
   readonly intent: ActionIntent;
+  readonly origin: GrantOrigin;
   readonly targetType: GrantTargetType;
   readonly targetId: string | null;
   /** A sentence a person can read, describing what this action may touch. */
@@ -63,6 +78,21 @@ export interface ActionGrant {
   readonly budget: GrantBudget;
   readonly createdAt: string;
 }
+
+/**
+ * What one action has spent so far.
+ *
+ * It lives exactly as long as its grant, in the process that issued it. This is
+ * not a quota ledger: a restart invalidates the grant and interrupts the action,
+ * so a usage number that outlived the grant would be a permission nobody holds.
+ */
+export interface ActionUsage {
+  readonly searches: number;
+  readonly reads: number;
+  readonly gapRounds: number;
+}
+
+export const EMPTY_ACTION_USAGE: ActionUsage = Object.freeze({ searches: 0, reads: 0, gapRounds: 0 });
 
 /** The capabilities an intent confers, before the research switch is applied. */
 const INTENT_CAPABILITIES: Readonly<Record<ActionIntent, readonly ActionCapability[]>> = Object.freeze({
@@ -91,6 +121,8 @@ export interface GrantInput {
   readonly sessionId: string;
   readonly intent: ActionIntent;
   readonly taskId: string | null;
+  /** Defaults to `pipeline`: only an explicit user action says otherwise. */
+  readonly origin?: GrantOrigin;
   readonly targetType?: GrantTargetType;
   readonly targetId?: string | null;
   readonly scope?: string;
@@ -114,6 +146,18 @@ const SCOPE_TEXT: Readonly<Record<ActionIntent, string>> = Object.freeze({
 /** The default research budget a grant carries: the task's own limits apply too. */
 const DEFAULT_GRANT_BUDGET: GrantBudget = Object.freeze({ maxSearches: 6, maxReads: 10, maxGapRounds: 2 });
 
+/**
+ * What one「再补查一些资料」may spend.
+ *
+ * It is deliberately small: the number bounds a single instruction, so a user
+ * who wants deeper coverage asks again and gets a fresh action with a fresh
+ * budget. It is not the project's remaining life.
+ */
+export const USER_RESEARCH_BUDGET: GrantBudget = Object.freeze({ maxSearches: 2, maxReads: 4, maxGapRounds: 2 });
+
+/** What an Edit authorized to look things up may spend on that errand. */
+export const EDIT_RESEARCH_BUDGET: GrantBudget = Object.freeze({ maxSearches: 1, maxReads: 2, maxGapRounds: 1 });
+
 export function createGrant(input: GrantInput): ActionGrant {
   const allowResearch = input.allowResearch ?? false;
   return {
@@ -121,6 +165,7 @@ export function createGrant(input: GrantInput): ActionGrant {
     sessionId: input.sessionId,
     taskId: input.taskId,
     intent: input.intent,
+    origin: input.origin ?? "pipeline",
     targetType: input.targetType ?? (input.intent === "ask" ? "project" : "none"),
     targetId: input.targetId ?? null,
     scope: input.scope ?? SCOPE_TEXT[input.intent],

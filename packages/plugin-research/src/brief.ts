@@ -43,8 +43,20 @@ export const MAX_BRIEF_SUBJECTS = 8;
 export const MAX_BRIEF_DIMENSIONS = 12;
 export const MAX_BRIEF_FOCUS = 12;
 
-/** How many guided decisions this product will ask for before it stops. */
-export const GUIDE_DECISION_LIMIT = 5;
+/**
+ * The depth Guided Planning promises, and the ceiling that keeps it finite.
+ *
+ * The promise is a *floor*, not a cap: a model cannot end guided planning
+ * before this many decisions have really been made, because a plan that ends
+ * after one question has not planned anything. The ceiling is what keeps the
+ * same promise from turning into an onboarding wizard — past it the program
+ * closes the conversation itself.
+ */
+export const GUIDE_MIN_DECISIONS = 5;
+export const GUIDE_MAX_DECISIONS = 7;
+
+/** The most characters a question's lead-in may carry. */
+export const GUIDE_LEAD_IN_LIMIT = 500;
 
 export function briefVersionOf(task: ReportTask): number {
   return task.briefVersion ?? INITIAL_BRIEF_VERSION;
@@ -531,9 +543,9 @@ export function isStructural(fields: readonly BriefFieldName[]): boolean {
  * One guided decision's target, chosen by the program.
  *
  * The ladder is the product's opinion about what is worth asking, not a
- * checklist: a field the user already decided is skipped, the count is capped,
- * and the generator may report that no further decision is worth asking for —
- * which is what keeps this from turning into an onboarding wizard.
+ * checklist: a field the user already decided is skipped, the order is fixed so
+ * the highest-value decisions come first, and the count is capped — which is
+ * what keeps this from turning into an onboarding wizard.
  */
 export interface GuideTarget {
   readonly field: BriefFieldName;
@@ -585,20 +597,41 @@ const GUIDE_LADDER: readonly { readonly field: BriefFieldName; readonly ask: str
   ]);
 
 /**
+ * How many decisions a person has really made about this draft.
+ *
+ * It counts the fields the *user* settled, read straight off the draft's own
+ * field states: a guided answer marks its field `confirmed`, a structured edit
+ * marks it `edited`, and either way a person chose the value that is in the
+ * draft now. A field the agent merely suggested stays `suggested` and counts
+ * for nothing, which is the one thing this number has to get right — an agent's
+ * default is not a user's decision, and telling the user it was would let the
+ * conversation end on questions nobody answered.
+ *
+ * Only the ladder's fields count: they are the ones Guided Mode can ask about,
+ * so they are the ones whose settlement means the conversation has less to do.
+ */
+export function guideReadinessDecisions(task: ReportTask): number {
+  const states = briefFieldStatesOf(task);
+  return GUIDE_LADDER.filter((step) => states[step.field] !== "suggested").length;
+}
+
+/**
  * The next decision worth asking about, or nothing when asking is over.
  *
  * `answered` is how many guided decisions this task has already recorded: the
- * cap is the product's promise that guided planning is a short conversation,
- * not a form. A field the user already decided is skipped rather than re-asked,
- * because asking "你是工程师吗" after the user wrote 研究生 would be the exact
- * failure the one-draft rule exists to prevent.
+ * ceiling is the product's promise that guided planning is a short conversation
+ * rather than a form, and the floor is enforced where a question is proposed,
+ * not here — this function answers "what is worth asking", never "may we stop".
+ * A field the user already decided is skipped rather than re-asked, because
+ * asking "你是工程师吗" after the user wrote 研究生 would be the exact failure
+ * the one-draft rule exists to prevent.
  */
 export function nextGuideTarget(input: {
   readonly task: ReportTask;
   readonly answered: number;
 }): GuideTarget | undefined {
   if (input.task.confirmedAt !== null) return undefined;
-  if (input.answered >= GUIDE_DECISION_LIMIT) return undefined;
+  if (input.answered >= GUIDE_MAX_DECISIONS) return undefined;
   const states = briefFieldStatesOf(input.task);
   for (const step of GUIDE_LADDER) {
     if (states[step.field] !== "suggested") continue;
@@ -633,6 +666,17 @@ export type GuideQuestionStatus = "active" | "answered" | "superseded";
 export interface GuideAnswerRecord {
   readonly optionIds: readonly string[];
   readonly freeText: string;
+  /**
+   * What the person decided, in the words a conversation can show back.
+   *
+   * It is stored rather than re-derived because the labels it names may be
+   * rewritten by a later question's wording, and the record of what someone
+   * chose should not change when that happens. A record written before this
+   * field existed has none, and is read back from what it does hold.
+   */
+  readonly answerText?: string;
+  /** The labels of the options that were picked, for a conversation view. */
+  readonly selectedOptionLabels?: readonly string[];
   readonly appliedFields: readonly BriefFieldName[];
   readonly resultingBriefVersion: number;
   readonly at: string;
@@ -649,6 +693,16 @@ export interface GuideAnswerRecord {
 export interface GuideQuestion {
   readonly id: string;
   readonly taskId: string;
+  /**
+   * One to three sentences of natural language before the question.
+   *
+   * It is the only part of a guided question that is *about the conversation*:
+   * it says how the previous answer was understood and what is being confirmed
+   * next. It is not research data and it may not change the brief — a model
+   * that writes a decision into its lead-in has written it nowhere. Absent on
+   * questions asked before this existed; read as empty, never migrated.
+   */
+  readonly leadIn?: string;
   readonly question: string;
   readonly whyThisMatters: string;
   readonly fieldTargets: readonly BriefFieldName[];
@@ -744,6 +798,46 @@ export function patchFromFreeText(task: ReportTask, field: BriefFieldName, text:
       return { dimensions };
     }
   }
+}
+
+// ------------------------------------------------------- reading a decision --
+
+/** A question's lead-in, with the questions that predate the field read as empty. */
+export function guideLeadInOf(question: GuideQuestion): string {
+  return (question.leadIn ?? "").trim();
+}
+
+/** What the offered options a person picked were called. */
+export function guideOptionLabelsOf(question: GuideQuestion, optionIds: readonly string[]): readonly string[] {
+  return optionIds
+    .map((optionId) => question.options.find((option) => option.optionId === optionId)?.label ?? "")
+    .filter((label) => label.length > 0);
+}
+
+/**
+ * What a person decided, in their own words.
+ *
+ * A decision recorded before this existed has no `answerText`, and is read back
+ * from what the record does hold — the labels it chose, or the text it typed.
+ * The derivation happens on read rather than in a migration because a stored
+ * decision is a historical fact: rewriting yesterday's records to hold today's
+ * field would be editing what someone is recorded as having chosen.
+ */
+export function guideAnswerTextOf(question: GuideQuestion): string {
+  const answer = question.answer;
+  if (answer === null) return "";
+  const recorded = (answer.answerText ?? "").trim();
+  if (recorded.length > 0) return recorded;
+  const labels = answer.selectedOptionLabels ?? guideOptionLabelsOf(question, answer.optionIds);
+  if (labels.length > 0) return labels.join("、");
+  return answer.freeText.trim();
+}
+
+/** The labels of a recorded decision, derived the same way as its text. */
+export function guideAnswerLabelsOf(question: GuideQuestion): readonly string[] {
+  const answer = question.answer;
+  if (answer === null) return [];
+  return answer.selectedOptionLabels ?? guideOptionLabelsOf(question, answer.optionIds);
 }
 
 /** Whether a question's target has moved since the question was written. */

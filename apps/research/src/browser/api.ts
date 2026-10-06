@@ -114,8 +114,23 @@ export interface GuideOptionView {
   readonly recommended?: boolean;
 }
 
+/**
+ * What one user action may still spend.
+ *
+ * It is the action's own allowance — the answer to「这次补查还能查多少」— not
+ * what is left of the project, which has its own budget for the agent's own
+ * research.
+ */
+export interface ActionBudgetView {
+  readonly searchesRemaining: number;
+  readonly readsRemaining: number;
+  readonly gapRoundsRemaining: number;
+}
+
 export interface GuideQuestionView {
   readonly questionId: string;
+  /** The conversation's transition into this question; empty when there is none. */
+  readonly leadIn: string;
   readonly question: string;
   readonly whyThisMatters: string;
   readonly fieldTargets: readonly BriefFieldName[];
@@ -125,12 +140,21 @@ export interface GuideQuestionView {
   readonly createdAt: string;
 }
 
-/** A decision already made through Guided Mode, for the page's own record. */
+/**
+ * A decision already made through Guided Mode, for the page's own record.
+ *
+ * It carries what a conversation shows (`answerText`, `selectedOptionLabels`,
+ * `leadIn`) as well as the ids an audit needs, so a page never has to re-open
+ * an old question to say what the user chose.
+ */
 export interface GuideDecisionView {
   readonly questionId: string;
+  readonly leadIn: string;
   readonly question: string;
   readonly fieldTargets: readonly BriefFieldName[];
   readonly optionIds: readonly string[];
+  readonly selectedOptionLabels: readonly string[];
+  readonly answerText: string;
   readonly freeText: string;
   readonly appliedFields: readonly BriefFieldName[];
   readonly resultingBriefVersion: number;
@@ -178,11 +202,23 @@ export interface BriefView {
   readonly editableFields: readonly BriefFieldName[];
   readonly fieldStates: BriefFieldStates;
   readonly validation: { readonly valid: boolean; readonly problems: readonly string[] };
+  /**
+   * Whether the user may start research now.
+   *
+   * Guided planning is a conversation, not a gate: below the floor the *agent*
+   * may not stop asking, and the user may still confirm a valid draft.
+   */
+  readonly canConfirm: boolean;
   readonly guide: {
     readonly complete: boolean;
     readonly reason: string;
     /** The most decisions Guided Mode will ask for; the page never assumes one. */
     readonly limit: number;
+    /** The floor: below this many real decisions, the agent may not stop. */
+    readonly minDecisions: number;
+    readonly maxDecisions: number;
+    /** Decisions the user has really made: guided answers plus their own edits. */
+    readonly readiness: number;
     readonly decisions: readonly GuideDecisionView[];
     readonly active: GuideQuestionView | null;
   };
@@ -603,7 +639,13 @@ export const api = {
   assistant: (
     taskId: string,
     body: { readonly text: string; readonly intent?: string; readonly targetSectionId?: string | null },
-  ): Promise<{ readonly ok: boolean; readonly started: string; readonly scope: string }> =>
+  ): Promise<{
+    readonly ok: boolean;
+    readonly started: string;
+    readonly scope: string;
+    /** The allowance of *this* instruction, for a Research action. */
+    readonly actionBudget?: ActionBudgetView;
+  }> =>
     request(`/api/research/tasks/${encodeURIComponent(taskId)}/assistant`, {
       method: "POST",
       body: JSON.stringify(body),

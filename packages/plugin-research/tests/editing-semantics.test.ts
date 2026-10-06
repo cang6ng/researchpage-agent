@@ -16,7 +16,7 @@ import { describe, expect, it } from "vitest";
 
 import { openResearchRepository, type ResearchRepository } from "../src/repository.js";
 import { createResearchService, type ResearchService } from "../src/service.js";
-import { classifyIntent } from "../src/semantics.js";
+import { classifyIntent, USER_RESEARCH_BUDGET } from "../src/semantics.js";
 import { renderRevisionHtml } from "../src/render.js";
 import { reportContentHash } from "../src/report.js";
 import type { ReadOutcome } from "../src/read.js";
@@ -905,6 +905,253 @@ describe("the report structure is fixed by the task", () => {
         section: { id: "invented-section", title: "自造章节", blocks: [] },
       });
       expect(part.ok).toBe(false);
+    } finally {
+      harness.close();
+    }
+  });
+});
+
+/**
+ * The user's own research budget.
+ *
+ * The project's budget exists to stop the *agent* researching forever on its
+ * own initiative. A person saying「再补查一些资料」is a different act, and it is
+ * bounded differently: one instruction may spend a little, and the next
+ * instruction gets its own allowance. Reading the two budgets as one is what
+ * made a finished project unable to answer the user at all.
+ */
+describe("J. a user action has its own budget, separate from the project's", () => {
+  /** The grant the application mints when a person asks for research. */
+  function asUser(harness: Harness, budget = USER_RESEARCH_BUDGET): void {
+    harness.service.issueGrant({
+      sessionId: SESSION,
+      intent: "research",
+      taskId: harness.taskId,
+      allowResearch: true,
+      origin: "user",
+      budget,
+    });
+  }
+
+  /** A project that has spent its automatic rounds and searches. */
+  function spentProject(harness: Harness, options: { readonly pastDeadline?: boolean } = {}): void {
+    const task = harness.service.getTask(harness.taskId)!;
+    harness.repo.updateTask({
+      ...task,
+      usage: {
+        ...task.usage,
+        gapRounds: task.budget.maxGapRounds,
+        searches: task.budget.maxSearches,
+        // The harness's clock is fixed, so "an hour ago" is a project whose
+        // research deadline passed long before the person came back to it.
+        ...(options.pastDeadline === true ? { startedAt: "2026-10-05T11:00:00.000Z" } : {}),
+      },
+    });
+  }
+
+  /** Unread sources to spend reads on, when the search fixture runs dry. */
+  function seedSources(harness: Harness, count: number): void {
+    for (let index = 0; index < count; index += 1) {
+      harness.repo.addSource({
+        id: `src_seeded_${index}`,
+        taskId: harness.taskId,
+        title: `Seeded fixture ${index}`,
+        authors: ["A. Author"],
+        org: "",
+        url: `https://arxiv.org/abs/2499.0000${index}`,
+        pdfUrl: null,
+        doi: null,
+        publishedAt: "2024-01-01T00:00:00Z",
+        venue: "arXiv",
+        abstract: "A seeded source for the budget tests.",
+        discovery: { provider: "arxiv", query: "seeded", queriedAt: "2026-10-05T12:00:00.000Z", target: null },
+        readStatus: "not_read",
+        readScope: null,
+        readAt: null,
+        readUrl: null,
+        retrievalNote: "",
+        failure: null,
+        snapshotId: null,
+      });
+    }
+  }
+
+  it("runs on a project whose automatic budget and deadline are spent, without touching the report (I, M, O)", async () => {
+    const harness = open();
+    try {
+      const { evidenceIds, cell } = await research(harness);
+      withReport(harness, evidenceIds);
+      const fingerprint = reportFingerprint(harness);
+      seedSources(harness, 1);
+      spentProject(harness, { pastDeadline: true });
+
+      asUser(harness);
+      const found = await harness.service.search(harness.taskId, { query: "user asked for more", limit: 2 });
+      expect(found.ok).toBe(true);
+      if (!found.ok) return;
+      expect(found.budgetScope).toBe("user-action");
+      expect(found.searchesRemaining).toBe(USER_RESEARCH_BUDGET.maxSearches - 1);
+
+      const task = harness.service.getTask(harness.taskId)!;
+      const unread = harness.service.sourcesOf(harness.taskId).find((source) => source.snapshotId === null);
+      if (unread === undefined) throw new Error("expected an unread source");
+      const read = await harness.service.read(harness.taskId, {
+        sourceId: unread.id,
+        question: "用户问的构建成本",
+        terms: ["cost", "construction"],
+        targetCell: cell,
+        role: "primary",
+      });
+      expect(read.ok).toBe(true);
+      if (!read.ok) return;
+      expect(read.budgetScope).toBe("user-action");
+      expect(read.readsRemaining).toBe(USER_RESEARCH_BUDGET.maxReads - 1);
+
+      const assessed = harness.service.assess(harness.taskId, {
+        proposals: [
+          {
+            cell,
+            evidenceIds: read.evidence.map((entry) => entry.evidenceId),
+            relationship: "supports",
+            directness: "direct",
+            scope: "用户补查得到的材料。",
+          },
+        ],
+        gapRound: true,
+      });
+      expect(assessed.ok).toBe(true);
+      if (!assessed.ok) return;
+      expect(assessed.budgetScope).toBe("user-action");
+      harness.service.clearGrant(SESSION);
+
+      // The user's errand spent the action's allowance and nothing else.
+      const after = harness.service.getTask(harness.taskId)!;
+      expect(after.usage.searches).toBe(task.budget.maxSearches + 1);
+      expect(after.usage.gapRounds).toBe(task.budget.maxGapRounds);
+
+      // And the report is untouched: material changed, the text did not.
+      expect(harness.service.contentHashOf(harness.taskId)).toBe(fingerprint.hash);
+      expect(harness.service.getTask(harness.taskId)?.currentReportId).toBe(fingerprint.id);
+      expect(after.reportNeedsReview?.reason).toContain("复核");
+      expect(harness.service.evidenceOf(harness.taskId).length).toBeGreaterThan(fingerprint.evidenceCount);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("bounds one instruction's searches and reads, refusing only that action's extras (case J)", async () => {
+    const harness = open();
+    try {
+      seedSources(harness, USER_RESEARCH_BUDGET.maxReads + 1);
+      asUser(harness);
+
+      const searches = [];
+      for (const query of ["first", "second", "third"]) {
+        searches.push(await harness.service.search(harness.taskId, { query }));
+      }
+      expect(searches.map((entry) => entry.ok)).toEqual([true, true, false]);
+      const refusedSearch = searches[2]!;
+      if (!refusedSearch.ok) {
+        expect(refusedSearch.problems.join("；")).toContain(
+          `本次补查的检索次数已用完（${USER_RESEARCH_BUDGET.maxSearches}/${USER_RESEARCH_BUDGET.maxSearches}）`,
+        );
+      }
+
+      const sources = harness.service.sourcesOf(harness.taskId);
+      const reads = [];
+      for (const source of sources) {
+        reads.push(
+          await harness.service.read(harness.taskId, { sourceId: source.id, question: "预算测试", terms: ["fixture"] }),
+        );
+      }
+      expect(reads.filter((entry) => entry.ok)).toHaveLength(USER_RESEARCH_BUDGET.maxReads);
+      const refusedRead = reads[USER_RESEARCH_BUDGET.maxReads]!;
+      expect(refusedRead.ok).toBe(false);
+      if (!refusedRead.ok) {
+        expect(refusedRead.problems.join("；")).toContain(
+          `本次补查的读取次数已用完（${USER_RESEARCH_BUDGET.maxReads}/${USER_RESEARCH_BUDGET.maxReads}）`,
+        );
+      }
+
+      // What was refused is this action's extra call, not the project's last
+      // resort: the task's own counters have barely moved.
+      const task = harness.service.getTask(harness.taskId)!;
+      expect(task.usage.searches).toBe(2);
+      expect(task.usage.reads).toBe(USER_RESEARCH_BUDGET.maxReads);
+      expect(task.usage.searches).toBeLessThan(task.budget.maxSearches);
+      expect(harness.service.actionBudgetOf(SESSION)).toEqual({ searchesRemaining: 0, readsRemaining: 0, gapRoundsRemaining: 2 });
+      harness.service.clearGrant(SESSION);
+      expect(harness.service.actionBudgetOf(SESSION)).toBeUndefined();
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("gives the next user instruction a fresh budget (case K)", async () => {
+    const harness = open();
+    try {
+      asUser(harness);
+      await harness.service.search(harness.taskId, { query: "first action" });
+      await harness.service.search(harness.taskId, { query: "first action again" });
+      expect(harness.service.actionBudgetOf(SESSION)?.searchesRemaining).toBe(0);
+      harness.service.clearGrant(SESSION);
+
+      // A project that is out of automatic budget, and the user asks again.
+      spentProject(harness);
+      asUser(harness);
+      expect(harness.service.actionBudgetOf(SESSION)?.searchesRemaining).toBe(USER_RESEARCH_BUDGET.maxSearches);
+      const again = await harness.service.search(harness.taskId, { query: "second action" });
+      expect(again.ok).toBe(true);
+      harness.service.clearGrant(SESSION);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("counts its own assessment round, and never the project's gap rounds (case L)", async () => {
+    const harness = open();
+    try {
+      const { evidenceIds, cell } = await research(harness);
+      spentProject(harness);
+      asUser(harness);
+
+      const assessed = harness.service.assess(harness.taskId, {
+        proposals: [
+          { cell, evidenceIds: evidenceIds.slice(0, 1), relationship: "supports", directness: "direct", scope: "补查材料。" },
+        ],
+        gapRound: true,
+      });
+      expect(assessed.ok).toBe(true);
+      if (!assessed.ok) return;
+      expect(assessed.budgetScope).toBe("user-action");
+      expect(assessed.gapRoundsUsed).toBe(1);
+      expect(harness.service.getTask(harness.taskId)!.usage.gapRounds).toBe(2);
+      harness.service.clearGrant(SESSION);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("leaves the automatic pipeline bounded by the project's own budget (case N)", async () => {
+    const harness = open();
+    try {
+      const { evidenceIds, cell } = await research(harness);
+      spentProject(harness);
+      harness.service.issueGrant({ sessionId: SESSION, intent: "research", taskId: harness.taskId, allowResearch: true });
+
+      const searched = await harness.service.search(harness.taskId, { query: "the pipeline tries again" });
+      expect(searched.ok).toBe(false);
+      if (!searched.ok) expect(searched.problems.join("；")).toContain("搜索次数已达上限");
+
+      const assessed = harness.service.assess(harness.taskId, {
+        proposals: [
+          { cell, evidenceIds: evidenceIds.slice(0, 1), relationship: "supports", directness: "direct", scope: "补查材料。" },
+        ],
+        gapRound: true,
+      });
+      expect(assessed.ok).toBe(false);
+      if (!assessed.ok) expect(assessed.problems.join("；")).toContain("定向补查轮次已达上限");
+      harness.service.clearGrant(SESSION);
     } finally {
       harness.close();
     }

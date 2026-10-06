@@ -52,7 +52,7 @@ import {
 } from "./proposal.js";
 import { readSource, type ReadOutcome } from "./read.js";
 import { newId, type ResearchRepository } from "./repository.js";
-import { createGrant, type ActionCapability, type ActionGrant, type GrantInput } from "./semantics.js";
+import { createGrant, EMPTY_ACTION_USAGE, type ActionCapability, type ActionGrant, type ActionUsage, type GrantInput } from "./semantics.js";
 import { searchArxiv, type SearchOutcome } from "./search.js";
 import { buildMatrix, createTask, normalizeCard, slugId, STRUCTURE_SECTIONS, type ProposedCard } from "./structure.js";
 import { TECHNICAL_COMPARISON_V2, blueprintSections } from "./blueprint.js";
@@ -67,8 +67,14 @@ import {
   briefWithApplication,
   EDITABLE_BRIEF_FIELDS,
   fieldTakesFreeText,
-  GUIDE_DECISION_LIMIT,
+  GUIDE_LEAD_IN_LIMIT,
+  GUIDE_MAX_DECISIONS,
+  GUIDE_MIN_DECISIONS,
+  guideAnswerLabelsOf,
+  guideAnswerTextOf,
+  guideLeadInOf,
   guideQuestionIsStale,
+  guideReadinessDecisions,
   isStructural,
   lockedFieldStates,
   nextGuideTarget,
@@ -155,6 +161,8 @@ export interface SearchResult {
   readonly total: number | null;
   readonly searchCount: number;
   readonly searchesRemaining: number;
+  /** Which budget `searchesRemaining` belongs to. */
+  readonly budgetScope: BudgetScope;
   readonly note: string;
 }
 
@@ -178,6 +186,8 @@ export interface ReadResult {
     readonly pickedBecause: string;
   }[];
   readonly readsRemaining: number;
+  /** Which budget `readsRemaining` belongs to. */
+  readonly budgetScope: BudgetScope;
   readonly note: string;
 }
 
@@ -197,7 +207,32 @@ export interface AssessResult {
   readonly gaps: readonly CellView[];
   readonly gapRoundsUsed: number;
   readonly gapRoundsRemaining: number;
+  /** Which budget the counts above belong to: the project's, or this action's. */
+  readonly budgetScope: BudgetScope;
   readonly note: string;
+}
+
+/**
+ * Which budget a spend is counted against.
+ *
+ * `project` is the task's own pipeline budget — the initial pass and the gap
+ * rounds the program schedules for itself. `user-action` is the budget of one
+ * instruction the person gave, which is why the same tool reports different
+ * remaining counts depending on who asked for the run it is serving.
+ */
+export type BudgetScope = "project" | "user-action";
+
+/**
+ * What one action may still spend, as the workspace reads it.
+ *
+ * It answers「这次补查还能查多少」rather than「这个项目还剩多少」: the numbers
+ * belong to the instruction the person gave, and they are what the workspace
+ * shows next to the action instead of a project-lifetime remainder.
+ */
+export interface ActionBudgetView {
+  readonly searchesRemaining: number;
+  readonly readsRemaining: number;
+  readonly gapRoundsRemaining: number;
 }
 
 export interface AcceptProposalResult {
@@ -293,6 +328,8 @@ export interface GuideOptionView {
 /** The question Guided Mode is currently asking, if any. */
 export interface GuideQuestionView {
   readonly questionId: string;
+  /** The conversation's transition into this question; empty when there is none. */
+  readonly leadIn: string;
   readonly question: string;
   readonly whyThisMatters: string;
   readonly fieldTargets: readonly BriefFieldName[];
@@ -302,12 +339,22 @@ export interface GuideQuestionView {
   readonly createdAt: string;
 }
 
-/** A decision the user already made through Guided Mode. */
+/**
+ * A decision the user already made through Guided Mode.
+ *
+ * It carries both what the conversation needs and what an audit needs: the
+ * ids stay, so a stored decision can be checked against the question that
+ * produced it, and the text and labels travel with it, so a conversation view
+ * never has to re-open an old question to say what the user chose.
+ */
 export interface GuideDecisionView {
   readonly questionId: string;
+  readonly leadIn: string;
   readonly question: string;
   readonly fieldTargets: readonly BriefFieldName[];
   readonly optionIds: readonly string[];
+  readonly selectedOptionLabels: readonly string[];
+  readonly answerText: string;
   readonly freeText: string;
   readonly appliedFields: readonly BriefFieldName[];
   readonly resultingBriefVersion: number;
@@ -352,6 +399,14 @@ export interface BriefView {
   readonly editableFields: readonly BriefFieldName[];
   readonly fieldStates: BriefFieldStates;
   readonly validation: BriefValidation;
+  /**
+   * Whether the user may start research now.
+   *
+   * Guided planning never gates this: a person who is satisfied after two
+   * questions confirms the draft and gets their report. It is the *agent* that
+   * may not stop early, not the user.
+   */
+  readonly canConfirm: boolean;
   readonly guide: {
     /** True when Guided Mode has nothing further worth asking. */
     readonly complete: boolean;
@@ -359,6 +414,11 @@ export interface BriefView {
     readonly reason: string;
     /** How many decisions Guided Mode asks for at most, so a page need not guess. */
     readonly limit: number;
+    /** The floor: below this many real decisions, guided planning cannot end. */
+    readonly minDecisions: number;
+    readonly maxDecisions: number;
+    /** Decisions a person has really made: guided answers plus their own edits. */
+    readonly readiness: number;
     readonly decisions: readonly GuideDecisionView[];
     readonly active: GuideQuestionView | null;
   };
@@ -403,7 +463,10 @@ export interface GuideTargetDecision {
   readonly complete: boolean;
   readonly reason: string;
   readonly target: GuideTarget | null;
+  /** How many guided questions have been answered. */
   readonly answered: number;
+  /** How many decisions a person has really made; the depth contract's subject. */
+  readonly readiness: number;
 }
 
 /** A refusal that also hands back the current brief, so a client can resync. */
@@ -526,6 +589,14 @@ export interface ResearchService {
    */
   issueGrant(input: GrantInput): ActionGrant;
   activeGrant(sessionId: string): ActionGrant | undefined;
+  /**
+   * What the session's in-flight *user* action may still spend.
+   *
+   * Undefined when what is running is the program's own work: a pipeline stage
+   * is bounded by the task's budget, and reporting an action remainder for it
+   * would answer a question nobody asked.
+   */
+  actionBudgetOf(sessionId: string): ActionBudgetView | undefined;
   clearGrant(sessionId: string): void;
 
   // ------------------------------------------------------------ assessments --
@@ -625,6 +696,32 @@ export function createResearchService(options: ResearchServiceOptions): Research
    * record of what was done — a proposal names the action that produced it.
    */
   const grants = new Map<string, ActionGrant>();
+
+  /**
+   * What each live grant has spent, keyed by the grant itself.
+   *
+   * It is process memory on purpose. A grant is permission to write *now*, and
+   * it dies with the process; a usage counter that outlived it would be a
+   * permission nobody holds. There is deliberately no quota ledger: the
+   * project's own ledger (`task.usage`) is what survives, and it is the
+   * pipeline's, not a user action's.
+   */
+  const actionUsage = new Map<string, ActionUsage>();
+
+  function usageOf(grant: ActionGrant): ActionUsage {
+    return actionUsage.get(grant.id) ?? EMPTY_ACTION_USAGE;
+  }
+
+  function spend(grant: ActionGrant, what: "searches" | "reads" | "gapRounds"): void {
+    const usage = usageOf(grant);
+    actionUsage.set(grant.id, { ...usage, [what]: usage[what] + 1 });
+  }
+
+  /** The action budget governing this task's session, when one is a user's. */
+  function userActionOf(task: ReportTask): ActionGrant | undefined {
+    const grant = grants.get(task.sessionId);
+    return grant !== undefined && grant.origin === "user" ? grant : undefined;
+  }
 
   const CAPABILITY_TEXT: Readonly<Record<ActionCapability, string>> = Object.freeze({
     card: "建立任务卡",
@@ -757,7 +854,55 @@ export function createResearchService(options: ResearchServiceOptions): Research
     };
   }
 
+  /**
+   * The refusal a spend earns when the budget that governs it is used up.
+   *
+   * Two budgets meet here, and they bound different things. The pipeline's is
+   * the task's: a wall-clock deadline, a search count, a read count and a gap
+   * round count that together stop the agent from researching forever on its own
+   * initiative. A user action's is its own grant's: one instruction, bounded so
+   * that「再查一下」cannot turn into six searches and ten reads, and *not* bound
+   * by how long ago the project started — a finished project from this morning
+   * is exactly the thing someone asks to dig further into.
+   */
   function budgetRefusal(task: ReportTask, what: string, guidance: string): Refusal | undefined {
+    const action = userActionOf(task);
+    if (action !== undefined) {
+      const usage = usageOf(action);
+      switch (what) {
+        case "search":
+          if (usage.searches >= action.budget.maxSearches) {
+            return {
+              ok: false,
+              problems: [`本次补查的检索次数已用完（${usage.searches}/${action.budget.maxSearches}）`],
+              guidance:
+                "这次动作只允许这么多次检索：请读取已有候选，并用 assess_coverage 评估覆盖情况；需要继续检索时由用户再发起一次补查。",
+            };
+          }
+          break;
+        case "read":
+          if (usage.reads >= action.budget.maxReads) {
+            return {
+              ok: false,
+              problems: [`本次补查的读取次数已用完（${usage.reads}/${action.budget.maxReads}）`],
+              guidance:
+                "这次动作只允许读这么多个来源：请基于已读材料评估矩阵，缺依据的项目如实标注；需要继续读取时由用户再发起一次补查。",
+            };
+          }
+          break;
+        case "gap":
+          if (usage.gapRounds >= action.budget.maxGapRounds) {
+            return {
+              ok: false,
+              problems: [`本次补查的评估轮次已用完（${usage.gapRounds}/${action.budget.maxGapRounds}）`],
+              guidance: "请在本次动作内收尾：把已获得的材料写进评估，缺口如实保留。",
+            };
+          }
+          break;
+      }
+      return undefined;
+    }
+
     const started = task.usage.startedAt;
     if (started !== undefined) {
       const elapsed = now().getTime() - new Date(started).getTime();
@@ -994,27 +1139,31 @@ export function createResearchService(options: ResearchServiceOptions): Research
 
   /** What Guided Mode would ask about next, and why it stopped when it did. */
   function guideTargetDecision(task: ReportTask): GuideTargetDecision {
+    const readiness = guideReadinessDecisions(task);
     if (task.confirmedAt !== null) {
-      return { complete: true, reason: "研究简报已确认，引导式规划结束", target: null, answered: 0 };
+      return { complete: true, reason: "研究简报已确认，引导式规划结束", target: null, answered: 0, readiness };
     }
     const answered = answeredGuideDecisions(task.id).length;
     const closed = task.guideClosed ?? null;
     if (closed !== null) {
-      return { complete: true, reason: closed.reason, target: null, answered };
+      return { complete: true, reason: closed.reason, target: null, answered, readiness };
     }
     const target = nextGuideTarget({ task, answered });
     if (target === undefined) {
       return {
         complete: true,
         reason:
-          answered >= GUIDE_DECISION_LIMIT
-            ? `已完成 ${answered} 个引导决策（上限 ${GUIDE_DECISION_LIMIT}）；其余字段可以随时直接编辑`
-            : "所有可引导的字段都已经由用户决定",
+          answered >= GUIDE_MAX_DECISIONS
+            ? `已完成 ${answered} 个关键决策（上限 ${GUIDE_MAX_DECISIONS}）；其余字段可以随时直接编辑`
+            : readiness >= GUIDE_MIN_DECISIONS
+              ? `已完成 ${readiness} 个关键决策，其余可引导的字段也已经由用户决定`
+              : "所有可引导的字段都已经由用户决定",
         target: null,
         answered,
+        readiness,
       };
     }
-    return { complete: false, reason: "", target, answered };
+    return { complete: false, reason: "", target, answered, readiness };
   }
 
   function optionViewOf(option: GuideOption): GuideOptionView {
@@ -1030,6 +1179,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
   function briefViewOf(task: ReportTask): BriefView {
     const blueprint = briefBlueprintOf(task);
     const decision = guideTargetDecision(task);
+    const validation = validateBriefDraft(task);
     const active = repo.listGuideQuestions(task.id).find((question) => question.status === "active");
     return {
       taskId: task.id,
@@ -1062,16 +1212,26 @@ export function createResearchService(options: ResearchServiceOptions): Research
       reportStructure: briefStructureView(task),
       editableFields: EDITABLE_BRIEF_FIELDS,
       fieldStates: briefFieldStatesOf(task),
-      validation: validateBriefDraft(task),
+      validation,
+      // Guided planning is a conversation, not a gate: a user who is satisfied
+      // confirms the draft whenever they like, and the floor only binds the
+      // agent's own decision to stop asking.
+      canConfirm: task.confirmedAt === null && validation.valid,
       guide: {
         complete: decision.complete,
         reason: decision.reason,
-        limit: GUIDE_DECISION_LIMIT,
+        limit: GUIDE_MAX_DECISIONS,
+        minDecisions: GUIDE_MIN_DECISIONS,
+        maxDecisions: GUIDE_MAX_DECISIONS,
+        readiness: decision.readiness,
         decisions: answeredGuideDecisions(task.id).map((question) => ({
           questionId: question.id,
+          leadIn: guideLeadInOf(question),
           question: question.question,
           fieldTargets: question.fieldTargets,
           optionIds: question.answer?.optionIds ?? [],
+          selectedOptionLabels: guideAnswerLabelsOf(question),
+          answerText: guideAnswerTextOf(question),
           freeText: question.answer?.freeText ?? "",
           appliedFields: question.answer?.appliedFields ?? [],
           resultingBriefVersion: question.answer?.resultingBriefVersion ?? question.basedOnBriefVersion,
@@ -1082,6 +1242,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
             ? null
             : {
                 questionId: active.id,
+                leadIn: guideLeadInOf(active),
                 question: active.question,
                 whyThisMatters: active.whyThisMatters,
                 fieldTargets: active.fieldTargets,
@@ -1101,12 +1262,18 @@ export function createResearchService(options: ResearchServiceOptions): Research
     | {
         readonly ok: true;
         readonly complete: false;
+        readonly leadIn: string;
         readonly question: string;
         readonly whyThisMatters: string;
         readonly fieldTargets: readonly BriefFieldName[];
         readonly options: readonly GuideOption[];
       }
     | { readonly ok: false; readonly problems: readonly string[] };
+
+  /** Whether a piece of prose the model wrote has markup in it. */
+  function looksLikeHtml(text: string): boolean {
+    return /<\/?[a-zA-Z][^>]*>/.test(text);
+  }
 
   /**
    * Reads the question a guide stage wrote, and checks it against the draft.
@@ -1129,6 +1296,13 @@ export function createResearchService(options: ResearchServiceOptions): Research
     }
 
     const problems: string[] = [];
+    // The lead-in is conversation, not a decision: it is optional, capped and
+    // plain. Markdown prose is fine — the workspace renders it with the same
+    // sanitizing renderer every other model text goes through — but markup is
+    // refused here rather than rendered and trusted later.
+    const leadIn = typeof record["leadIn"] === "string" ? record["leadIn"].trim() : "";
+    if (leadIn.length > GUIDE_LEAD_IN_LIMIT) problems.push(`leadIn 过长（>${GUIDE_LEAD_IN_LIMIT} 字）`);
+    if (looksLikeHtml(leadIn)) problems.push("leadIn 只能是普通文本或 Markdown，不要包含 HTML 标签");
     const question = typeof record["question"] === "string" ? record["question"].trim() : "";
     if (question.length === 0) problems.push("缺少 question");
     if (question.length > 400) problems.push("question 过长（>400 字）");
@@ -1192,7 +1366,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
     });
 
     if (problems.length > 0) return { ok: false, problems };
-    return { ok: true, complete: false, question, whyThisMatters, fieldTargets, options };
+    return { ok: true, complete: false, leadIn, question, whyThisMatters, fieldTargets, options };
   }
 
   return {
@@ -1355,6 +1529,21 @@ export function createResearchService(options: ResearchServiceOptions): Research
         };
       }
       if (reading.complete) {
+        // The depth contract: until enough decisions have really been made, the
+        // agent has no authority to end the conversation. The refusal is a
+        // result rather than an exception, so the run it happens in can answer
+        // with a real question instead — and nothing here closes the guide.
+        if (decision.readiness < GUIDE_MIN_DECISIONS) {
+          return {
+            ok: false,
+            problems: [
+              `当前只完成 ${decision.readiness}/${GUIDE_MIN_DECISIONS} 个关键决策，还不能结束引导式规划（complete 被拒绝）`,
+            ],
+            guidance:
+              `请继续围绕程序指定的字段 ${decision.target.field}（${decision.target.ask}）生成一个真正有区分度的问题，并再次调用 propose_guide_question；` +
+              "只有用户自己可以直接开始研究，Agent 不能替他提前结束。",
+          };
+        }
         const at = isoNow();
         updateTask(task, { guideClosed: { at, reason: reading.reason }, briefUpdatedAt: at });
         return { ok: true, complete: true, reason: reading.reason, question: null };
@@ -1372,6 +1561,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
       const record: GuideQuestion = {
         id: newId(ID_PREFIX.guide),
         taskId: task.id,
+        ...(reading.leadIn.length === 0 ? {} : { leadIn: reading.leadIn }),
         question: reading.question,
         whyThisMatters: reading.whyThisMatters,
         fieldTargets: reading.fieldTargets,
@@ -1467,9 +1657,18 @@ export function createResearchService(options: ResearchServiceOptions): Research
       const changed = applyBriefChange(task, patch, "confirmed", isoNow());
       if (!changed.ok) return changed;
 
+      // What the person chose is recorded in the words they chose it in: the
+      // labels of the options they picked, or what they typed. A conversation
+      // view reads the decision back without re-opening the question, and the
+      // ids stay for the audit trail.
+      const labels = question.options
+        .filter((option) => chosen.includes(option.optionId))
+        .map((option) => option.label);
       const answer: GuideAnswerRecord = {
         optionIds: chosen,
         freeText,
+        selectedOptionLabels: labels,
+        answerText: freeText.length > 0 ? freeText : labels.join("、"),
         appliedFields: changed.fields,
         resultingBriefVersion: briefVersionOf(changed.task),
         at: isoNow(),
@@ -1562,8 +1761,14 @@ export function createResearchService(options: ResearchServiceOptions): Research
         });
       }
 
+      // The task's counter is cumulative telemetry and always moves; which
+      // budget *refuses the next call* is the thing that differs, so the
+      // remaining count is reported against whichever one governs this run.
       const searches = task.usage.searches + 1;
       updateTask(task, { usage: { ...task.usage, searches } });
+      const action = userActionOf(task);
+      if (action !== undefined) spend(action, "searches");
+      const actionUsage = action === undefined ? undefined : usageOf(action);
 
       return {
         ok: true,
@@ -1572,7 +1777,11 @@ export function createResearchService(options: ResearchServiceOptions): Research
         requestUrl: outcome.requestUrl,
         total: outcome.total,
         searchCount: searches,
-        searchesRemaining: Math.max(0, task.budget.maxSearches - searches),
+        searchesRemaining:
+          action === undefined || actionUsage === undefined
+            ? Math.max(0, task.budget.maxSearches - searches)
+            : Math.max(0, action.budget.maxSearches - actionUsage.searches),
+        budgetScope: action === undefined ? "project" : "user-action",
         note:
           created.length === 0
             ? "本次检索没有返回候选：请换英文关键词或更基础的术语。搜索结果只是候选，不是依据。"
@@ -1615,7 +1824,9 @@ export function createResearchService(options: ResearchServiceOptions): Research
         const refusal = budgetRefusal(task, "read", "");
         if (refusal !== undefined) return refusal;
 
+        const grant = userActionOf(task);
         const outcome = await readImpl({ url: source.url }, input.signal === undefined ? {} : { signal: input.signal });
+        if (grant !== undefined) spend(grant, "reads");
         const reads = task.usage.reads + 1;
         if (outcome.status === "failed" || outcome.scope === null) {
           repo.updateSource({
@@ -1709,6 +1920,8 @@ export function createResearchService(options: ResearchServiceOptions): Research
         );
       }
       const refreshed = requireTask(task.id);
+      const action = userActionOf(refreshed);
+      const actionUsage = action === undefined ? undefined : usageOf(action);
 
       return {
         ok: true,
@@ -1728,7 +1941,11 @@ export function createResearchService(options: ResearchServiceOptions): Research
           scope: scopeLabel(evidence.readScope),
           pickedBecause: evidence.pickedBecause,
         })),
-        readsRemaining: Math.max(0, refreshed.budget.maxReads - refreshed.usage.reads),
+        readsRemaining:
+          action === undefined || actionUsage === undefined
+            ? Math.max(0, refreshed.budget.maxReads - refreshed.usage.reads)
+            : Math.max(0, action.budget.maxReads - actionUsage.reads),
+        budgetScope: action === undefined ? "project" : "user-action",
         note: `${note}（读取范围：${scopeLabel(snapshot.scope)}；excerpt 均为保存文本中的原样片段）`,
       };
     },
@@ -1740,7 +1957,16 @@ export function createResearchService(options: ResearchServiceOptions): Research
       if (input.gapRound === true) {
         const refusal = budgetRefusal(task, "gap", "");
         if (refusal !== undefined) return refusal;
-        task = updateTask(task, { usage: { ...task.usage, gapRounds: task.usage.gapRounds + 1 } });
+        const action = userActionOf(task);
+        if (action === undefined) {
+          task = updateTask(task, { usage: { ...task.usage, gapRounds: task.usage.gapRounds + 1 } });
+        } else {
+          // `gapRound` counts the pipeline's own rounds: how many times the
+          // agent decided on its own to go back for more. A round a person
+          // asked for is not one of those, and letting it bump the counter
+          // would spend the automatic budget on the user's errand.
+          spend(action, "gapRounds");
+        }
       }
 
       const allEvidence = repo.listEvidence(task.id);
@@ -1810,13 +2036,20 @@ export function createResearchService(options: ResearchServiceOptions): Research
       const gaps = views
         .filter((cell) => needsAttention(cell.status))
         .sort((a, b) => (a.status === b.status ? 0 : a.status === "missing" ? -1 : 1));
+      const action = userActionOf(task);
+      const actionUsage = action === undefined ? undefined : usageOf(action);
 
       return {
         ok: true,
         cells: views,
         gaps,
-        gapRoundsUsed: task.usage.gapRounds,
-        gapRoundsRemaining: Math.max(0, task.budget.maxGapRounds - task.usage.gapRounds),
+        gapRoundsUsed:
+          action === undefined || actionUsage === undefined ? task.usage.gapRounds : actionUsage.gapRounds,
+        gapRoundsRemaining:
+          action === undefined || actionUsage === undefined
+            ? Math.max(0, task.budget.maxGapRounds - task.usage.gapRounds)
+            : Math.max(0, action.budget.maxGapRounds - actionUsage.gapRounds),
+        budgetScope: action === undefined ? "project" : "user-action",
         note:
           gaps.length === 0
             ? "所有单元格都已有评估过的正文级支持。若有新增材料，可用 read_source 继续增强。"
@@ -2054,11 +2287,29 @@ export function createResearchService(options: ResearchServiceOptions): Research
 
     issueGrant(input) {
       const grant = createGrant({ ...input, now: input.now ?? isoNow() });
+      const previous = grants.get(grant.sessionId);
       grants.set(grant.sessionId, grant);
+      // A new grant starts with nothing spent, and the one it replaces leaves
+      // no counter behind: what a finished action used is not a budget anyone
+      // can still draw on.
+      actionUsage.set(grant.id, EMPTY_ACTION_USAGE);
+      if (previous !== undefined && previous.id !== grant.id) actionUsage.delete(previous.id);
       return grant;
     },
     activeGrant: (sessionId) => grants.get(sessionId),
+    actionBudgetOf(sessionId) {
+      const grant = grants.get(sessionId);
+      if (grant === undefined || grant.origin !== "user") return undefined;
+      const usage = usageOf(grant);
+      return {
+        searchesRemaining: Math.max(0, grant.budget.maxSearches - usage.searches),
+        readsRemaining: Math.max(0, grant.budget.maxReads - usage.reads),
+        gapRoundsRemaining: Math.max(0, grant.budget.maxGapRounds - usage.gapRounds),
+      };
+    },
     clearGrant(sessionId) {
+      const grant = grants.get(sessionId);
+      if (grant !== undefined) actionUsage.delete(grant.id);
       grants.delete(sessionId);
     },
 

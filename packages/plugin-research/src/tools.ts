@@ -478,6 +478,7 @@ export function createResearchTools(service: ResearchService): ResearchTools {
         gaps: result.gaps.slice(0, 6),
         gapRoundsUsed: result.gapRoundsUsed,
         gapRoundsRemaining: result.gapRoundsRemaining,
+        budgetScope: result.budgetScope,
         note: result.note,
       });
     },
@@ -487,7 +488,8 @@ export function createResearchTools(service: ResearchService): ResearchTools {
     name: "load_research_state",
     description:
       "读取当前研究任务的有界状态：任务卡、章节结构、比较对象、研究维度、证据矩阵（含缺口）、来源索引、证据索引、预算使用情况。" +
-      "用于在长任务中恢复上下文；不会返回全文。矩阵状态由真实证据与已保存评估推导，可以据此判断哪些维度还缺依据。",
+      "用于在长任务中恢复上下文；不会返回全文。矩阵状态由真实证据与已保存评估推导，可以据此判断哪些维度还缺依据。" +
+      "budget/usage 是项目的累计情况；actionBudget 是本次动作还剩多少（只在用户明确发起的补查/修改动作里非空，与项目预算分开计算，用完即止）。",
     inputSchema: { type: "object", properties: {}, required: [] },
     async execute(_input, context) {
       const binding = taskFor(context.sessionId);
@@ -535,8 +537,12 @@ export function createResearchTools(service: ResearchService): ResearchTools {
             locator: item.locator,
             excerpt: item.excerpt.length > 140 ? `${item.excerpt.slice(0, 140)}…` : item.excerpt,
           })),
+          // The project's totals are cumulative telemetry. What *this* run may
+          // still spend is a different number when the run is a user action,
+          // and it is reported separately so the two are never read as one.
           usage: state.usage,
           budget: state.budget,
+          actionBudget: service.actionBudgetOf(context.sessionId) ?? null,
           currentReportId: state.currentReportId,
           currentReportHash: state.currentReportHash,
           reportNeedsReview: state.reportNeedsReview,
@@ -854,16 +860,22 @@ export function createResearchTools(service: ResearchService): ResearchTools {
     name: "propose_guide_question",
     description:
       "为研究简报（Research Brief）写出下一个引导问题。一次只处理一个字段，字段由本次阶段的指令指定。\n" +
-      "输出形状：{ complete: false, question, whyThisMatters, fieldTargets, options }，" +
-      "其中 options 为 2–5 项，每项 { label, description?, recommended?, value }，" +
+      "输出形状：{ complete: false, leadIn, question, whyThisMatters, fieldTargets, options }，" +
+      "其中 leadIn 是 1–3 句自然语言过渡（先接住用户刚做出的决定，再说接下来要确认什么；不使用 HTML 标签），" +
+      "options 为 2–5 项，每项 { label, description?, recommended?, value }，" +
       "value 是该字段的最小取值 patch（例如 { \"audience\": \"研究生组会\" }），必须只包含 fieldTargets 里的字段，且是可以真正写进简报的取值。\n" +
-      "如果当前默认值已经足够具体、不值得占用用户的一次决定，返回 { complete: true, reason: \"...\" } 并说明理由。\n" +
+      "引导式规划至少要完成 5 个关键决策：在达到之前，服务端会拒绝 { complete: true }，你必须围绕指定字段提出一个真正有区分度的问题。\n" +
+      "只有确实已经问满 5 个关键决策（或所有可引导字段都已由用户决定），才允许返回 { complete: true, reason: \"...\" }。\n" +
       "不要输出 Markdown 或对话文本；不要调用其他工具。",
     inputSchema: {
       type: "object",
       properties: {
-        complete: { type: "boolean", description: "true 表示没有更值得确认的字段" },
+        complete: { type: "boolean", description: "true 表示关键决策已经问满、没有更值得确认的字段" },
         reason: { type: "string", description: "complete=true 时说明理由" },
+        leadIn: {
+          type: "string",
+          description: "1–3 句过渡语：先回应上一轮的决定，再说明接下来确认什么；只是对话呈现，不写入简报",
+        },
         question: { type: "string", description: "要问用户的问题（一次只问一个决策）" },
         whyThisMatters: { type: "string", description: "一句话说明它如何影响检索、比较框架或报告深度" },
         fieldTargets: {

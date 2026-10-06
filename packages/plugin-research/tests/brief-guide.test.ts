@@ -14,7 +14,13 @@ import { describe, expect, it } from "vitest";
 
 import { openResearchRepository, type ResearchRepository } from "../src/repository.js";
 import { createResearchService, type ResearchService } from "../src/service.js";
-import type { BriefFieldName, BriefPatch, GuideQuestion } from "../src/brief.js";
+import {
+  GUIDE_MAX_DECISIONS,
+  GUIDE_MIN_DECISIONS,
+  type BriefFieldName,
+  type BriefPatch,
+  type GuideQuestion,
+} from "../src/brief.js";
 import type { BriefView, GuideAnswerInput, GuideAnswerResult, PatchBriefResult } from "../src/service.js";
 import type { ReadOutcome } from "../src/read.js";
 import type { SearchOutcome } from "../src/search.js";
@@ -653,19 +659,23 @@ describe("H. Guided Mode asks one question at a time", () => {
     h.close();
   });
 
-  it("accepts a declaration that nothing further is worth asking", () => {
+  it("refuses the agent's own early completion while the depth floor is unmet", () => {
     const h = open();
     h.asGuide();
     const done = h.service.proposeGuideQuestion(h.taskId, { complete: true, reason: "默认方案已经足够具体" });
     h.service.clearGrant(SESSION);
-    expect(done.ok).toBe(true);
-    if (!done.ok) return;
-    expect(done.complete).toBe(true);
-    expect(h.service.activeGuideQuestion(h.taskId)).toBeUndefined();
-    expect(h.brief().guide.complete).toBe(true);
-    expect(h.brief().guide.reason).toBe("默认方案已经足够具体");
 
-    // And a completion without a reason is not a decision anyone can read.
+    // The judgement is the model's to make and this one is not accepted: no
+    // decision has been made yet, so there is nothing to be specific about.
+    expect(done.ok).toBe(false);
+    if (done.ok) return;
+    expect(done.problems.join("；")).toContain(`0/${GUIDE_MIN_DECISIONS}`);
+
+    // Nothing closed, and the conversation is still about the same field.
+    expect(h.brief().guide.complete).toBe(false);
+    expect(h.task().guideClosed ?? null).toBeNull();
+    expect(h.service.activeGuideQuestion(h.taskId)).toBeUndefined();
+    expect(h.service.guideTargetOf(h.taskId).target?.field).toBe("purpose");
     h.close();
   });
 
@@ -862,10 +872,10 @@ describe("K. Guided Mode reads the latest draft and never re-asks a decided fiel
     h.close();
   });
 
-  it("stops after the decision budget instead of becoming a wizard", () => {
+  it("closes the conversation itself at the ceiling instead of becoming a wizard", () => {
     const h = open();
     const answeredFields: BriefFieldName[] = [];
-    for (let step = 0; step < 5; step += 1) {
+    for (let step = 0; step < GUIDE_MAX_DECISIONS; step += 1) {
       const target = h.service.guideTargetOf(h.taskId);
       expect(target.complete).toBe(false);
       const field = target.target?.field;
@@ -874,12 +884,14 @@ describe("K. Guided Mode reads the latest draft and never re-asks a decided fiel
       answered(h, { questionId: question.id, optionIds: ["opt_2"] });
       answeredFields.push(field);
     }
-    expect(answeredFields).toEqual(["purpose", "audience", "subjects", "dimensions", "focus"]);
+    // The ladder asks the decisions that shape the research first, and the two
+    // that merely tune the output last.
+    expect(answeredFields).toEqual(["purpose", "audience", "subjects", "dimensions", "focus", "exclusions", "lengthTarget"]);
 
     const after = h.service.guideTargetOf(h.taskId);
     expect(after.complete).toBe(true);
-    expect(after.answered).toBe(5);
-    expect(after.reason).toContain("上限");
+    expect(after.answered).toBe(GUIDE_MAX_DECISIONS);
+    expect(after.reason).toContain(`上限 ${GUIDE_MAX_DECISIONS}`);
     h.close();
   });
 });
@@ -1006,3 +1018,218 @@ describe("N. projects that predate the brief stay readable and frozen", () => {
     h.close();
   });
 });
+
+// -------------------------------------------------------------------------- O --
+
+/** Asks the guide to end, and returns what the service said about it. */
+function endGuide(h: Harness): { readonly ok: boolean; readonly problems: readonly string[] } {
+  h.asGuide();
+  const result = h.service.proposeGuideQuestion(h.taskId, { complete: true, reason: "默认方案已经足够具体" });
+  h.service.clearGrant(SESSION);
+  return result.ok ? { ok: true, problems: [] } : { ok: false, problems: result.problems };
+}
+
+/** Answers the field the program chose next, with an option that really differs. */
+function answerNext(h: Harness): BriefFieldName {
+  const target = h.service.guideTargetOf(h.taskId);
+  const field = target.target?.field;
+  if (field === undefined) throw new Error("expected a target");
+  const question = withQuestion(h, purposeQuestion({ fieldTargets: [field], options: optionsFor(field, h.brief()) }));
+  answered(h, { questionId: question.id, optionIds: ["opt_2"] });
+  return field;
+}
+
+/**
+ * The depth contract: how long Guided Planning lasts, and who gets to end it.
+ *
+ * The product promises a conversation of at least five decisions that really
+ * shape the research, and at most seven so it never becomes an onboarding
+ * wizard. The floor binds the *agent*: it exists because a plan that ends after
+ * one question has not planned anything. It does not bind the user, who may
+ * start research the moment the draft is valid — which is what keeps the floor
+ * a promise about the assistant rather than a gate in front of the report.
+ */
+describe("O. Guided Planning has a depth floor, a ceiling, and one exit the user owns", () => {
+  it("refuses every early stop the agent proposes before the floor (cases A and B)", () => {
+    const h = open();
+    for (let step = 1; step <= GUIDE_MIN_DECISIONS - 1; step += 1) {
+      const stopped = endGuide(h);
+      expect(stopped.ok).toBe(false);
+      expect(stopped.problems.join("；")).toContain(`${step - 1}/${GUIDE_MIN_DECISIONS}`);
+      // Still open, still asking.
+      expect(h.brief().guide.complete).toBe(false);
+      expect(h.task().guideClosed ?? null).toBeNull();
+      answerNext(h);
+      expect(h.service.guideTargetOf(h.taskId).readiness).toBe(step);
+    }
+
+    // Nothing the model says closes it early: four attempts, four refusals,
+    // and the draft still holds only what the user actually decided.
+    expect(h.brief().guide.decisions).toHaveLength(GUIDE_MIN_DECISIONS - 1);
+    h.close();
+  });
+
+  it("accepts the agent's stop once five decisions have really been made (case C)", () => {
+    const h = open();
+    for (let step = 0; step < GUIDE_MIN_DECISIONS; step += 1) answerNext(h);
+
+    const stopped = endGuide(h);
+    expect(stopped.ok).toBe(true);
+    const brief = h.brief();
+    expect(brief.guide.complete).toBe(true);
+    expect(brief.guide.reason).toBe("默认方案已经足够具体");
+    expect(brief.guide.readiness).toBe(GUIDE_MIN_DECISIONS);
+    expect(brief.guide.minDecisions).toBe(GUIDE_MIN_DECISIONS);
+    expect(brief.guide.maxDecisions).toBe(GUIDE_MAX_DECISIONS);
+    expect(brief.guide.active).toBeNull();
+    // The floor is a floor, not a ceiling: the two fields the ladder never got
+    // to are still the user's to edit.
+    expect(brief.fieldStates.exclusions).toBe("suggested");
+    expect(brief.canConfirm).toBe(true);
+    h.close();
+  });
+
+  it("lets the user start research whenever the draft is valid (case E)", () => {
+    const h = open();
+    answerNext(h);
+    answerNext(h);
+
+    const brief = h.brief();
+    expect(brief.guide.readiness).toBe(2);
+    expect(brief.guide.complete).toBe(false);
+    // The user's own exit does not wait for the agent's floor.
+    expect(brief.canConfirm).toBe(true);
+    const confirmed = h.service.confirmTask(h.taskId);
+    expect(confirmed.ok).toBe(true);
+    expect(h.brief().guide.complete).toBe(true);
+    expect(h.brief().guide.reason).toContain("已确认");
+    expect(h.brief().canConfirm).toBe(false);
+    h.close();
+  });
+});
+
+// -------------------------------------------------------------------------- P --
+
+/**
+ * The guided conversation as data.
+ *
+ * A guided question is not only a form field with options: it is a turn in a
+ * conversation, and the workspace has to be able to rebuild the turns — what
+ * the assistant said, what the person answered, and which field it changed —
+ * without a chat subsystem and without a second draft.
+ */
+describe("P. the guided conversation can be read back turn by turn", () => {
+  it("carries the lead-in, the chosen labels and the answer text (case G)", () => {
+    const h = open();
+    const question = withQuestion(h, purposeQuestion({ leadIn: "明白，你更关心工程选型，所以报告不该只解释机制。" }));
+    answered(h, { questionId: question.id, optionIds: ["opt_2"] });
+
+    // The ladder moves on to what is still undecided, and the new question
+    // carries its own lead-in.
+    const next = withQuestion(
+      h,
+      purposeQuestion({
+        leadIn: "接下来我想确认读者是谁。",
+        fieldTargets: ["audience"],
+        options: optionsFor("audience", h.brief()),
+      }),
+    );
+    expect(next.leadIn).toBe("接下来我想确认读者是谁。");
+
+    const brief = h.brief();
+    expect(brief.guide.active?.leadIn).toBe("接下来我想确认读者是谁。");
+    expect(brief.guide.active?.fieldTargets).toEqual(["audience"]);
+    expect(brief.guide.decisions).toHaveLength(1);
+    expect(brief.guide.decisions[0]).toMatchObject({
+      leadIn: "明白，你更关心工程选型，所以报告不该只解释机制。",
+      question: "这次研究最重要的目标是什么？",
+      optionIds: ["opt_2"],
+      selectedOptionLabels: ["为技术选型提供依据"],
+      answerText: "为技术选型提供依据",
+      appliedFields: ["purpose"],
+    });
+    h.close();
+  });
+
+  it("records a typed answer in the words it was typed in, and reads an old record back", () => {
+    const h = open();
+    const typed = withQuestion(h, purposeQuestion());
+    const words = "给采购同事看的选型材料，重点在成本与维护";
+    answered(h, { questionId: typed.id, freeText: words });
+    expect(h.brief().guide.decisions[0]?.answerText).toBe(words);
+
+    // A record written before these fields existed holds only ids and text; it
+    // is read back from what it does hold, and nothing is migrated.
+    const briefBefore = h.brief();
+    const legacy: GuideQuestion = {
+      id: "gq_legacy",
+      taskId: h.taskId,
+      question: "读者是谁？",
+      whyThisMatters: "它决定解释深度",
+      fieldTargets: ["audience"],
+      options: [
+        { optionId: "opt_1", label: "研究生组会", value: { audience: "研究生组会" } },
+        { optionId: "opt_2", label: "工程团队", value: { audience: "工程团队" } },
+      ],
+      allowFreeText: true,
+      basedOnBriefVersion: briefBefore.version,
+      basedOnFields: { audience: "hash-of-an-older-draft" },
+      status: "answered",
+      createdAt: NOW,
+      answer: {
+        optionIds: ["opt_2"],
+        freeText: "",
+        appliedFields: ["audience"],
+        resultingBriefVersion: briefBefore.version + 1,
+        at: NOW,
+      },
+    };
+    h.repo.saveGuideQuestion(legacy);
+
+    const decision = h.brief().guide.decisions.find((entry) => entry.questionId === "gq_legacy");
+    expect(decision?.answerText).toBe("工程团队");
+    expect(decision?.selectedOptionLabels).toEqual(["工程团队"]);
+    expect(decision?.leadIn).toBe("");
+    // The record itself is untouched: the derivation happens on read.
+    expect(h.repo.getGuideQuestion("gq_legacy")?.answer?.answerText).toBeUndefined();
+    h.close();
+  });
+
+  it("refuses markup in a lead-in, and reads Markdown prose as written", () => {
+    const h = open();
+    const marked = withQuestion_(h, purposeQuestion({ leadIn: "<b>明白</b>，接下来确认比较对象。" }));
+    expect(marked.ok).toBe(false);
+    expect(marked.problems.join("；")).toContain("不要包含 HTML");
+
+    const long = withQuestion_(h, purposeQuestion({ leadIn: "很长的过渡语。".repeat(80) }));
+    expect(long.ok).toBe(false);
+    expect(long.problems.join("；")).toContain("leadIn 过长");
+
+    const question = withQuestion(h, purposeQuestion({ leadIn: "**明白**，接下来确认比较对象的范围。" }));
+    expect(question.leadIn).toBe("**明白**，接下来确认比较对象的范围。");
+    h.close();
+  });
+
+  it("counts the user's own structured edits as decisions and never re-asks them (case F)", () => {
+    const h = open();
+    patched(h, { purpose: "为技术选型提供依据" });
+    patched(h, { audience: "工程团队" });
+
+    const target = h.service.guideTargetOf(h.taskId);
+    expect(target.target?.field).toBe("subjects");
+    expect(target.readiness).toBe(2);
+
+    // Two more decisions on top of the user's own edits reach the floor: what
+    // the user settled in the structured editor is a decision like any other.
+    answerNext(h);
+    answerNext(h);
+    expect(h.service.guideTargetOf(h.taskId).readiness).toBe(4);
+    expect(endGuide(h).ok).toBe(false);
+
+    answerNext(h);
+    expect(h.service.guideTargetOf(h.taskId).readiness).toBe(GUIDE_MIN_DECISIONS);
+    expect(endGuide(h).ok).toBe(true);
+    h.close();
+  });
+});
+
