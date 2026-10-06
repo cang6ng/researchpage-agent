@@ -87,6 +87,8 @@ interface AppState {
   setSelection(next: Selection): void;
   openDock(target: DockTarget | null): void;
   prefillAssistant(next: { readonly intent: AssistantIntent; readonly sectionId: string | null; readonly text?: string }): void;
+  /** What the reader has typed so far, kept while they look something up. */
+  updateAssistant(next: { readonly intent?: AssistantIntent; readonly sectionId?: string | null; readonly text?: string }): void;
   setThemeId(next: string): void;
   act(action: () => Promise<unknown>, what: string): Promise<boolean>;
   say(kind: Notice["kind"], text: string): void;
@@ -235,6 +237,7 @@ export function AppProvider({ children }: { readonly children: ReactNode }) {
     setAnswers([]);
     setSelection(null);
     setDock(null);
+    setAssistant({ intent: "auto", sectionId: null, text: "", token: 0 });
     lastBundle.current = "";
     lastReportId.current = "";
     lastAnswers.current = "";
@@ -250,6 +253,8 @@ export function AppProvider({ children }: { readonly children: ReactNode }) {
     setAnswers([]);
     setSelection(null);
     setDock(null);
+    // A composer aimed at one project must not follow the reader into another.
+    setAssistant({ intent: "auto", sectionId: null, text: "", token: 0 });
     lastBundle.current = "";
     lastReportId.current = "";
     window.localStorage.setItem("researchpage.task", id);
@@ -290,6 +295,18 @@ export function AppProvider({ children }: { readonly children: ReactNode }) {
     [],
   );
 
+  const updateAssistant = useCallback(
+    (next: { readonly intent?: AssistantIntent; readonly sectionId?: string | null; readonly text?: string }): void => {
+      setAssistant((current) => ({
+        intent: next.intent ?? current.intent,
+        sectionId: next.sectionId === undefined ? current.sectionId : next.sectionId,
+        text: next.text ?? current.text,
+        token: current.token,
+      }));
+    },
+    [],
+  );
+
   const setThemeId = useCallback((next: string): void => {
     setThemeIdState(next);
     window.localStorage.setItem(THEME_KEY, next);
@@ -318,6 +335,7 @@ export function AppProvider({ children }: { readonly children: ReactNode }) {
       setSelection,
       openDock: setDock,
       prefillAssistant,
+      updateAssistant,
       setThemeId,
       act,
       say,
@@ -345,6 +363,7 @@ export function AppProvider({ children }: { readonly children: ReactNode }) {
       startTopic,
       refresh,
       prefillAssistant,
+      updateAssistant,
       setThemeId,
       act,
       say,

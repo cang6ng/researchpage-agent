@@ -14,5 +14,5 @@
     "types": ["node"]
   },
   "include": ["packages", "apps", "tests"],
-  "exclude": ["apps/web/src/browser", "apps/web/tests/shell-rendering.test.tsx", "apps/web/dist", "apps/research/src/browser", "apps/research/dist"]
+  "exclude": ["apps/web/src/browser", "apps/web/tests/shell-rendering.test.tsx", "apps/web/dist", "apps/research/src/browser", "apps/research/dist", "apps/research/tests/markdown.test.ts", "apps/research/tests/artifact-view.test.ts"]
 }

@@ -720,12 +720,43 @@ function SourcePanel({ bundle, source }: { readonly bundle: TaskBundle; readonly
 
 /* ----------------------------------------------------------------- dock -- */
 
+/**
+ * How wide the one panel is, and why.
+ *
+ * There is still exactly one contextual workspace on the right, but its width is
+ * a consequence of what is in it. A source or an evidence excerpt is something
+ * to glance at beside the matrix, and stays a dock; an assistant answer, a
+ * proposal's two versions of a section, and a claim's evidence chain are things
+ * a reader reads, and take a column wide enough to read. Nothing here decides
+ * *whether* the panel is open — only how much room it asks for.
+ */
+export type DockTab = "assistant" | "primary" | "proposal";
+
+const TAB_WIDTH: Readonly<Record<DockTab, "narrow" | "wide">> = Object.freeze({
+  primary: "narrow",
+  assistant: "wide",
+  proposal: "wide",
+});
+
+/** The two widths the panel is allowed to be, in the spec's own numbers. */
+const WIDTHS: Readonly<Record<"narrow" | "wide", string>> = Object.freeze({
+  narrow: "376px",
+  wide: "clamp(420px, 32vw, 520px)",
+});
+
 export function ContextDock({ overlay }: { readonly overlay: boolean }) {
   const { bundle, document, dock, openDock, setSelection } = useApp();
-  const [tab, setTab] = useState<"primary" | "assistant">("primary");
+  const [tab, setTab] = useState<DockTab>("primary");
 
+  const pendingProposal = bundle?.proposals.filter((proposal) => proposal.status === "pending").slice(-1)[0] ?? null;
+  const showProposalTab = pendingProposal !== null || dock?.kind === "proposal";
+  const activeTab: DockTab = tab === "proposal" && !showProposalTab ? "primary" : tab;
+
+  // The subject decides the tab it belongs in: selecting a sentence opens its
+  // evidence, asking the assistant opens the assistant, and a proposal arrives
+  // where proposals live rather than as a surprise in another panel.
   useEffect(() => {
-    setTab(dock?.kind === "assistant" ? "assistant" : "primary");
+    setTab(dock?.kind === "assistant" ? "assistant" : dock?.kind === "proposal" ? "proposal" : "primary");
   }, [dock]);
 
   useEffect(() => {
@@ -741,16 +772,18 @@ export function ContextDock({ overlay }: { readonly overlay: boolean }) {
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const cell = dock?.kind === "cell" && bundle !== null ? findCell(bundle, dock) : undefined;
 
-  // A panel that floats over the page must not float over the controls that
-  // opened it: the sticky chrome makes room for it while it is open.
+  // The panel's width is published as one variable, because two other things
+  // read it: the layout that makes room for the panel, and the sticky chrome
+  // that has to keep its controls clear of a floating one.
   useEffect(() => {
     const root = window.document.documentElement;
+    root.style.setProperty("--rp-dock-w", WIDTHS[TAB_WIDTH[activeTab]]);
     if (overlay) root.style.setProperty("--rp-dock-offset", "var(--rp-dock-w)");
-    else root.style.removeProperty("--rp-dock-offset");
     return () => {
+      root.style.removeProperty("--rp-dock-w");
       root.style.removeProperty("--rp-dock-offset");
     };
-  }, [overlay]);
+  }, [activeTab, overlay]);
 
   useEffect(() => {
     bodyRef.current?.scrollTo({ top: 0 });
@@ -810,16 +843,24 @@ export function ContextDock({ overlay }: { readonly overlay: boolean }) {
         };
       }
       case "assistant":
-        return { kicker: "助手", title: "对项目下指令", sub: "选目标与方式，动作会记在下方" };
+        return { kicker: "助手", title: "与文档并排工作", sub: "" };
     }
   }, [bundle, document, dock]);
 
   if (bundle === null || dock === null) return null;
 
   const primaryLabel = tabLabel(dock).primary;
+  // A panel that is the assistant has no "primary subject" to switch back to:
+  // the tab that would say "助手" beside the assistant tab says nothing.
+  const hasPrimary = dock.kind !== "assistant";
 
   return (
-    <aside className={`rp-dock${overlay ? " rp-dock--overlay" : ""}`} aria-label="上下文面板" data-testid="context-dock">
+    <aside
+      className={`rp-dock rp-dock--${TAB_WIDTH[activeTab]}${overlay ? " rp-dock--overlay" : ""}`}
+      aria-label="上下文面板"
+      data-testid="context-dock"
+      data-width={TAB_WIDTH[activeTab]}
+    >
       <div className="rp-dock__head">
         <div style={{ minWidth: 0 }}>
           <div className="rp-dock__kicker">{header.kicker}</div>
@@ -840,28 +881,28 @@ export function ContextDock({ overlay }: { readonly overlay: boolean }) {
         </Tooltip>
       </div>
 
-      <div className="rp-dock__tabs">
+      <div className="rp-dock__tabs" data-testid="dock-tabs">
+        {hasPrimary && (
+          <button
+            type="button"
+            className="rp-nav__item"
+            aria-current={activeTab === "primary"}
+            onClick={() => {
+              setTab("primary");
+            }}
+          >
+            {dock.kind === "source" ? (
+              <BookOpen size={14} />
+            ) : (
+              <FileSearch size={14} />
+            )}
+            {primaryLabel}
+          </button>
+        )}
         <button
           type="button"
           className="rp-nav__item"
-          aria-current={tab === "primary"}
-          onClick={() => {
-            setTab("primary");
-          }}
-        >
-          {dock.kind === "source" ? (
-            <BookOpen size={14} />
-          ) : dock.kind === "proposal" ? (
-            <SquarePen size={14} />
-          ) : (
-            <FileSearch size={14} />
-          )}
-          {primaryLabel}
-        </button>
-        <button
-          type="button"
-          className="rp-nav__item"
-          aria-current={tab === "assistant"}
+          aria-current={activeTab === "assistant"}
           onClick={() => {
             setTab("assistant");
           }}
@@ -869,10 +910,37 @@ export function ContextDock({ overlay }: { readonly overlay: boolean }) {
           <MessageSquare size={14} />
           助手
         </button>
+        {showProposalTab && (
+          <button
+            type="button"
+            className="rp-nav__item"
+            aria-current={activeTab === "proposal"}
+            onClick={() => {
+              if (pendingProposal !== null) {
+                openDock({ kind: "proposal", proposalId: pendingProposal.proposalId });
+                return;
+              }
+              setTab("proposal");
+            }}
+            data-testid="dock-tab-proposal"
+          >
+            <SquarePen size={14} />
+            修改建议
+            {pendingProposal !== null && <span className="rp-nav__count">待接受</span>}
+          </button>
+        )}
       </div>
 
-      {tab === "assistant" ? (
+      {activeTab === "assistant" ? (
         <AssistantPanel bundle={bundle} />
+      ) : activeTab === "proposal" ? (
+        <div className="rp-dock__body" ref={bodyRef}>
+          {pendingProposal !== null && dock.kind !== "proposal" ? (
+            <ProposalPanel bundle={bundle} proposalId={pendingProposal.proposalId} />
+          ) : dock.kind === "proposal" ? (
+            <ProposalPanel bundle={bundle} proposalId={dock.proposalId} />
+          ) : null}
+        </div>
       ) : dock.kind === "cell" && cell !== undefined ? (
         <>
           <div className="rp-dock__body" ref={bodyRef}>
@@ -952,7 +1020,11 @@ export function ContextDock({ overlay }: { readonly overlay: boolean }) {
  */
 export function DockSlot() {
   const { dock } = useApp();
-  const roomy = useMediaQuery(`(min-width: ${String(370 + 1030)}px)`);
+  // The panel pushes when there is room for it *and* a document: a wide
+  // assistant workspace plus a readable page. 1366 is the narrowest window this
+  // product supports, and 376 + 900 fits inside it, so the threshold is that
+  // width rather than a name for a device.
+  const roomy = useMediaQuery("(min-width: 1350px)");
   if (dock === null) return null;
   return <ContextDock overlay={roomy !== true} />;
 }

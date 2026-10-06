@@ -595,7 +595,11 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       });
       const state = runSettled(runId);
       if (record !== undefined) {
-        record = { ...record, activity: transcriptOf(runId) };
+        // A run's live timeline disappears when it settles, so the last poll of
+        // a finished run reads nothing. What it did is the whole point of the
+        // record: keep the transcript that was read while it was still there.
+        const transcript = transcriptOf(runId);
+        if (transcript.length > 0) record = { ...record, activity: transcript };
         service.recordRun(record);
       }
       if (state.settled) {

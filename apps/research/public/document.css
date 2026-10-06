@@ -430,34 +430,9 @@
   background: rgba(31, 44, 51, 0.12);
 }
 
-.rp-doc__mech__ends {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-  margin-bottom: 18px;
-}
-
-.rp-doc__mech__end {
-  border: 1px solid rgba(31, 44, 51, 0.12);
-  border-radius: 3px;
-  padding: 11px 13px;
-  background: rgba(31, 44, 51, 0.015);
-}
-
-.rp-doc__mech__end b {
-  display: block;
-  font-family: var(--rp-font-mono);
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: #8b9499;
-  font-weight: 500;
-  margin-bottom: 5px;
-}
-
 .rp-doc__mech__steps {
   list-style: none;
-  margin: 0 0 18px;
+  margin: 0;
   padding: 0;
   counter-reset: rp-step;
   display: flex;
@@ -715,4 +690,457 @@
   text-align: left;
   margin-right: 6px;
   vertical-align: 1px;
+}
+
+/* ------------------------------------------------- new comparison matrix -- */
+
+/*
+ * The comparison, in the orientation a reader compares in: the questions down
+ * the side, the objects across the top. The report writes the transpose, which
+ * is a fine way to write and a poor way to read — six questions across give six
+ * narrow columns of prose, and the frame the comparison claims to hold in stops
+ * being visible.
+ *
+ * Nothing here ranks. A cell holds one bounded judgement and, where the claim
+ * contract says the comparison could not be made on the same terms, that fact is
+ * printed in the cell rather than encoded in a colour.
+ */
+
+.rp-doc__compare__matrix {
+  overflow-x: auto;
+}
+
+.rp-doc__table--matrix th:first-child {
+  width: 34%;
+  min-width: 212px;
+}
+
+.rp-doc__table--matrix thead th {
+  padding-bottom: 12px;
+}
+
+.rp-doc__corner {
+  font-family: var(--rp-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8b9499;
+  font-weight: 500;
+}
+
+.rp-doc__rowname {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+  color: #16232a;
+}
+
+.rp-doc__rowq {
+  display: block;
+  font-family: var(--rp-font);
+  font-size: 11.5px;
+  font-weight: 400;
+  line-height: 1.5;
+  color: #8b9499;
+  margin-top: 3px;
+}
+
+.rp-doc__table--matrix td {
+  font-size: 13px;
+  line-height: 1.55;
+  color: #33414a;
+}
+
+.rp-doc__table--matrix tbody th {
+  border-bottom: 1px solid rgba(31, 44, 51, 0.09);
+  vertical-align: top;
+  padding: 14px 18px 14px 0;
+}
+
+.rp-doc__cellfill {
+  font-family: var(--rp-font);
+  font-size: 11.5px;
+  color: #8b9499;
+}
+
+/* A cell the report left empty still says where the project stands, and opening
+   it is how a reader gets at the evidence for that pair. It is a label, not a
+   button that wants pressing: the border appears when it is pointed at. */
+.rp-doc__cellfill--open {
+  appearance: none;
+  border: 1px dashed rgba(31, 44, 51, 0.18);
+  background: none;
+  border-radius: 3px;
+  padding: 2px 7px;
+  cursor: pointer;
+}
+
+.rp-doc__cellfill--open:hover {
+  border-style: solid;
+  border-color: rgba(36, 75, 96, 0.4);
+  color: #244b60;
+}
+
+.rp-doc__cellmark {
+  display: inline-block;
+  margin-top: 6px;
+  font-family: var(--rp-font);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+  padding: 1px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.rp-doc__cellmark--none {
+  color: #74569a;
+  background: rgba(116, 86, 154, 0.09);
+}
+
+.rp-doc__cellmark--part {
+  color: #94651c;
+  background: rgba(148, 101, 28, 0.1);
+}
+
+.rp-doc__compare__foot {
+  font-family: var(--rp-font);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: #8b9499;
+  margin: 10px 0 0;
+}
+
+.rp-doc__compare__label {
+  appearance: none;
+  border: 0;
+  background: none;
+  font-family: var(--rp-font);
+  font-size: 11px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #8b9499;
+  margin-bottom: 10px;
+  padding: 0;
+  cursor: pointer;
+}
+
+.rp-doc__compare__label:hover {
+  color: #244b60;
+}
+
+/* -------------------------------------------------------- research boundaries -- */
+
+/*
+ * What the research does not know, collected in one place instead of scattered
+ * as coverage states through the text. Each item is a question, not a cell: a
+ * reader acts on "成本口径", not on the twelve cells that share it. The cells
+ * themselves are still there, one disclosure down, because summarising them
+ * away would be the report hiding its own gaps.
+ */
+
+.rp-doc__boundaries {
+  font-family: var(--rp-font);
+  margin-top: 54px;
+  padding-top: 30px;
+  border-top: 1px solid rgba(31, 44, 51, 0.14);
+}
+
+.rp-doc__boundaries .rp-doc__h2 {
+  font-size: 17px;
+  cursor: default;
+}
+
+.rp-doc__boundary__lede {
+  font-size: 13px;
+  line-height: 1.65;
+  color: #657078;
+  margin: 0 0 20px;
+  max-width: 66ch;
+}
+
+.rp-doc__boundary__list {
+  display: flex;
+  flex-direction: column;
+}
+
+.rp-doc__boundary__item {
+  padding: 14px 0;
+  border-top: 1px solid rgba(31, 44, 51, 0.09);
+}
+
+.rp-doc__boundary__item:first-child {
+  border-top: 0;
+}
+
+.rp-doc__boundary__head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.rp-doc__boundary__name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #16232a;
+}
+
+.rp-doc__boundary__counts {
+  font-size: 11.5px;
+  color: #94651c;
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-doc__boundary__q {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #8b9499;
+  margin: 4px 0 0;
+  max-width: 74ch;
+}
+
+.rp-doc__boundary__sentence {
+  font-size: 13.5px;
+  line-height: 1.65;
+  color: #33414a;
+  margin: 8px 0 0;
+  max-width: 76ch;
+}
+
+.rp-doc__boundary__subjects {
+  font-size: 11.5px;
+  color: #657078;
+  margin: 6px 0 0;
+}
+
+.rp-doc__boundary__all {
+  margin-top: 18px;
+  font-size: 12.5px;
+}
+
+.rp-doc__boundary__all summary {
+  cursor: pointer;
+  color: #244b60;
+  font-size: 12.5px;
+}
+
+.rp-doc__boundary__all ul {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rp-doc__boundary__all li {
+  display: grid;
+  grid-template-columns: minmax(120px, 180px) minmax(110px, 160px) minmax(0, 1fr);
+  gap: 12px;
+  padding: 6px 0;
+  border-top: 1px solid rgba(31, 44, 51, 0.07);
+  font-size: 12px;
+  line-height: 1.5;
+  color: #657078;
+}
+
+.rp-doc__boundary__cell-subject {
+  color: #1f2c33;
+  font-weight: 550;
+}
+
+.rp-doc__boundary__cell-state {
+  color: #657078;
+}
+
+/* ------------------------------------------------------------- checks strip -- */
+
+/*
+ * One line at the top, in the reader's words, with the technician's list one
+ * disclosure down. Twelve validator sentences printed before the report is a
+ * debug view; the same twelve behind a summary are the audit trail.
+ */
+
+.rp-doc__checks {
+  font-family: var(--rp-font);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: 0 0 26px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(31, 44, 51, 0.09);
+}
+
+.rp-doc__checks .rp-chip {
+  font-size: 12px;
+}
+
+.rp-doc__checks__jump {
+  appearance: none;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-family: var(--rp-font);
+  font-size: 12.5px;
+  color: #244b60;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.rp-doc__checks__detail {
+  flex-basis: 100%;
+  font-size: 12px;
+  color: #657078;
+}
+
+.rp-doc__checks__detail summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: #8b9499;
+}
+
+.rp-doc__checks__detail ul {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  line-height: 1.65;
+}
+
+/* ----------------------------------------------------------- mechanism flow -- */
+
+/*
+ * A mechanism, drawn as the sequence it is: what goes in, the stages it passes
+ * through, what comes out, and then the two things a reader needs before
+ * believing it — what it costs and when it stops working. No diagram; the
+ * shape of the explanation, not a picture of it.
+ */
+
+.rp-doc__mech__stage {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 4px 16px;
+  border: 1px solid rgba(31, 44, 51, 0.12);
+  border-radius: 3px;
+  padding: 12px 14px;
+  background: rgba(31, 44, 51, 0.015);
+}
+
+.rp-doc__mech__stage--out {
+  background: rgba(36, 75, 96, 0.05);
+  border-color: rgba(36, 75, 96, 0.22);
+}
+
+.rp-doc__mech__stage-k {
+  padding-top: 1px;
+}
+
+.rp-doc__mech__stage-k b {
+  font-family: var(--rp-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8b9499;
+  font-weight: 500;
+}
+
+.rp-doc__mech__stage-v {
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: #3d4a51;
+}
+
+/* The connector between stages: a rule with a head, drawn rather than set in a
+   typeface that may not have the glyph. */
+.rp-doc__mech__flow {
+  width: 1px;
+  height: 22px;
+  margin: 0 auto;
+  background: rgba(31, 44, 51, 0.22);
+  position: relative;
+  font-size: 0;
+  color: transparent;
+}
+
+.rp-doc__mech__flow::after {
+  content: "";
+  position: absolute;
+  left: -3px;
+  bottom: -1px;
+  border-left: 3.5px solid transparent;
+  border-right: 3.5px solid transparent;
+  border-top: 5px solid rgba(31, 44, 51, 0.32);
+}
+
+/* A step that numbers itself does not get a second number from the list. */
+.rp-doc__mech__steps li.rp-doc__step--self {
+  grid-template-columns: minmax(0, 1fr);
+  padding-left: 38px;
+}
+
+.rp-doc__mech__steps li.rp-doc__step--self::before {
+  content: none;
+}
+
+.rp-doc__list li.rp-doc__li--self {
+  list-style: none;
+}
+
+.rp-doc[data-theme="swiss"] .rp-doc__mech__stage-v {
+  font-family: var(--rp-font);
+  font-size: 13px;
+}
+
+.rp-doc__empty {
+  font-size: 13px;
+  color: #8b9499;
+  margin: 0;
+}
+
+.rp-doc__back__sub {
+  margin-top: 26px;
+}
+
+@media (max-width: 1100px) {
+  .rp-doc__boundary__all li {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+}
+
+/* ------------------------------------------------------------------ inline -- */
+
+/*
+ * The emphasis inside a sentence. A report is written with `**` and backticks
+ * like any other Markdown, and printing the punctuation instead of the emphasis
+ * is the page failing to read what it was handed. Only the inline vocabulary
+ * arrives here; anything block-shaped was unwrapped before it got this far.
+ */
+
+.rp-md-inline strong {
+  font-weight: 600;
+}
+
+.rp-md-inline em {
+  font-style: italic;
+}
+
+.rp-md-inline code {
+  font-family: var(--rp-font-mono);
+  font-size: 0.92em;
+  background: rgba(31, 44, 51, 0.055);
+  border-radius: 3px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+
+.rp-md-inline a {
+  color: #244b60;
+  text-decoration: none;
+  border-bottom: 1px solid rgba(36, 75, 96, 0.3);
+}
+
+.rp-md-inline del {
+  color: #8b9499;
 }

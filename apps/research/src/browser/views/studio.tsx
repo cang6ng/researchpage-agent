@@ -34,8 +34,9 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { api, type DocumentView } from "../api.js";
-import { DocumentCanvas, type CanvasSelection, type DocMode } from "../components/document.js";
+import { coverageKey, DocumentCanvas, type CanvasSelection, type DocMode } from "../components/document.js";
 import { DockSlot } from "../components/dock.js";
+import { boundarySummary, boundariesOf, nameMaps, warningSummary } from "../document-logic.js";
 import { useApp } from "../store.js";
 import { currentReportOf } from "../store.js";
 
@@ -50,6 +51,7 @@ export function StudioView() {
     document,
     selection,
     setSelection,
+    dock,
     openDock,
     prefillAssistant,
     themeId,
@@ -103,9 +105,21 @@ export function StudioView() {
       ? selection
       : null;
 
-  const warningCount = shown?.validation?.warnings.length ?? 0;
+  const warnings = warningSummary(shown);
 
   if (bundle === null) return null;
+
+  // The document's own names, and the research's open questions. A frozen
+  // revision is a snapshot of a moment; it gets neither, because its matrix and
+  // its names are the ones it was frozen with, not today's.
+  const names = nameMaps(bundle);
+  const boundaries = revisionId === null ? boundariesOf(bundle) : [];
+  // The matrix knows how each subject × dimension stands, which is what a
+  // comparison cell the report left empty has to say for itself.
+  const coverage = new Map(bundle.matrix.map((cell) => [coverageKey(cell.subjectId, cell.dimensionId), cell.status]));
+  const openCount = bundle.matrix.filter(
+    (cell) => cell.status === "missing" || cell.status === "unassessed" || cell.status === "limited" || cell.status === "conflict",
+  ).length;
 
   const select = (next: CanvasSelection): void => {
     setSelection(next);
@@ -164,8 +178,23 @@ export function StudioView() {
     if (ok) say("success", "已按当前版本导出 PDF：导出前会自动冻结，文件只依赖冻结时的材料。");
   };
 
+  const assistantOpen = dock !== null && dock.kind === "assistant";
+  const toggleAssistant = (): void => {
+    if (assistantOpen) {
+      openDock(null);
+      return;
+    }
+    // Opening it keeps whatever the reader had typed and aims it at whatever
+    // they have selected: closing the panel to read must not cost them the
+    // sentence they were in the middle of writing.
+    prefillAssistant({
+      intent: "ask",
+      sectionId: selection !== null && selection.kind !== "cell" && selection.kind !== "source" ? selection.sectionId : null,
+    });
+  };
+
   return (
-    <div className="rp-studio">
+    <div className="rp-studio" data-layout={dock === null ? "reading" : "coedit"} data-testid="studio">
       <div className="rp-studio__main">
         <div className="rp-toolbar" data-testid="studio-toolbar">
           <div className="rp-toolbar__group">
@@ -223,12 +252,18 @@ export function StudioView() {
                 核验
               </button>
             </div>
-            {warningCount > 0 && mode === "verify" && (
-              <Tooltip label="报告里的这些义务没有完全达成；它不阻止发布，正文里也写着" withArrow={false}>
-                <span className="rp-chip rp-chip--limited">
-                  <span className="rp-toolbar__long">{warningCount} 条</span>校验提醒
-                </span>
-              </Tooltip>
+            {openCount > 0 && (
+              <button
+                type="button"
+                className="rp-toolbar__alert"
+                onClick={() => {
+                  window.document.querySelector("#research-boundaries")?.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
+                data-testid="open-boundaries"
+              >
+                <span>{boundarySummary(bundle)}</span>
+                <span className="rp-toolbar__long rp-brief-field__count">研究边界</span>
+              </button>
             )}
           </div>
 
@@ -402,18 +437,12 @@ export function StudioView() {
             </Tooltip>
           )}
 
-          <Tooltip label="选中一句话，再打开助手" withArrow={false}>
+          <Tooltip label={assistantOpen ? "关闭助手，回到只读文档" : "打开助手工作区，与文档并排"} withArrow={false}>
             <Button
               size="compact-sm"
-              variant="subtle"
+              variant={assistantOpen ? "light" : "subtle"}
               leftSection={<MessageSquare size={14} />}
-              onClick={() => {
-                prefillAssistant({
-                  intent: "ask",
-                  sectionId: selection !== null && selection.kind !== "cell" && selection.kind !== "source" ? selection.sectionId : null,
-                  text: "",
-                });
-              }}
+              onClick={toggleAssistant}
               data-testid="open-assistant"
             >
               助手
@@ -519,7 +548,36 @@ export function StudioView() {
                     mode={revisionId === null ? mode : "read"}
                     themeId={shown.themeId ?? themeId}
                     selection={revisionId === null ? documentSelection : null}
+                    names={names}
+                    boundaries={boundaries}
+                    coverage={coverage}
+                    checks={
+                      warnings === null && openCount === 0 ? undefined : (
+                        <>
+                          {warnings !== null && (
+                            <Tooltip label="这些义务在正文里已如实写出，不阻止发布" withArrow={false}>
+                              <span className="rp-chip rp-chip--limited">{warnings.headline}</span>
+                            </Tooltip>
+                          )}
+                          {openCount > 0 && (
+                            <button
+                              type="button"
+                              className="rp-doc__checks__jump"
+                              onClick={() => {
+                                window.document.querySelector("#research-boundaries")?.scrollIntoView({ behavior: "smooth", block: "start" });
+                              }}
+                            >
+                              {boundarySummary(bundle)} →
+                            </button>
+                          )}
+                        </>
+                      )
+                    }
                     onSelect={select}
+                    onOpenCell={(subjectId, dimensionId) => {
+                      setSelection({ kind: "cell", subjectId, dimensionId });
+                      openDock({ kind: "cell", subjectId, dimensionId });
+                    }}
                     onOpenReference={(sourceId) => {
                       openDock({ kind: "source", sourceId });
                     }}
