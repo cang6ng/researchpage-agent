@@ -378,6 +378,7 @@
 - 离线全量、类型检查与构建：`pnpm typecheck`、`pnpm build:research`、`EVERY_DAGENT_NO_BROWSER=1 npx vitest run --exclude …`（同 Step 2 的排除项）。
 - 已知的既有 flaky（与本次改动无关，单独重跑即过）：`packages/host/tests/tool-policy.test.ts` 的 deadline 毫秒取整断言；`apps/web/tests/shell-*.browser.test.ts` 在整仓并行跑时的 CDP 超时。
 - 本地跑 gate 的注意：产品服务的数据目录不要与正在运行的实例共用（SQLite 会拒绝第二个进程打开）；本次验证是在 `researchpage-data` 的副本上进行的，未改动原有 demo 数据。
+- **本次实测**（2026-10-07，真实模型 `deepseek/deepseek-flash`，真实 Chrome）：浏览器 gate `78/78 PASS · 1 SKIP`（«早退被拒后的自动恢复» 那一项这一轮没有被模型触发，如实 SKIP，不报 PASS）；`pnpm typecheck` 三个 project、`pnpm build:research`、离线全量 `1792 passed / 62 skipped / 0 failed` 均通过。
 
 ## Step 3.5C-A 的验证入口
 
