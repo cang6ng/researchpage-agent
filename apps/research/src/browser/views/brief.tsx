@@ -208,7 +208,7 @@ export function BriefView() {
         return true;
       } catch (error) {
         if (error instanceof ApiError && error.stale === true) {
-          markFields(fields, "stale", "研究任务刚刚发生了变化，请重新确认这一项。");
+          markFields(fields, "stale", "研究范围刚刚发生了变化，请重新确认这一项。");
           await refresh();
           return false;
         }
@@ -349,7 +349,7 @@ export function BriefView() {
       if (error instanceof ApiError && error.status === 409) {
         setGuideStale(
           error.stale
-            ? "研究任务刚刚发生了变化，请重新确认这一项。"
+            ? "研究范围刚刚发生了变化，请重新确认这一项。"
             : error.message.length > 0
               ? error.message
               : "这个问题已经不再适用，请重新获取。",
@@ -377,7 +377,7 @@ export function BriefView() {
   return (
     <div className="rp-page">
       <header className="rp-brief__head">
-        <div className="rp-kicker">研究任务</div>
+        <div className="rp-kicker">研究范围</div>
         <h1 className="rp-title rp-title--clamp" title={brief.topic} style={{ maxWidth: "44ch" }}>
           {brief.topic}
         </h1>
@@ -429,7 +429,7 @@ export function BriefView() {
             <div className="rp-note rp-note--warn" data-testid="brief-stale">
               <Info size={14} style={{ flex: "none", marginTop: 2 }} />
               <span style={{ flex: 1 }}>
-                {saveNotes[staleField] ?? "研究任务刚刚发生了变化，请重新确认这一项。"}
+                {saveNotes[staleField] ?? "研究范围刚刚发生了变化，请重新确认这一项。"}
                 「{BRIEF_FIELD_LABELS[staleField]}」还没有写入，页面不会用你的输入覆盖这次变化。
               </span>
               <Button
@@ -899,7 +899,7 @@ function ConfirmedBrief({
       <div className="rp-note rp-note--quiet">
         <Check size={15} color="var(--rp-verified)" style={{ flex: "none", marginTop: 2 }} />
         <span style={{ flex: 1 }} data-testid="confirmed-note">
-          研究任务已确认。它已锁定为检索与报告的依据；要改方向，请在报告上发起修改，由你逐次接受。
+          研究范围已确认。它已锁定为检索与报告的依据；要改方向，请在报告上发起修改，由你逐次接受。
         </span>
       </div>
 

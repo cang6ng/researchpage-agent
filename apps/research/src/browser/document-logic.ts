@@ -199,6 +199,19 @@ export function warningSummary(document: DocumentView | null): WarningSummary | 
   if (warnings.length === 0) return null;
   return {
     count: warnings.length,
-    headline: `${String(warnings.length)} 处义务未完全达成，正文里已如实写出`,
+    headline: `需要进一步核验 · ${String(warnings.length)}`,
   };
+}
+
+/**
+ * One warning as the reader reads it: the sentence, without the check's number.
+ *
+ * `Q03：…` is how the validator files a finding, and the number is what a
+ * developer traces it by — the sentence after it is what is wrong with the
+ * report and what to do about it. The number is not thrown away, it is moved
+ * behind the detail disclosure, which is where a reader who wants to trace it
+ * back to the contract can find it.
+ */
+export function readerWarning(text: string): string {
+  return text.replace(/^\s*Q\d+\s*[:：]\s*/, "").trim();
 }

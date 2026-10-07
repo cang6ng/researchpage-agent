@@ -16,7 +16,7 @@
 import { describe, expect, it } from "vitest";
 
 import { blockIsSynthesis, citationNumbersFor, claimChanges, firstClaimByNumber } from "../src/browser/claims.js";
-import { parseRoute, projectHash, VIEWS } from "../src/browser/routes.js";
+import { defaultViewOf, parseRoute, PRIMARY_NAV, projectHash, resolveView, VIEWS, VIEW_LABELS } from "../src/browser/routes.js";
 
 describe("the page's addresses", () => {
   it("opens the view a project URL names", () => {
@@ -32,9 +32,33 @@ describe("the page's addresses", () => {
     expect(parseRoute("#/settings")).toEqual({ kind: "settings" });
   });
 
-  it("falls back to the research view for an address it does not know", () => {
-    expect(parseRoute("#/p/task_1/whatever")).toEqual({ kind: "project", taskId: "task_1", view: "research" });
-    expect(parseRoute("#/p/task_1")).toEqual({ kind: "project", taskId: "task_1", view: "research" });
+  it("leaves the view unnamed for an address that names none", () => {
+    // "No view named" is a question for the project, not for the URL grammar:
+    // where a project opens depends on whether its brief is confirmed and on
+    // whether it has written a report yet, and that is answered from the
+    // project rather than frozen into a link that would mean something else
+    // tomorrow.
+    expect(parseRoute("#/p/task_1/whatever")).toEqual({ kind: "project", taskId: "task_1", view: null });
+    expect(parseRoute("#/p/task_1")).toEqual({ kind: "project", taskId: "task_1", view: null });
+  });
+
+  it("opens an unconfirmed project on its scope, and a written one on its report", () => {
+    expect(defaultViewOf({ confirmed: false, hasReport: false })).toBe("brief");
+    expect(defaultViewOf({ confirmed: false, hasReport: true })).toBe("brief");
+    expect(defaultViewOf({ confirmed: true, hasReport: true })).toBe("report");
+    expect(defaultViewOf({ confirmed: true, hasReport: false })).toBe("research");
+    const route = { kind: "project", taskId: "task_1", view: null } as const;
+    expect(resolveView(route, { confirmed: true, hasReport: false })).toBe("research");
+    expect(resolveView({ ...route, view: "sources" }, { confirmed: true, hasReport: true })).toBe("sources");
+  });
+
+  it("keeps the three workspaces primary and the rest reachable", () => {
+    expect(PRIMARY_NAV).toEqual(["report", "research", "sources"]);
+    expect(VIEWS).toContain("brief");
+    expect(VIEWS).toContain("gallery");
+    // Nothing is called a template: there is one blueprint in this build, and
+    // a navigation item that promised more would be a claim about the product.
+    expect(Object.values(VIEW_LABELS).join("")).not.toContain("模板");
   });
 
   it("round-trips every view through its own hash", () => {

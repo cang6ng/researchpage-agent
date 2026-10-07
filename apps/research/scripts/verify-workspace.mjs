@@ -432,7 +432,7 @@ async function main() {
     }
     if (draftId === undefined && withModel) {
       draftId = await createDraft("对比三种 RAG 方案在长文档问答上的成本与效果，给技术选型用");
-      case_("从起始页建立一份新的研究任务卡", draftId !== undefined, draftId ?? "主题提交后没有产生新项目");
+      case_("从起始页建立一份新的研究范围", draftId !== undefined, draftId ?? "主题提交后没有产生新项目");
     }
 
     /* ----------------------------------------------------------- brief -- */
@@ -1481,11 +1481,11 @@ async function main() {
         // and offers the way back to what the reader was reading.
         const gapCount = (await api(`/api/research/tasks/${reportTaskId}`)).gaps.length;
         const canInspect = await session.evaluate(
-          `[...document.querySelectorAll("button")].some((button) => button.textContent.trim() === "检查新证据")`,
+          `[...document.querySelectorAll("button")].some((button) => button.textContent.trim() === "查看本轮证据")`,
         );
         if (canInspect === true && gapCount > 0) {
           await session.evaluate(
-            `(() => { const button = [...document.querySelectorAll("button")].find((el) => el.textContent.trim() === "检查新证据"); button.scrollIntoView({block: "center"}); button.click(); return true; })()`,
+            `(() => { const button = [...document.querySelectorAll("button")].find((el) => el.textContent.trim() === "查看本轮证据"); button.scrollIntoView({block: "center"}); button.click(); return true; })()`,
           );
           await session.waitFor(`document.querySelector('[data-testid="back-to-conversation"]') !== null`, "the way back", 10_000);
           const pane = await session.evaluate(
@@ -1568,10 +1568,10 @@ async function main() {
         const editRun = (await api(`/api/research/tasks/${reportTaskId}`)).runs.filter((run) => run.stage === "edit").slice(-1)[0];
         const attempts = (editRun?.activity ?? []).filter((step) => step.name === "propose_section_edit");
         case_(
-          "Edit 生成一份待接受的修改建议（而不是直接改写正文）",
+          "Edit 生成一份待确认的修改建议（而不是直接改写正文）",
           proposalReady === true,
           proposalReady
-            ? `${String(pending.length)} 份待接受`
+            ? `${String(pending.length)} 份待确认`
             : attempts.length === 0
               ? "模型这一次没有起草提案"
               : String(attempts[attempts.length - 1].detail).slice(0, 120),
@@ -1579,7 +1579,7 @@ async function main() {
 
         const sectionsDuring = await session.evaluate(`Object.fromEntries(${proseOf})`);
         case_(
-          "提案待接受时正文没有变化",
+          "提案待确认时正文没有变化",
           Object.keys(sectionsBefore).every((id) => sectionsDuring[id] === sectionsBefore[id]),
           `${String(Object.keys(sectionsBefore).length)} 节逐一比对`,
         );
@@ -1667,7 +1667,7 @@ async function main() {
 
     const otherTaskId = reportTaskId ?? taskArg ?? draftId;
     if (otherTaskId === undefined) {
-      skip("来源工作区 / 模板 / 设置", "没有打开任何项目");
+      skip("来源工作区 / 样式 / 设置", "没有打开任何项目");
     } else {
       await session.goto(`${base}/#/p/${otherTaskId}/sources`);
       await session.waitFor(`document.querySelector('[data-testid="source-table"]') !== null`, "the source table", 12_000);
@@ -1694,9 +1694,9 @@ async function main() {
         `(() => ({ themes: document.querySelectorAll("[data-testid^='theme-']").length, previews: document.querySelectorAll(".rp-theme__scale-inner .rp-doc").length, unchanged: document.querySelector(".rp-unchanged")?.textContent?.length ?? 0 }))()`,
       );
       case_(
-        "模板页用同一份真实报告并排预览两套主题",
+        "样式对照页用同一份真实报告并排预览两套排版",
         gallery.themes === 2 && gallery.previews === 2 && gallery.unchanged > 10,
-        `${String(gallery.themes)} 套主题 · ${String(gallery.previews)} 份预览`,
+        `${String(gallery.themes)} 套排版 · ${String(gallery.previews)} 份预览`,
       );
     }
 

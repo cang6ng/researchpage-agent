@@ -76,7 +76,7 @@ export function GalleryView() {
 
   return (
     <div className="rp-gallery">
-      <div className="rp-kicker">模板与主题</div>
+      <div className="rp-kicker">文档样式</div>
       <h1 className="rp-title" style={{ fontSize: 22, marginBottom: 8 }}>
         同一份报告，两种排版
       </h1>
@@ -87,7 +87,7 @@ export function GalleryView() {
 
       <div className="rp-unchanged">
         <Info size={14} />
-        切换主题只改变排版：文字、引用编号与证据编号都不会变化；PDF 主题待后续步骤接入，本页记录你选择的主题。
+        切换样式只改变排版：文字、引用编号与证据编号都不会变化；PDF 样式随后续步骤接入，本页记录你选择的样式。
       </div>
 
       <div className="rp-themes">
@@ -148,7 +148,7 @@ export function GalleryView() {
                   {selected ? (
                     <span className="rp-chip rp-chip--accent">
                       <Check size={12} />
-                      当前主题
+                      当前样式
                     </span>
                   ) : (
                     <Button size="compact-xs" variant="default">
@@ -164,7 +164,7 @@ export function GalleryView() {
 
       <div className="rp-section-head">
         <h2>内容未变</h2>
-        <span>主题只影响排版</span>
+        <span>样式只影响排版</span>
       </div>
       <dl className="rp-kv" style={{ maxWidth: 720 }}>
         <dt>章节</dt>
@@ -174,13 +174,7 @@ export function GalleryView() {
           {claimCount} 条论断 · {referenceCount} 个引用来源 · {preview?.citations.evidenceIndex.length ?? 0} 条证据编号
         </dd>
         <dt>报告版本</dt>
-        <dd>
-          {report === null
-            ? "—"
-            : `${report.reportId}${report.contentHash === null ? "" : ` · hash ${report.contentHash.slice(7, 15)}…`}${
-                bundle.currentReportFrozen ? " · 已有冻结版本" : " · 工作稿"
-              }`}
-        </dd>
+        <dd>{report === null ? "—" : bundle.currentReportFrozen ? "已有冻结版本" : "工作稿"}</dd>
       </dl>
 
       <div style={{ display: "flex", gap: 10, marginTop: 22, flexWrap: "wrap" }}>
@@ -193,7 +187,7 @@ export function GalleryView() {
         >
           回到报告工作台
         </Button>
-        <Tooltip label="冻结时会把当前主题记录在版本里；PDF 版本随后续步骤接入" withArrow={false}>
+        <Tooltip label="冻结时会把当前样式记录在版本里；PDF 版本随后续步骤接入" withArrow={false}>
           <span>
             <Button
               disabled={bundle.currentReportId === null}
@@ -206,11 +200,11 @@ export function GalleryView() {
                     }),
                   "冻结版本",
                 ).then((ok) => {
-                  if (ok) say("success", `已按 ${themeId === "swiss" ? "Swiss" : "Editorial"} 主题冻结当前版本。`);
+                  if (ok) say("success", `已按 ${themeId === "swiss" ? "Swiss" : "Editorial"} 样式冻结当前版本。`);
                 });
               }}
             >
-              以这套主题冻结当前版本
+              以这套样式冻结当前版本
             </Button>
           </span>
         </Tooltip>

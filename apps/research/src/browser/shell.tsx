@@ -2,14 +2,19 @@
  * The product shell: identity, the open project, the project's own navigation,
  * and the one status line the workspace is allowed to keep.
  *
- * The bar is deliberately thin. What a research tool must not do is turn every
- * panel it owns into a destination: the project has five views — what it is,
- * what it found, what it wrote, where it read, how it prints — and everything
- * else (evidence, history, proposals) is a consequence of something on one of
- * those five, so it belongs in the dock rather than in the navigation.
+ * The bar is deliberately thin, and it got thinner: what a research tool must
+ * not do is narrate its own bookkeeping. Searches, reads and gap rounds are
+ * what a specific action spends, so they are stated beside that action when it
+ * runs; the bar answers the question a reader actually has — what is happening
+ * with this project — with one sentence and a way to see the facts behind it.
+ *
+ * The project has three workspaces: what it wrote, what it found, where it
+ * read. The research scope is a property of the project and is reached from its
+ * title; the print theme is a property of the document and is reached from the
+ * report's own toolbar. Neither is a destination.
  */
 
-import { ActionIcon, Menu, Tooltip } from "@mantine/core";
+import { ActionIcon, Menu, Popover, Tooltip } from "@mantine/core";
 import {
   BookText,
   FolderOpen,
@@ -24,54 +29,76 @@ import {
 import type { ReactNode } from "react";
 
 import type { TaskBundle } from "./api.js";
-import { navigate, projectHash, type Route, type View, VIEW_LABELS } from "./router.js";
+import { navigate, projectHash, PRIMARY_NAV, type Route, type View, VIEW_LABELS } from "./router.js";
+import { primaryStatusOf, scopeEntryLabel, scopeSummary, statusDetails } from "./status.js";
 import { useApp } from "./store.js";
 
 const VIEW_ICONS: Readonly<Record<View, ReactNode>> = Object.freeze({
-  brief: <ScrollText size={15} strokeWidth={1.75} />,
-  research: <LayoutList size={15} strokeWidth={1.75} />,
   report: <BookText size={15} strokeWidth={1.75} />,
+  research: <LayoutList size={15} strokeWidth={1.75} />,
   sources: <Library size={15} strokeWidth={1.75} />,
+  brief: <ScrollText size={15} strokeWidth={1.75} />,
   gallery: <GalleryVerticalEnd size={15} strokeWidth={1.75} />,
 });
 
-/**
- * One sentence about where this project stands, in the reader's words.
- *
- * It is read from the project's own readout rather than recomputed here: the
- * label used to say「报告就绪 · 无待查项」whenever no matrix cell was open,
- * which is a claim about material coverage being worn as a claim about the
- * report. The readout separates those facts, so the label can only say the one
- * it means — and a report whose material arrived after it was written says
- * 「待复核」instead of「无待查项」.
- */
-export function projectState(bundle: TaskBundle): { readonly label: string; readonly tone: string } {
-  const readout = bundle.presentation;
-  const run = readout.runState.state;
-  if (run === "failed") return { label: readout.runState.displayName, tone: "danger" };
-  if (run === "editing") return { label: readout.runState.displayName, tone: "accent" };
-  if (run === "preparing") return { label: "待确认任务卡", tone: "limited" };
-  if (run === "researching") return { label: readout.runState.displayName, tone: "accent" };
-  const open = readout.unresolvedResearch.unresolved + readout.unresolvedResearch.limited + readout.unresolvedResearch.incomparable;
-  return {
-    label:
-      readout.reportReview.state === "needs_review"
-        ? `报告待复核 · ${String(open)} 项未定论`
-        : open === 0
-          ? "报告就绪 · 比较项均已核对"
-          : `报告就绪 · ${String(open)} 项未定论`,
-    tone: readout.reportReview.state === "needs_review" || open > 0 ? "limited" : "reviewed",
-  };
+/** What each workspace is holding, as the count beside its name. */
+function navCounts(bundle: TaskBundle): Partial<Record<View, string>> {
+  const counts: Partial<Record<View, string>> = {};
+  if (bundle.hasReport && bundle.gaps.length > 0) counts.report = `${String(bundle.gaps.length)} 项待查`;
+  if (!bundle.hasReport && bundle.matrix.length > 0) {
+    const reviewed = bundle.matrix.filter((cell) => cell.status === "reviewed").length;
+    counts.research = `${String(reviewed)}/${String(bundle.matrix.length)}`;
+  }
+  if (bundle.sources.length > 0) counts.sources = String(bundle.sources.length);
+  return counts;
 }
 
-function StatusDot({ bundle }: { readonly bundle: TaskBundle }) {
-  const running = bundle.busy || bundle.task.status === "researching";
-  return <span className={running ? "rp-dot rp-dot--busy" : "rp-dot rp-dot--live"} />;
+/**
+ * The project's status, and the facts it stands on.
+ *
+ * Clicking it is the whole gesture: the label is what is happening now, and the
+ * panel behind it keeps the six answers the project has about itself side by
+ * side — material coverage, unresolved research, the report's review flag, its
+ * content contract and the source roles — each in its own sentence, because
+ * they answer different questions and a reader checking one must not be handed
+ * another.
+ */
+export function ProjectStatus({ bundle }: { readonly bundle: TaskBundle }) {
+  const status = primaryStatusOf(bundle);
+  return (
+    <Popover shadow="md" width={392} position="bottom-start" withinPortal>
+      <Popover.Target>
+        <button
+          type="button"
+          className={`rp-chip rp-chip--${status.tone} rp-bar__state`}
+          data-testid="project-status"
+          data-state={status.kind}
+        >
+          {status.label}
+        </button>
+      </Popover.Target>
+      <Popover.Dropdown data-testid="status-detail">
+        <div className="rp-block__label" style={{ marginBottom: 10 }}>
+          这个项目的状态
+        </div>
+        <dl className="rp-kv rp-kv--stack">
+          {statusDetails(bundle).map((row) => (
+            <div key={row.label} style={{ display: "contents" }}>
+              <dt>{row.label}</dt>
+              <dd>{row.text}</dd>
+            </div>
+          ))}
+        </dl>
+        <p className="rp-status__note">
+          这些是并列的事实，不会互相覆盖：有材料不等于有结论，报告通过自己的内容检查也不等于结论已被独立复核。
+        </p>
+      </Popover.Dropdown>
+    </Popover>
+  );
 }
 
 export function GlobalBar({ route }: { readonly route: Route }) {
   const { bundle, tasks, runtime, openTask, openStart } = useApp();
-  const state = bundle === null ? null : projectState(bundle);
 
   return (
     <header className="rp-bar">
@@ -94,7 +121,12 @@ export function GlobalBar({ route }: { readonly route: Route }) {
             </Menu.Target>
             <Menu.Dropdown>
               <Menu.Label>当前项目</Menu.Label>
-              <Menu.Item leftSection={<LayoutList size={14} />} onClick={() => navigate(projectHash(bundle.task.id, "research"))}>
+              <Menu.Item
+                leftSection={<LayoutList size={14} />}
+                onClick={() => {
+                  navigate(projectHash(bundle.task.id, "research"));
+                }}
+              >
                 {bundle.task.topic}
               </Menu.Item>
               <Menu.Divider />
@@ -120,22 +152,26 @@ export function GlobalBar({ route }: { readonly route: Route }) {
               </Menu.Item>
             </Menu.Dropdown>
           </Menu>
-          {state !== null && <span className={`rp-chip rp-chip--${state.tone}`}>{state.label}</span>}
+
+          <Tooltip label={scopeSummary(bundle)} withArrow={false}>
+            <button
+              type="button"
+              className="rp-bar__scope"
+              onClick={() => {
+                navigate(projectHash(bundle.task.id, "brief"));
+              }}
+              data-testid="scope-entry"
+            >
+              {scopeEntryLabel(bundle)}
+              <span className="rp-bar__scope-view">查看</span>
+            </button>
+          </Tooltip>
+
+          <ProjectStatus bundle={bundle} />
         </div>
       )}
 
       <div className="rp-bar__spacer" />
-
-      {bundle !== null && (
-        <span className="rp-bar__status">
-          <StatusDot bundle={bundle} />
-          {bundle.busy || bundle.task.status === "researching" ? "研究进行中" : "已同步"}
-          <span className="rp-meta__sep">·</span>
-          搜索 {bundle.usage.searches}/{bundle.budget.maxSearches}
-          <span className="rp-meta__sep">·</span>
-          读取 {bundle.usage.reads}/{bundle.budget.maxReads}
-        </span>
-      )}
 
       {bundle === null && runtime !== null && (
         <span className="rp-bar__status">
@@ -150,7 +186,7 @@ export function GlobalBar({ route }: { readonly route: Route }) {
             variant="subtle"
             aria-label="打开助手"
             onClick={() => {
-              navigate(projectHash(bundle.task.id, route.kind === "project" ? route.view : "research"));
+              navigate(projectHash(bundle.task.id, route.kind === "project" ? route.view ?? "report" : "report"));
             }}
           >
             <MessageSquare size={16} strokeWidth={1.75} />
@@ -173,19 +209,38 @@ export function GlobalBar({ route }: { readonly route: Route }) {
   );
 }
 
+/**
+ * The project's three workspaces, and the scope while it is still undecided.
+ *
+ * An unconfirmed project has exactly one place to work, so the scope appears
+ * beside the workspaces instead of being something the reader has to go and
+ * find; once it is confirmed it leaves the row and lives beside the project's
+ * title, with the rest of what the project *is* rather than what it contains.
+ */
 export function ProjectNav({ taskId, view }: { readonly taskId: string; readonly view: View }) {
   const { bundle } = useApp();
-  const counts: Partial<Record<View, string>> = {};
-  if (bundle !== null) {
-    const gaps = bundle.gaps.length;
-    if (bundle.hasReport && gaps > 0) counts.report = `${gaps} 项待查`;
-    if (!bundle.hasReport && bundle.matrix.length > 0) totals(bundle, counts);
-    if (bundle.sources.length > 0) counts.sources = String(bundle.sources.length);
-  }
+  const counts = bundle === null ? {} : navCounts(bundle);
+  const deciding = bundle !== null && !bundle.task.confirmed;
 
   return (
-    <nav className="rp-nav" aria-label="项目视图">
-      {(["research", "report", "sources", "brief", "gallery"] as const).map((candidate) => (
+    <nav className="rp-nav" aria-label="项目视图" data-testid="project-nav">
+      {deciding && (
+        <button
+          key="brief"
+          type="button"
+          className="rp-nav__item"
+          aria-current={view === "brief"}
+          onClick={() => {
+            navigate(projectHash(taskId, "brief"));
+          }}
+          data-testid="nav-brief"
+        >
+          {VIEW_ICONS.brief}
+          研究范围
+          <span className="rp-nav__count">待确认</span>
+        </button>
+      )}
+      {PRIMARY_NAV.map((candidate) => (
         <button
           key={candidate}
           type="button"
@@ -194,6 +249,7 @@ export function ProjectNav({ taskId, view }: { readonly taskId: string; readonly
           onClick={() => {
             navigate(projectHash(taskId, candidate));
           }}
+          data-testid={`nav-${candidate}`}
         >
           {VIEW_ICONS[candidate]}
           {VIEW_LABELS[candidate]}
@@ -206,9 +262,3 @@ export function ProjectNav({ taskId, view }: { readonly taskId: string; readonly
     </nav>
   );
 }
-
-function totals(bundle: TaskBundle, counts: Partial<Record<View, string>>): void {
-  const reviewed = bundle.matrix.filter((cell) => cell.status === "reviewed").length;
-  counts.research = `${reviewed}/${bundle.matrix.length}`;
-}
-

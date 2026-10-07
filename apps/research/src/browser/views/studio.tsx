@@ -38,7 +38,7 @@ import { api, type DocumentView } from "../api.js";
 import { COEDIT_SPLIT, clampSplit, splitFromDrag, studioLayout } from "../conversation-logic.js";
 import { coverageKey, DocumentCanvas, type CanvasSelection, type DocMode } from "../components/document.js";
 import { DockSlot } from "../components/dock.js";
-import { boundarySummary, boundariesOf, nameMaps, warningSummary } from "../document-logic.js";
+import { boundarySummary, boundariesOf, nameMaps, readerWarning, warningSummary } from "../document-logic.js";
 import { useApp } from "../store.js";
 import { currentReportOf } from "../store.js";
 
@@ -46,6 +46,20 @@ function when(iso: string): string {
   const date = new Date(iso);
   return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("zh-CN", { hour12: false });
 }
+
+/**
+ * The two ways this build prints a document.
+ *
+ * The choice belongs to the document, so it lives in the report's own toolbar
+ * and is called what it is — a 样式 — rather than a gallery of templates: there
+ * is one blueprint in this build, and a navigation item promising more would be
+ * a claim about the product rather than about the reader's options.
+ */
+export const DOC_THEME_OPTIONS: readonly { readonly id: string; readonly name: string; readonly note: string }[] =
+  Object.freeze([
+    { id: "editorial", name: "Editorial", note: "期刊排版" },
+    { id: "swiss", name: "Swiss", note: "分析出版" },
+  ]);
 
 export function StudioView() {
   const {
@@ -119,6 +133,12 @@ export function StudioView() {
       : null;
 
   const warnings = warningSummary(shown);
+  // The document's own contract, as the project's readout states it: a report
+  // that passed is not a chip at all, and one that has findings says how many
+  // and opens the details rather than printing the validator's sentences in the
+  // toolbar.
+  const readout = bundle?.presentation.artifactQuality ?? null;
+  const quality = readout !== null && readout.state !== "passed" && readout.state !== "unknown" ? readout : null;
 
   if (bundle === null) return null;
 
@@ -320,6 +340,48 @@ export function StudioView() {
                 <span className="rp-toolbar__long rp-brief-field__count">研究边界</span>
               </button>
             )}
+            {quality !== null && (
+              <Popover shadow="md" width={440} position="bottom-start" withinPortal>
+                <Popover.Target>
+                  <button
+                    type="button"
+                    className="rp-toolbar__alert rp-toolbar__optional"
+                    data-testid="quality-chip"
+                    data-state={quality.state}
+                  >
+                    {quality.state === "blocking"
+                      ? `需要先解决的问题 · ${String(quality.blocking)}`
+                      : `需要进一步核验 · ${String(quality.warnings)}`}
+                  </button>
+                </Popover.Target>
+                <Popover.Dropdown data-testid="quality-detail">
+                  <div className="rp-block__label" style={{ marginBottom: 10 }}>
+                    核验详情
+                  </div>
+                  <ul className="rp-quality__list">
+                    {(shown?.validation?.warnings ?? []).map((warning, index) => (
+                      <li key={`${String(index)}-${warning.slice(0, 12)}`}>{readerWarning(warning)}</li>
+                    ))}
+                  </ul>
+                  <p className="rp-status__note" style={{ marginTop: 10 }}>
+                    {quality.userMessage}
+                  </p>
+                  <details className="rp-action-card__log" data-testid="quality-technical">
+                    <summary>技术细节（校验编号）</summary>
+                    <ul>
+                      {(shown?.validation?.checks ?? [])
+                        .filter((check) => check.result !== "pass")
+                        .map((check) => (
+                          <li key={check.id}>
+                            {check.id} · {check.result}
+                            {check.detail.length > 0 ? ` · ${check.detail}` : ""}
+                          </li>
+                        ))}
+                    </ul>
+                  </details>
+                </Popover.Dropdown>
+              </Popover>
+            )}
           </div>
 
           <div className="rp-toolbar__group">
@@ -386,35 +448,37 @@ export function StudioView() {
 
             <Menu shadow="md" width={280} position="bottom-start">
               <Menu.Target>
+                {/* The control is called 样式 at every width — the name does
+                    not come and go with the room — and the style it would
+                    change is what drops out first when the toolbar is tight. */}
                 <Button size="compact-sm" variant="subtle" leftSection={<Palette size={14} />} data-testid="theme-menu" className="rp-toolbar__optional">
-                  {themeId === "swiss" ? "Swiss" : "Editorial"}
+                  样式
+                  <span className="rp-toolbar__long"> · {themeId === "swiss" ? "Swiss" : "Editorial"}</span>
                 </Button>
               </Menu.Target>
               <Menu.Dropdown>
-                <Menu.Label>文档主题 · 只改变排版</Menu.Label>
-                <Menu.Item
-                  onClick={() => {
-                    setThemeId("editorial");
-                  }}
-                >
-                  Editorial · 期刊排版{themeId === "editorial" ? "（当前）" : ""}
-                </Menu.Item>
-                <Menu.Item
-                  onClick={() => {
-                    setThemeId("swiss");
-                  }}
-                >
-                  Swiss · 分析出版{themeId === "swiss" ? "（当前）" : ""}
-                </Menu.Item>
+                <Menu.Label>文档样式 · 只改变排版</Menu.Label>
+                {DOC_THEME_OPTIONS.map((option) => (
+                  <Menu.Item
+                    key={option.id}
+                    onClick={() => {
+                      setThemeId(option.id);
+                    }}
+                    data-testid={`theme-option-${option.id}`}
+                  >
+                    {option.name} · {option.note}
+                    {themeId === option.id ? "（当前）" : ""}
+                  </Menu.Item>
+                ))}
                 <Menu.Divider />
-                <Menu.Label>文字、引用编号与证据编号不随主题变化</Menu.Label>
+                <Menu.Label>文字、引用编号与证据编号不随样式变化</Menu.Label>
                 <Menu.Item
                   leftSection={<Eye size={14} />}
                   onClick={() => {
                     window.location.hash = `#/p/${bundle.task.id}/gallery`;
                   }}
                 >
-                  并排比较两种主题
+                  并排比较两种样式
                 </Menu.Item>
               </Menu.Dropdown>
             </Menu>

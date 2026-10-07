@@ -39,7 +39,25 @@ export type DockTarget =
   | { readonly kind: "claim"; readonly claimId: string }
   | { readonly kind: "section"; readonly sectionId: string }
   | { readonly kind: "proposal"; readonly proposalId: string }
-  | { readonly kind: "assistant" };
+  /**
+   * What one action brought in, and nothing else.
+   *
+   * A 补查's own evidence is a different subject from the matrix cell it was
+   * about: the reader asked "what did this find", and showing them the whole
+   * project's material — or making them find the three new excerpts inside it —
+   * answers a question they did not ask. The turn is named, not the ids: the
+   * ids are the application's, and they are already on the run.
+   */
+  | { readonly kind: "action"; readonly interactionId: string }
+  /**
+   * The conversation, optionally scrolled back to one turn of it.
+   *
+   * `focus` is how "back to the conversation" means "back to what I was
+   * reading" rather than "back to the top": a reader who followed a research
+   * action into its evidence returns to that turn, not to the oldest one on
+   * screen.
+   */
+  | { readonly kind: "assistant"; readonly focus?: string };
 
 /** The document object the reader selected, and the actions that follow it. */
 export type Selection =

@@ -464,6 +464,78 @@ body {
   line-height: 1;
 }
 
+/* The project's one status, and the scope it belongs to. Both are controls
+   rather than labels: the status opens the facts behind it, the scope opens the
+   brief — which is where a project's scope lives now that it is not a
+   destination of its own. */
+.rp-bar__state {
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+  border-width: 1px;
+  border-style: solid;
+  border-color: transparent;
+  max-width: 34ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rp-bar__state:hover {
+  border-color: rgba(31, 44, 51, 0.16);
+}
+
+.rp-bar__scope {
+  appearance: none;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--rp-r-control);
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--rp-ink-3);
+  padding: 3px 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.rp-bar__scope:hover {
+  color: var(--rp-ink);
+  background: rgba(31, 44, 51, 0.045);
+}
+
+.rp-bar__scope-view {
+  color: var(--rp-brand);
+}
+
+.rp-status__note {
+  font-size: 11.5px;
+  color: var(--rp-ink-3);
+  line-height: 1.6;
+  margin: 12px 0 0;
+}
+
+/* Facts that are answers to different questions: they stack rather than share
+   a column, so nothing reads as a continuation of the line above it. */
+.rp-kv--stack {
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 9px 12px;
+}
+
+.rp-quality__list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--rp-ink-2);
+}
+
+.rp-quality__list li + li {
+  margin-top: 6px;
+}
+
 /* ------------------------------------------------------------------ start -- */
 
 .rp-start {
@@ -1534,10 +1606,12 @@ body {
   margin-bottom: 22px;
 }
 
-.rp-research__facts {
+/* The research scope, where the budget scoreboard used to be: what the matrix
+   is built on, and the way back to the brief that decided it. */
+.rp-research__scope {
   margin-left: auto;
-  display: flex;
-  gap: 22px;
+  text-align: right;
+  max-width: 32ch;
 }
 
 .rp-fact {
@@ -3279,6 +3353,71 @@ body {
   border-color: var(--rp-hairline);
 }
 
+/* A decided proposal, folded to the line it now is: what was decided, about
+   what, and when. The full text is one click away and stays out of the way of
+   the conversation that is still happening. */
+.rp-proposal-history {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--rp-hairline);
+  border-radius: var(--rp-r-surface);
+  background: var(--rp-surface);
+  font-size: 12.5px;
+  color: var(--rp-ink-2);
+}
+
+.rp-proposal-history__target {
+  font-weight: 550;
+  color: var(--rp-ink);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rp-proposal-history__when {
+  margin-left: auto;
+  color: var(--rp-ink-3);
+  white-space: nowrap;
+}
+
+/* The action's verdict, drawn as the answer rather than as a log line. */
+.rp-outcome {
+  border: 1px solid var(--rp-hairline);
+  border-radius: var(--rp-r-surface);
+  background: var(--rp-surface-2);
+  padding: 12px 14px;
+}
+
+.rp-outcome[data-status="unresolved"],
+.rp-outcome[data-status="proposal_not_created"] {
+  background: var(--rp-limited-bg);
+  border-color: transparent;
+}
+
+.rp-outcome__head {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--rp-ink);
+  letter-spacing: 0.01em;
+}
+
+.rp-outcome__row {
+  display: flex;
+  gap: 10px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  margin-top: 8px;
+}
+
+.rp-outcome__k {
+  flex: none;
+  width: 52px;
+  color: var(--rp-ink-3);
+}
+
 /* A long project title is the project's name, not its argument: two lines and
    then it is the topic's own problem to be long. */
 .rp-title--clamp {
@@ -3316,7 +3455,7 @@ body {
   padding-right: calc(20px + var(--rp-dock-offset, 0px));
 }
 
-.rp-research__facts,
+.rp-research__scope,
 .rp-matrix__foot,
 .rp-stable thead th:last-child {
   transition: padding-right var(--rp-t-dock) var(--rp-ease);

@@ -30,6 +30,18 @@ const FILTERS: readonly { readonly key: FilterKey; readonly label: string }[] = 
   { key: "failed", label: "读取失败" },
 ];
 
+/**
+ * What this filter counts, in this project's own terms.
+ *
+ * A filter that said「一手材料 0」for a project whose sources simply have no
+ * role yet would be making a claim about the material out of a classification
+ * that never happened, so it says what it is a count of.
+ */
+function filterLabel(bundle: TaskBundle, key: FilterKey, label: string): string {
+  if (key !== "primary") return label;
+  return bundle.presentation.sourceRoles.unknown > 0 ? `${label}（已分类）` : label;
+}
+
 function matches(source: SourceView, filter: FilterKey): boolean {
   switch (filter) {
     case "all":
@@ -112,7 +124,7 @@ export function SourcesView() {
                     setFilter(entry.key);
                   }}
                 >
-                  {entry.label}
+                  {filterLabel(bundle, entry.key, entry.label)}
                   <span style={{ color: "var(--rp-ink-3)" }}>
                     {sources.filter((source) => matches(source, entry.key)).length}
                   </span>
@@ -182,11 +194,10 @@ export function SourcesView() {
                         {source.venue.length > 0 ? ` · ${source.venue}` : ""}
                         {source.publishedAt !== null ? ` · ${source.publishedAt.slice(0, 10)}` : ""}
                       </div>
-                      <div className="rp-src__id rp-mono">{source.sourceId}</div>
                     </td>
                     <td>
                       {source.role === null ? (
-                        <span style={{ color: "var(--rp-ink-3)" }}>未声明</span>
+                        <span style={{ color: "var(--rp-ink-3)" }}>尚未分类</span>
                       ) : (
                         <span className={`rp-chip rp-chip--${source.role === "primary" || source.role === "official" ? "accent" : "quiet"}`}>
                           {ROLE_LABELS[source.role] ?? source.role}

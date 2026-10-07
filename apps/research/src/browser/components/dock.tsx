@@ -47,6 +47,7 @@ import {
   type SourceView,
   type TaskBundle,
 } from "../api.js";
+import { actionMaterial, deltaLine, interactionIdOf, outcomeOfRun, runOfInteraction } from "../outcome.js";
 import { findCell, useApp, type DockTarget } from "../store.js";
 import { navigate, projectHash } from "../router.js";
 import { AssistantPanel } from "./assistant.js";
@@ -66,6 +67,8 @@ function tabLabel(target: DockTarget): { readonly primary: string; readonly kick
       return { primary: "章节", kicker: "章节" };
     case "proposal":
       return { primary: "修改建议", kicker: "修改建议" };
+    case "action":
+      return { primary: "本轮证据", kicker: "本轮证据" };
     case "assistant":
       return { primary: "助手", kicker: "助手" };
   }
@@ -642,7 +645,7 @@ function SourcePanel({ bundle, source }: { readonly bundle: TaskBundle; readonly
           <dt>读取范围</dt>
           <dd>{source.readScope === null ? "—" : SCOPE_LABELS[source.readScope] ?? source.readScope}</dd>
           <dt>来源角色</dt>
-          <dd>{source.role === null ? "未声明" : ROLE_LABELS[source.role] ?? source.role}</dd>
+          <dd>{source.role === null ? "尚未分类" : ROLE_LABELS[source.role] ?? source.role}</dd>
           <dt>证据</dt>
           <dd>
             {evidence.length} 条
@@ -719,8 +722,157 @@ function SourcePanel({ bundle, source }: { readonly bundle: TaskBundle; readonly
   );
 }
 
-/* ----------------------------------------------------------------- dock -- */
+/* ------------------------------------------------- one action's material -- */
 
+/**
+ * What one action brought in, and what it left open.
+ *
+ * This is not the matrix narrowed down. The reader asked "what did this find",
+ * so the panel shows the resolution, then the sources, excerpts and support
+ * judgements that *this* action added — by id, from the run's own record — and
+ * the gaps that are still open. Nothing else in the project appears here: a
+ * panel that showed the whole material library would answer a question nobody
+ * asked and make the difference invisible.
+ */
+function ActionEvidencePanel({
+  bundle,
+  interactionId,
+  onBack,
+}: {
+  readonly bundle: TaskBundle;
+  readonly interactionId: string;
+  readonly onBack?: (() => void) | undefined;
+}) {
+  const run = runOfInteraction(bundle, interactionId);
+  if (run === null) {
+    return <p style={{ fontSize: 13, color: "var(--rp-ink-3)" }}>这次动作的记录不在当前项目里。</p>;
+  }
+  const result = outcomeOfRun(bundle, run);
+  const { sources, evidence, assessments } = actionMaterial(bundle, interactionId);
+  const nameOfCell = (target: { readonly subjectId: string; readonly dimensionId: string }): string =>
+    `${bundle.subjects.find((subject) => subject.id === target.subjectId)?.name ?? "比较对象"} × ${
+      bundle.dimensions.find((dimension) => dimension.id === target.dimensionId)?.name ?? "研究维度"
+    }`;
+
+  return (
+    <div data-testid="action-evidence">
+      {onBack !== undefined && (
+        <button type="button" className="rp-dock__back" onClick={onBack} data-testid="back-to-conversation">
+          <ArrowLeft size={12} />
+          返回对话
+        </button>
+      )}
+
+      <div className="rp-block">
+        <div className="rp-outcome" data-status={result.verdict}>
+          <div className="rp-outcome__head">{result.headline}</div>
+          <p className="rp-chat__said" style={{ margin: "6px 0 10px" }}>
+            {result.sentence}
+          </p>
+          <div className="rp-outcome__row">
+            <span className="rp-outcome__k">本轮新增</span>
+            <span data-testid="action-delta">{result.hasDelta ? deltaLine(result.delta) : "本轮没有找到新的材料。"}</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="rp-block">
+        <div className="rp-block__label">新增来源（{sources.length}）</div>
+        {sources.length === 0 ? (
+          <p style={{ fontSize: 13, color: "var(--rp-ink-3)", margin: 0 }}>这次动作没有新增来源。</p>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {sources.map((source) => (
+              <div key={source.sourceId} className="rp-quote" style={{ fontSize: 12.5 }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 5, flexWrap: "wrap" }}>
+                  <span className={`rp-chip rp-chip--${source.role === "primary" || source.role === "official" ? "accent" : "quiet"}`}>
+                    {source.role === null ? "尚未分类" : ROLE_LABELS[source.role] ?? source.role}
+                  </span>
+                  <span className="rp-chip rp-chip--quiet">
+                    {source.readScope === null ? "未读取" : SCOPE_LABELS[source.readScope] ?? source.readScope}
+                  </span>
+                </div>
+                <div style={{ fontWeight: 550, color: "var(--rp-ink)" }}>{source.title}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="rp-block">
+        <div className="rp-block__label">新增证据（{evidence.length}）</div>
+        {evidence.length === 0 ? (
+          <p style={{ fontSize: 13, color: "var(--rp-ink-3)", margin: 0 }}>这次动作没有新增可引用的片段。</p>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {evidence.map((item) => (
+              <EvidenceItem
+                key={item.evidenceId}
+                evidence={item}
+                bundle={bundle}
+                active={false}
+                onSelect={() => {
+                  /* the reader is already looking at this action's evidence */
+                }}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="rp-block">
+        <div className="rp-block__label">对应的支持评估（{assessments.length}）</div>
+        {assessments.length === 0 ? (
+          <p style={{ fontSize: 13, color: "var(--rp-ink-3)", margin: 0 }}>这次动作没有产生支持评估。</p>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {assessments.map((entry) => (
+              <div key={entry.assessmentId} className="rp-quote" style={{ fontSize: 12.5 }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 5, flexWrap: "wrap" }}>
+                  <span
+                    className={`rp-chip rp-chip--${
+                      entry.relationship === "supports" ? "reviewed" : entry.relationship === "contradicts" ? "conflict" : "quiet"
+                    }`}
+                  >
+                    {entry.relationship === "supports" ? "支持" : entry.relationship === "contradicts" ? "相反" : "背景"}
+                  </span>
+                  <span className="rp-chip rp-chip--quiet">
+                    {entry.directness === "direct" ? "正文级 · 直接" : entry.directness === "indirect" ? "间接" : entry.directness === "contextual" ? "仅背景" : "未评估"}
+                  </span>
+                  <span style={{ color: "var(--rp-ink-3)", fontSize: 11.5 }}>{nameOfCell(entry.target)}</span>
+                </div>
+                {entry.rationale}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="rp-block">
+        <div className="rp-block__label">仍未解决的缺口（{result.missing.length}）</div>
+        {result.missing.length === 0 ? (
+          <p style={{ fontSize: 13, color: "var(--rp-ink-3)", margin: 0 }}>
+            {result.verdict === "resolved" ? "这次动作没有留下未解决的缺口。" : "这次动作没有记录具体缺口。"}
+          </p>
+        ) : (
+          <div className="rp-note rp-note--warn">
+            <Search size={14} style={{ flex: "none", marginTop: 2 }} />
+            <span>
+              {result.missing.map((target) => (
+                <span key={target.label} style={{ display: "block" }}>
+                  <b>{target.label}</b>
+                  {target.reason.length > 0 ? `：${target.reason}` : ""}
+                </span>
+              ))}
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------------- dock -- */
 /**
  * How wide the one panel is, and why.
  *
@@ -858,6 +1010,14 @@ export function ContextDock({
           sub: proposal === undefined ? "" : proposal.reason,
         };
       }
+      case "action": {
+        const run = bundle.runs.find((candidate) => interactionIdOf(candidate) === dock.interactionId);
+        return {
+          kicker: "本轮证据",
+          title: run === undefined || run.userText.length === 0 ? "这次动作" : run.userText,
+          sub: "只显示这次动作用到的材料，与整个项目的材料库无关",
+        };
+      }
       case "assistant":
         return { kicker: "助手", title: "与文档并排工作", sub: "" };
     }
@@ -885,7 +1045,7 @@ export function ContextDock({
       {!bare && (
       <div className="rp-dock__head">
         <div style={{ minWidth: 0 }}>
-          {workspace && dock.kind !== "assistant" && onBackToConversation !== undefined && (
+          {workspace && dock.kind !== "assistant" && dock.kind !== "action" && onBackToConversation !== undefined && (
             <button
               type="button"
               className="rp-dock__back"
@@ -1032,6 +1192,20 @@ export function ContextDock({
       ) : dock.kind === "proposal" ? (
         <div className="rp-dock__body" ref={bodyRef}>
           <ProposalPanel bundle={bundle} proposalId={dock.proposalId} />
+        </div>
+      ) : dock.kind === "action" ? (
+        <div className="rp-dock__body" ref={bodyRef}>
+          <ActionEvidencePanel
+            bundle={bundle}
+            interactionId={dock.interactionId}
+            onBack={
+              workspace
+                ? () => {
+                    openDock({ kind: "assistant", focus: dock.interactionId });
+                  }
+                : undefined
+            }
+          />
         </div>
       ) : (
         <div className="rp-dock__body">

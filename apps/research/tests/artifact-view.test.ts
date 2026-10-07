@@ -500,7 +500,7 @@ describe("the checks at the top of the document", () => {
   it("says how many obligations were not met, and keeps the sentences behind a disclosure", () => {
     expect(warningSummary(documentFixture())).toEqual({
       count: 1,
-      headline: "1 处义务未完全达成，正文里已如实写出",
+      headline: "需要进一步核验 · 1",
     });
     expect(warningSummary({ ...documentFixture(), validation: null })).toBeNull();
   });

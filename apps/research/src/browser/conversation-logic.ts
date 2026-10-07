@@ -19,6 +19,9 @@
 
 import type { AnswerView, ProposalView, RunOutcomeView, RunStepView, RunView, TaskBundle } from "./api.js";
 import { TOOL_LABELS } from "./api.js";
+import { countCalls, interactionIdOf, refusedCall } from "./outcome.js";
+
+export { refusedCall };
 
 /** How many interactions the workspace shows. Enough to be a history, not a log. */
 export const CONVERSATION_LIMIT = 10;
@@ -56,23 +59,6 @@ export interface Interaction {
    * is not how many claims changed.
    */
   readonly outcome: RunOutcomeView | null;
-}
-
-/**
- * Whether a call the host completed was one the *service* refused.
- *
- * A refusal is a tool result, not a failure: the host ran the call and the
- * server said no, so the record carries `ok: true` and the sentence refusing
- * the call is inside the result body. Counting those as work done would let an
- * action report having searched three times when it searched twice and was
- * turned away once — and the allowance it says it spent would be wrong too.
- */
-export function refusedCall(detail: string): boolean {
-  return /\{"ok":false/.test(detail);
-}
-
-function countOf(run: RunView, name: string): number {
-  return run.activity.filter((step) => step.name === name && step.ok !== false && !refusedCall(step.detail)).length;
 }
 
 /** A refusal arrives inside a tool result; the reader gets its sentences. */
@@ -133,7 +119,7 @@ export function conversationOf(bundle: TaskBundle, answers: readonly AnswerView[
     if (kind === null || run.userText.length === 0) continue;
     const proposalCall = run.activity.filter((step) => step.name === "propose_section_edit").slice(-1)[0];
     interactions.push({
-      id: run.runId ?? `${run.stage}-${run.startedAt}`,
+      id: interactionIdOf(run),
       runId: run.runId,
       kind,
       at: run.startedAt,
@@ -141,10 +127,13 @@ export function conversationOf(bundle: TaskBundle, answers: readonly AnswerView[
       status: run.status,
       userText: run.userText,
       answer: kind === "ask" ? (answers.find((entry) => entry.runId === run.runId)?.text ?? null) : null,
-      searches: countOf(run, "search_sources"),
-      reads: countOf(run, "read_source"),
-      assessments: countOf(run, "assess_coverage"),
-      drafted: proposalCall !== undefined && proposalCall.ok === true && !refusedCall(proposalCall.detail),
+      searches: countCalls(run, "search_sources"),
+      reads: countCalls(run, "read_source"),
+      assessments: countCalls(run, "assess_coverage"),
+      drafted:
+        run.outcome?.kind === "edit"
+          ? run.outcome.status === "proposal_created"
+          : proposalCall !== undefined && proposalCall.ok === true && !refusedCall(proposalCall.detail),
       refusal: proposalCall === undefined ? "" : refusalOf(proposalCall.detail),
       steps: stepsOf(run),
       failure: run.status === "failed" || run.status === "interrupted" ? run.note : "",

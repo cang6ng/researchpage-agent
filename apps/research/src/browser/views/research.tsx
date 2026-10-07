@@ -17,7 +17,8 @@ import { Button, Tooltip } from "@mantine/core";
 import { ArrowRight, CircleDot, FileText, Gauge, Loader, MessageSquare, Search, Target } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { ROLE_LABELS, STATUS_LABELS, STATUS_MARKS, TOOL_LABELS, type TaskBundle } from "../api.js";
+import { STATUS_LABELS, STATUS_MARKS, TOOL_LABELS, type TaskBundle } from "../api.js";
+import { scopeSummary } from "../status.js";
 import { DockSlot } from "../components/dock.js";
 import { useApp } from "../store.js";
 import { api } from "../api.js";
@@ -107,7 +108,14 @@ function supportLine(bundle: TaskBundle, evidenceIds: readonly string[]): string
   return `${evidenceIds.length} 条证据${primary > 0 ? ` · ${primary} 条一手` : ""}${body ? "" : " · 仅摘要级"}`;
 }
 
-/** The one line above the matrix that says what the project is waiting for. */
+/**
+ * The one line above the matrix that says what the project is waiting for.
+ *
+ * It is one line about the research and nothing else. What a run spent —
+ * searches, reads, gap rounds — belongs beside the action that spends it, not
+ * as a permanent scoreboard over the matrix: a reader looking at「已核对 1/15」
+ * is not helped by knowing the agent has used four of its six searches.
+ */
 function ProjectHeadline({ bundle }: { readonly bundle: TaskBundle }) {
   const reviewed = bundle.matrix.filter((cell) => cell.status === "reviewed").length;
   const gaps = bundle.gaps.length;
@@ -126,25 +134,22 @@ function ProjectHeadline({ bundle }: { readonly bundle: TaskBundle }) {
               : `已核对 ${reviewed}/${bundle.matrix.length} 个比较项，还有 ${gaps} 项没有直接依据。`}
         </p>
       </div>
-      <div className="rp-research__facts">
-        <div className="rp-fact">
-          <div className="rp-fact__k">检索</div>
-          <div className="rp-fact__v">
-            {bundle.usage.searches}/{bundle.budget.maxSearches}
-          </div>
+      <div className="rp-research__scope">
+        <div className="rp-fact__k">研究范围</div>
+        <div style={{ fontSize: 13, color: "var(--rp-ink-2)", lineHeight: 1.6, marginTop: 2 }}>
+          {scopeSummary(bundle)}
         </div>
-        <div className="rp-fact">
-          <div className="rp-fact__k">读取</div>
-          <div className="rp-fact__v">
-            {bundle.usage.reads}/{bundle.budget.maxReads}
-          </div>
-        </div>
-        <div className="rp-fact">
-          <div className="rp-fact__k">补查</div>
-          <div className="rp-fact__v">
-            {bundle.usage.gapRounds}/{bundle.budget.maxGapRounds}
-          </div>
-        </div>
+        <button
+          type="button"
+          className="rp-nav__item"
+          style={{ padding: "2px 0", fontSize: 12.5, color: "var(--rp-brand)" }}
+          onClick={() => {
+            navigate(projectHash(bundle.task.id, "brief"));
+          }}
+          data-testid="scope-from-research"
+        >
+          查看研究范围
+        </button>
       </div>
     </div>
   );
@@ -421,13 +426,16 @@ export function ResearchView() {
       )}
 
           {bundle.sources.length > 0 && (
-        <p className="rp-meta" style={{ marginTop: 22 }}>
+        <p className="rp-meta" style={{ marginTop: 22 }} data-testid="research-sources-line">
           <Search size={13} />
           已读取 {bundle.sources.filter((source) => source.readStatus === "ok").length} 个来源
           <span className="rp-meta__sep">·</span>
           {bundle.evidence.length} 条证据
           <span className="rp-meta__sep">·</span>
-          {Object.keys(ROLE_LABELS).length > 0 && `${bundle.sources.filter((source) => source.role === "primary").length} 个一手来源`}
+          {/* The role line is the project's own readout: a source nobody
+              classified is unclassified, which is not the same as a project
+              with no primary material. */}
+          {bundle.presentation.sourceRoles.userMessage}
           <button
             type="button"
             className="rp-nav__item"

@@ -27,6 +27,7 @@ import {
   proposalFor,
   type Interaction,
 } from "../conversation-logic.js";
+import { deltaLine, interactionIdOf, researchOutcomeOf } from "../outcome.js";
 import { currentReportOf, useApp, type AssistantIntent, type Selection } from "../store.js";
 import { navigate, projectHash } from "../router.js";
 import { runningSummary } from "../views/research.js";
@@ -139,8 +140,11 @@ function Steps({ interaction }: { readonly interaction: Interaction }) {
  *
  * The reply's *shape* is the product's and its *words* are the model's where
  * there are any: an Ask answers in prose, anything else reports what it did.
+ *
+ * Exported because the turn is the product's most load-bearing sentence —「问题
+ * 解决了吗」— and the markup it produces is checked as markup, not by eye.
  */
-function AssistantTurn({
+export function AssistantTurn({
   bundle,
   interaction,
   proposal,
@@ -149,6 +153,7 @@ function AssistantTurn({
   onInspect,
   onOpenProposal,
   onEditFromResearch,
+  onRetryEdit,
   onRewrite,
 }: {
   readonly bundle: TaskBundle;
@@ -159,10 +164,16 @@ function AssistantTurn({
   readonly onInspect: () => void;
   readonly onOpenProposal: () => void;
   readonly onEditFromResearch: () => void;
+  readonly onRetryEdit: () => void;
   readonly onRewrite: () => void;
 }) {
   const running = interaction.status === "running";
   const exhausted = budgetExhausted(interaction, allowance);
+  const outcome = researchOutcomeOf(bundle, interaction);
+  // What an Edit ran into, in the words written for the person who asked for
+  // the change. The tool's own refusal is the fallback for runs that predate
+  // the sentence being recorded.
+  const failureReason = interaction.outcome?.kind === "edit" ? interaction.outcome.userMessage : interaction.refusal;
 
   return (
     <div className="rp-chat__turn rp-chat__turn--assistant" data-testid={`action-${interaction.kind === "research" ? "gap" : interaction.kind}`}>
@@ -199,33 +210,58 @@ function AssistantTurn({
             </>
           ) : (
             <>
-              <p className="rp-chat__said" data-testid="research-result">
-                {exhausted
-                  ? "这次补查已经用完了本轮的检索额度。"
-                  : /* The result answers whether the question was resolved. A
-                       count of sources fetched is not that answer: two
-                       background papers satisfy「找到 2 个可用来源」while
-                       leaving the question entirely open. */
-                    interaction.outcome?.kind === "research"
-                    ? interaction.outcome.resolution.summary
-                    : `找到了 ${String(interaction.reads)} 个来源的可用材料。`}
-              </p>
-              <div className="rp-action-card__body">
-                <span>
-                  本轮：检索 <b className="rp-action-card__num">{interaction.searches}</b> 次 · 读取{" "}
-                  <b className="rp-action-card__num">{interaction.reads}</b> 次 · 覆盖评估{" "}
-                  <b className="rp-action-card__num">{interaction.assessments}</b> 格
-                </span>
-                <span className="rp-muted">报告正文没有改变：补查只增加材料与支持评估。</span>
+              {/* The result answers whether the question was resolved. A count
+                  of sources fetched is not that answer: two background papers
+                  satisfy「找到 2 个可用来源」while leaving the question entirely
+                  open. */}
+              <div className="rp-outcome" data-testid="research-outcome" data-status={outcome.verdict}>
+                <div className="rp-outcome__head" data-testid="research-verdict">
+                  {outcome.headline}
+                </div>
+                <p className="rp-chat__said" data-testid="research-result">
+                  {outcome.sentence}
+                </p>
+                {outcome.settled.length > 0 && (
+                  <div className="rp-outcome__row">
+                    <span className="rp-outcome__k">已解决</span>
+                    <span>{outcome.settled.join("、")}</span>
+                  </div>
+                )}
+                {outcome.missing.length > 0 && (
+                  <div className="rp-outcome__row">
+                    <span className="rp-outcome__k">仍缺少</span>
+                    <span>
+                      {outcome.missing
+                        .map((target) => (target.reason.length > 0 ? `${target.label}（${target.reason}）` : target.label))
+                        .join("；")}
+                    </span>
+                  </div>
+                )}
+                <div className="rp-outcome__row">
+                  <span className="rp-outcome__k">本轮新增</span>
+                  <span data-testid="research-delta">
+                    {outcome.hasDelta ? deltaLine(outcome.delta) : "本轮没有找到新的材料。"}
+                  </span>
+                </div>
               </div>
+              {exhausted && <p className="rp-chat__note">本轮的检索额度已经用完；可以再发一条指令，那会得到新的一次额度。</p>}
               <div className="rp-action-card__actions">
-                <Button size="xs" variant="default" onClick={onInspect}>
-                  检查新证据
-                </Button>
+                {outcome.inspectable && (
+                  <Button size="xs" variant="default" onClick={onInspect} data-testid="inspect-action-evidence">
+                    查看本轮证据
+                  </Button>
+                )}
                 <Button size="xs" variant="subtle" leftSection={<SquarePen size={13} />} onClick={onEditFromResearch}>
                   基于这些材料修改本节
                 </Button>
               </div>
+              {/* What the action spent is a secondary detail, and it stays
+                  folded: 「问题解决了吗」is the result, the tool counts are not. */}
+              <details className="rp-action-card__log" data-testid="research-activity">
+                <summary>本轮活动</summary>
+                <p>{outcome.activity}</p>
+                <p className="rp-muted">报告正文没有改变：补查只增加材料与支持评估。</p>
+              </details>
             </>
           )
         ) : running ? (
@@ -246,13 +282,23 @@ function AssistantTurn({
           </>
         ) : (
           <>
-            <p className="rp-chat__said">这次没有产生修改建议，报告正文没有变化。</p>
-            <p className="rp-chat__note">
-              {interaction.refusal.length > 0 ? interaction.refusal : "模型这一次没有起草提案；可以改一下说法再试。"}
-            </p>
+            {/* Nothing was drafted, so nothing is offered to accept: the turn
+                says what the attempt ran into — in the application's own words,
+                which name what the rewrite lost rather than a check id — and
+                offers the two things the reader can do about it. */}
+            <div className="rp-outcome" data-testid="edit-outcome" data-status="proposal_not_created">
+              <div className="rp-outcome__head">这次改写没有形成可接受的修改建议</div>
+              <p className="rp-chat__said" data-testid="edit-refusal-reason">
+                {failureReason.length > 0 ? failureReason : "模型这一次没有起草提案。"}
+              </p>
+              {!failureReason.includes("正文") && <p className="rp-chat__note">报告正文没有变化。</p>}
+            </div>
             <div className="rp-action-card__actions">
-              <Button size="xs" variant="default" onClick={onRewrite}>
-                改写指令再试
+              <Button size="xs" variant="default" onClick={onRetryEdit} data-testid="retry-edit">
+                重新尝试
+              </Button>
+              <Button size="xs" variant="subtle" onClick={onRewrite} data-testid="rewrite-edit">
+                换一种修改方式
               </Button>
             </div>
           </>
@@ -273,9 +319,10 @@ function AssistantTurn({
 }
 
 export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
-  const { assistant, answers, runtime, selection, setSelection, openDock, prefillAssistant, updateAssistant, refresh, busy, say } =
+  const { assistant, answers, runtime, selection, setSelection, dock, openDock, prefillAssistant, updateAssistant, refresh, busy, say } =
     useApp();
   const composer = useRef<HTMLTextAreaElement | null>(null);
+  const thread = useRef<HTMLDivElement | null>(null);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const report = currentReportOf(bundle);
@@ -291,16 +338,19 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
     if (assistant.token > 0 && assistant.text.length > 0) composer.current?.focus();
   }, [assistant.token, assistant.text]);
 
-  const send = async (): Promise<void> => {
-    const value = text.trim();
+  const send = async (
+    value: string,
+    intentToUse: AssistantIntent = intent,
+    sectionId: string | null = target.sectionId,
+  ): Promise<void> => {
     if (value.length === 0) return;
     setSending(true);
     setError(null);
     try {
       await api.assistant(bundle.task.id, {
         text: value,
-        intent,
-        ...(intent === "edit" && target.sectionId !== null ? { targetSectionId: target.sectionId } : {}),
+        intent: intentToUse,
+        ...(intentToUse === "edit" && sectionId !== null ? { targetSectionId: sectionId } : {}),
       });
       updateAssistant({ text: "" });
       await refresh();
@@ -316,14 +366,27 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
   const interactions = conversationOf(bundle, answers);
   const allowance = runtime?.actionAllowance ?? { searches: 2, reads: 4 };
 
-  const inspect = (): void => {
-    const gap = bundle.gaps[0];
-    if (gap !== undefined) {
-      setSelection({ kind: "cell", subjectId: gap.subjectId, dimensionId: gap.dimensionId });
-      openDock({ kind: "cell", subjectId: gap.subjectId, dimensionId: gap.dimensionId });
-      return;
-    }
-    navigate(projectHash(bundle.task.id, "research"));
+  // Following an action into its evidence is a move inside the conversation:
+  // the reader returns to the turn they left, not to the top of the thread.
+  const focus = dock?.kind === "assistant" ? dock.focus : undefined;
+  const consumed = useRef<string | null>(null);
+  useEffect(() => {
+    if (focus === undefined || focus === consumed.current) return;
+    consumed.current = focus;
+    thread.current
+      ?.querySelector(`[data-interaction-id="${CSS.escape(focus)}"]`)
+      ?.scrollIntoView({ block: "center" });
+  }, [focus]);
+
+  /** Opens the evidence this one action brought in — and only that. */
+  const inspect = (interaction: Interaction): void => {
+    openDock({ kind: "action", interactionId: interaction.id });
+  };
+
+  /** Sends the same sentence again, for an Edit that produced nothing. */
+  const retryEdit = (value: string): void => {
+    updateAssistant({ intent: "edit", text: value });
+    void send(value, "edit", target.sectionId);
   };
 
   /**
@@ -405,7 +468,7 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
         )}
       </div>
 
-      <div className="rp-assistant__body" data-testid="assistant-thread">
+      <div className="rp-assistant__body" data-testid="assistant-thread" ref={thread}>
         {running !== null && (
           <div className="rp-note rp-note--quiet rp-assistant__running">
             <Sparkles size={14} style={{ flex: "none", marginTop: 2 }} />
@@ -430,7 +493,7 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
         )}
 
         {interactions.map((interaction) => (
-          <div className="rp-chat__exchange" key={interaction.id}>
+          <div className="rp-chat__exchange" key={interaction.id} data-interaction-id={interaction.id}>
             <UserTurn text={interaction.userText} />
             <AssistantTurn
               bundle={bundle}
@@ -438,7 +501,9 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
               proposal={proposalFor(interaction, bundle.proposals, Date.now())}
               allowance={allowance}
               answerBudget={bundle.actionBudget}
-              onInspect={inspect}
+              onInspect={() => {
+                inspect(interaction);
+              }}
               onOpenProposal={() => {
                 void openProposal();
               }}
@@ -449,8 +514,12 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
                   text: target.sectionId === null ? "" : `基于刚才补查到的材料，修改「${target.label}」这一节。`,
                 });
               }}
+              onRetryEdit={() => {
+                retryEdit(interaction.userText);
+              }}
               onRewrite={() => {
-                updateAssistant({ intent: "edit" });
+                updateAssistant({ intent: "edit", text: "" });
+                composer.current?.focus();
               }}
             />
           </div>
@@ -491,7 +560,7 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
           onKeyDown={(event) => {
             if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
               event.preventDefault();
-              void send();
+              void send(text.trim());
             }
           }}
           data-testid="assistant-input"
@@ -531,7 +600,7 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
                 loading={sending}
                 disabled={text.trim().length === 0 || busy || needsSection}
                 onClick={() => {
-                  void send();
+                  void send(text.trim());
                 }}
                 data-testid="assistant-submit"
               >

@@ -827,10 +827,10 @@ export const STATUS_MARKS: Readonly<Record<string, string>> = Object.freeze({
 /** What each support state means, in the words the workspace shows. */
 export const STATUS_LABELS: Readonly<Record<string, string>> = Object.freeze({
   reviewed: "已核对",
-  limited: "有限支持",
+  limited: "支持有限",
   unassessed: "有材料，待核对",
-  conflict: "冲突 / 不可比",
-  missing: "待查",
+  conflict: "证据冲突",
+  missing: "缺少依据",
 });
 
 /**
@@ -844,14 +844,41 @@ export const STATUS_LABELS: Readonly<Record<string, string>> = Object.freeze({
  */
 export const CELL_FALLBACK_LABELS: Readonly<Record<string, string>> = Object.freeze({
   reviewed: "尚未写出判断",
-  limited: "有限支持",
+  limited: "支持有限",
   unassessed: "有材料，待核对",
-  conflict: "冲突 / 不可比",
+  conflict: "不可直接比较",
   missing: "证据不足",
 });
 
 /** The fallback for a cell whose pair the project has no coverage row for. */
 export const CELL_UNKNOWN_LABEL = "尚未写出判断";
+
+/**
+ * Whether one research action answered the question it was given.
+ *
+ * The three words are the whole of the answer a reader needs from a 补查, and
+ * they are not a score: `unresolved` means the question is still open, not that
+ * the search failed.
+ */
+export const RESOLUTION_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  resolved: "已解决",
+  partially_resolved: "部分解决",
+  unresolved: "未解决",
+});
+
+/**
+ * What became of a modification proposal, in the words of the decision.
+ *
+ * `stale` and `invalid` are the two the reader cannot act on any more, and they
+ * say what to do instead of naming the state they are in.
+ */
+export const PROPOSAL_STATUS_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  pending: "待确认",
+  accepted: "已接受",
+  discarded: "已放弃",
+  stale: "需要重新生成",
+  invalid: "未生成修改建议",
+});
 
 export const STAGE_LABELS: Readonly<Record<string, string>> = Object.freeze({
   card: "任务卡",

@@ -17,6 +17,7 @@ import { useEffect, useState } from "react";
 
 import { api, CLAIM_TYPE_LABELS, type ProposalDetailView, type TaskBundle } from "../api.js";
 import { claimChanges } from "../claims.js";
+import { proposalDeltaLine, proposalViewState } from "../proposal-logic.js";
 import { useApp } from "../store.js";
 import { DocumentBlocks } from "./document.js";
 
@@ -45,6 +46,10 @@ export function ProposalPanel({
   const [error, setError] = useState<string | null>(null);
   const [pane, setPane] = useState<"proposed" | "current">("proposed");
   const [working, setWorking] = useState(false);
+  // A decided proposal is history: it stays in the conversation as one line —
+  // what was decided, about what, and when — and opens only when asked. The
+  // pending one is the reader's current task and is always expanded.
+  const [open, setOpen] = useState(false);
   const settle = onSettled ?? ((): void => openDock(null));
 
   // The panel is shown inside the conversation now, so it has to notice when
@@ -77,7 +82,8 @@ export function ProposalPanel({
     );
   }
 
-  const pending = proposal.status === "pending";
+  const view = proposalViewState(proposal.status);
+  const pending = view.decidable;
   const currentSection =
     document?.sections.find((section) => section.id === proposal.sections[0]?.id) ?? document?.sections[0];
 
@@ -115,24 +121,56 @@ export function ProposalPanel({
     }
   };
 
+  const targetTitles =
+    proposal.sections.map((section) => section.title).join("、") ||
+    proposal.targets.map((target) => target.targetId).join("、");
+
+  if (view.folded && !open) {
+    return (
+      <div className="rp-proposal-history" data-testid="proposal-history" data-status={proposal.status}>
+        <span className={`rp-chip rp-chip--${view.tone}`} data-testid="proposal-history-status">
+          {view.label}
+        </span>
+        <span className="rp-proposal-history__target">{targetTitles}</span>
+        <span className="rp-proposal-history__when">{when(proposal.decidedAt ?? proposal.createdAt)}</span>
+        <button
+          type="button"
+          className="rp-nav__item"
+          style={{ fontSize: 12.5 }}
+          onClick={() => {
+            setOpen(true);
+          }}
+          data-testid="expand-proposal"
+        >
+          展开
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div>
       <div className={`rp-proposal${pending ? "" : " rp-proposal--settled"}`}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          <span className={`rp-chip rp-chip--${pending ? "accent" : proposal.status === "accepted" ? "reviewed" : "quiet"}`}>
-            {pending
-              ? "待接受"
-              : proposal.status === "accepted"
-                ? "已接受"
-                : proposal.status === "discarded"
-                  ? "已放弃"
-                  : proposal.status === "stale"
-                    ? "基线已变化"
-                    : "内容未通过校验"}
+          <span className={`rp-chip rp-chip--${view.tone}`} data-testid="proposal-status">
+            {view.label}
           </span>
           <span style={{ fontSize: 12.5, color: "var(--rp-ink-3)" }} data-testid="proposal-target">
-            目标：{proposal.sections.map((section) => section.title).join("、") || proposal.targets.map((target) => target.targetId).join("、")}
+            目标：{targetTitles}
           </span>
+          {!pending && (
+            <button
+              type="button"
+              className="rp-nav__item"
+              style={{ marginLeft: "auto", fontSize: 12.5 }}
+              onClick={() => {
+                setOpen(false);
+              }}
+              data-testid="collapse-proposal"
+            >
+              收起
+            </button>
+          )}
         </div>
 
         <p style={{ fontSize: 13.5, color: "var(--rp-ink-2)", lineHeight: 1.65, margin: "12px 0 0" }}>{proposal.reason}</p>
@@ -248,16 +286,10 @@ export function ProposalPanel({
                     answer rather than a small project total: an edit that
                     searched for nothing says so, instead of reporting how much
                     material the project happens to hold. */}
-                {summary.researchAdded.sources === 0 &&
-                summary.researchAdded.evidence === 0 &&
-                summary.researchAdded.assessments === 0
-                  ? "本次修改没有新增研究材料。"
-                  : `${String(summary.researchAdded.sources)} 个来源 · ${String(summary.researchAdded.evidence)} 条证据 · ${String(summary.researchAdded.assessments)} 条评估`}
+                {proposalDeltaLine(summary.researchAdded)}
               </dd>
             </>
           )}
-          <dt>基线</dt>
-          <dd className="rp-mono">{proposal.baseContentHash.slice(7, 19)}…</dd>
         </dl>
         <p style={{ fontSize: 12, color: "var(--rp-ink-3)", margin: "10px 0 0", lineHeight: 1.55 }}>
           接受只替换上面那个目标；其它章节、来源与证据都不会因为这次接受而改变。
@@ -325,8 +357,8 @@ export function ProposalPanel({
       ) : (
         <p style={{ fontSize: 12.5, color: "var(--rp-ink-3)", marginTop: 14, lineHeight: 1.6 }}>
           已结束于 {proposal.decidedAt === null ? "—" : when(proposal.decidedAt)}。
-          {proposal.status === "stale" && " 报告在你接受之前已经变化，因此这份提案不能再被应用。"}
-          {proposal.status === "accepted" && ` 由它产生的报告：${proposal.acceptedReportId ?? "—"}。`}
+          {proposal.status === "stale" && " 报告在你接受之前已经变化，因此这份提案不能再被应用；可以重新生成一份。"}
+          {proposal.status === "accepted" && " 这次修改已经写进报告，只替换了上面那个目标。"}
         </p>
       )}
     </div>
