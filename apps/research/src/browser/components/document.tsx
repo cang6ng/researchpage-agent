@@ -39,7 +39,7 @@ import {
   type DocumentNames,
 } from "../document-logic.js";
 import { RichInline } from "./markdown.js";
-import { STATUS_LABELS } from "../api.js";
+import { CELL_FALLBACK_LABELS, CELL_UNKNOWN_LABEL, STATUS_LABELS } from "../api.js";
 
 export type DocMode = "read" | "verify";
 
@@ -231,7 +231,7 @@ function CellBody({
   // in a comparison reads as "nothing to say" — and what the project actually
   // knows about this pair is one coverage lookup away.
   const state = subjectId === undefined || dimensionId === undefined ? undefined : context.coverage.get(coverageKey(subjectId, dimensionId));
-  const label = state === undefined ? "未填写" : STATUS_LABELS[state] ?? state;
+  const label = state === undefined ? CELL_UNKNOWN_LABEL : CELL_FALLBACK_LABELS[state] ?? STATUS_LABELS[state] ?? state;
   const openable = context.mode === "verify" && subjectId !== undefined && dimensionId !== undefined;
   return (
     <td data-empty="true" data-testid={testId}>
@@ -298,8 +298,11 @@ function ComparisonMatrix({ block, context }: { readonly block: Extract<ReportBl
                 </th>
                 {shape.rows.map((rowEntry) => {
                   const authored = block.rows[rowEntry.row];
-                  const cell = authored?.cells[entry.column];
-                  if (cell === undefined) return <td key={rowEntry.row} data-empty="true" />;
+                  // A row that stops short of a column is the same fact as an
+                  // empty cell, and it used to render as literally nothing: a
+                  // `<td>` with no text and no state. It goes through CellBody
+                  // like every other cell, so the fallback applies.
+                  const cell = authored?.cells[entry.column] ?? { text: "", claimIds: [] };
                   return (
                     <CellBody
                       key={`${String(rowEntry.row)}-${String(entry.column)}`}
@@ -341,13 +344,19 @@ function PlainTable({ block, context }: { readonly block: Extract<ReportBlock, {
           </tr>
         </thead>
         <tbody>
-          {block.rows.map((row, rowIndex) => (
-            <tr key={rowIndex}>
-              {row.cells.map((cell, cellIndex) => (
-                <CellBody key={cellIndex} cell={cell} context={context} />
-              ))}
-            </tr>
-          ))}
+          {block.rows.map((row, rowIndex) => {
+            // The row is drawn to the table's declared width, not to whatever
+            // the writer happened to submit: a short row would otherwise break
+            // the frame silently, with later columns simply missing.
+            const width = Math.max(block.columns.length, row.cells.length);
+            return (
+              <tr key={rowIndex}>
+                {Array.from({ length: width }, (_, cellIndex) => (
+                  <CellBody key={cellIndex} cell={row.cells[cellIndex] ?? { text: "", claimIds: [] }} context={context} />
+                ))}
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

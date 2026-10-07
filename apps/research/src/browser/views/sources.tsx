@@ -83,7 +83,10 @@ export function SourcesView() {
   if (bundle === null) return null;
 
   const readCount = sources.filter((source) => source.readStatus === "ok").length;
-  const primaryCount = sources.filter((source) => source.role === "primary" || source.role === "official").length;
+  // The role line comes from the project's own readout, because the count
+  // depends on what is *not* classified: a project whose sources carry no role
+  // yet has an unknown amount of primary material, not none of it.
+  const roles = bundle.presentation.sourceRoles;
 
   return (
     <div className="rp-split">
@@ -93,9 +96,9 @@ export function SourcesView() {
           <h1 className="rp-title" style={{ fontSize: 22, marginBottom: 8 }}>
             读过什么，以及它算得上什么
           </h1>
-          <p className="rp-lede" style={{ fontSize: 13.5 }}>
-            共 {sources.length} 个来源，其中 {readCount} 个真正读取过、{primaryCount} 个是原始论文或官方材料。只有读取过的来源才会产生可引用证据；
-            角色只用于判断结论能说多硬，不构成可信度评分。
+          <p className="rp-lede" style={{ fontSize: 13.5 }} data-testid="source-summary">
+            共 {sources.length} 个来源，其中 {readCount} 个真正读取过；{roles.userMessage}
+            只有读取过的来源才会产生可引用证据；角色只用于判断结论能说多硬，不构成可信度评分。
           </p>
 
           <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "22px 0 10px", flexWrap: "wrap" }}>

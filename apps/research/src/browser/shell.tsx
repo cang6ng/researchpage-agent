@@ -35,19 +35,33 @@ const VIEW_ICONS: Readonly<Record<View, ReactNode>> = Object.freeze({
   gallery: <GalleryVerticalEnd size={15} strokeWidth={1.75} />,
 });
 
-/** One sentence about where this project stands, in the reader's words. */
+/**
+ * One sentence about where this project stands, in the reader's words.
+ *
+ * It is read from the project's own readout rather than recomputed here: the
+ * label used to say「报告就绪 · 无待查项」whenever no matrix cell was open,
+ * which is a claim about material coverage being worn as a claim about the
+ * report. The readout separates those facts, so the label can only say the one
+ * it means — and a report whose material arrived after it was written says
+ * 「待复核」instead of「无待查项」.
+ */
 export function projectState(bundle: TaskBundle): { readonly label: string; readonly tone: string } {
-  if (bundle.task.error !== null) return { label: "运行失败", tone: "danger" };
-  if (bundle.busy || bundle.task.status === "researching") return { label: "研究中", tone: "accent" };
-  if (bundle.task.status === "draft") return { label: "待确认任务卡", tone: "limited" };
-  if (bundle.hasReport) {
-    const gaps = bundle.gaps.length;
-    return gaps === 0
-      ? { label: "报告就绪 · 无待查项", tone: "reviewed" }
-      : { label: `报告就绪 · ${gaps} 项待查`, tone: "limited" };
-  }
-  const unassessed = bundle.matrix.filter((cell) => cell.status === "missing" || cell.status === "unassessed").length;
-  return { label: `材料就绪 · ${unassessed} 项待核对`, tone: "unassessed" };
+  const readout = bundle.presentation;
+  const run = readout.runState.state;
+  if (run === "failed") return { label: readout.runState.displayName, tone: "danger" };
+  if (run === "editing") return { label: readout.runState.displayName, tone: "accent" };
+  if (run === "preparing") return { label: "待确认任务卡", tone: "limited" };
+  if (run === "researching") return { label: readout.runState.displayName, tone: "accent" };
+  const open = readout.unresolvedResearch.unresolved + readout.unresolvedResearch.limited + readout.unresolvedResearch.incomparable;
+  return {
+    label:
+      readout.reportReview.state === "needs_review"
+        ? `报告待复核 · ${String(open)} 项未定论`
+        : open === 0
+          ? "报告就绪 · 比较项均已核对"
+          : `报告就绪 · ${String(open)} 项未定论`,
+    tone: readout.reportReview.state === "needs_review" || open > 0 ? "limited" : "reviewed",
+  };
 }
 
 function StatusDot({ bundle }: { readonly bundle: TaskBundle }) {

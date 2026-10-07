@@ -763,9 +763,16 @@ export function createResearchTools(service: ResearchService): ResearchTools {
     name: "propose_section_edit",
     description:
       "对报告的一个章节生成修改提案（Edit）。本工具不会修改报告正文：它保存旧内容 hash、目标章节、替换内容与理由，" +
-      "由用户在界面上接受后才产生新的报告版本。只在被授权 Edit 的动作中可用；目标章节必须与本次授权的目标一致。" +
+      "由用户在界面上接受后才产生新的报告版本。只在被授权 Edit 的动作中可用；目标章节必须与本次授权的目标一致。\n" +
+      "改写必须保留这一节的内容义务（认知责任）：用户说「改成纯文字 / 去掉表格」改变的是表达形式，不是这一节的义务。" +
+      "例如综合判断节仍然必须包含至少一条合法的综合判断（claimType=\"synthesis\"、synthesis=true、绑定 ≥2 条来自 ≥2 个来源的证据），" +
+      "比较节仍然必须有完整的多维比较表，机制节仍然必须写清输入、过程与输出。把义务一起去掉会被拒绝，不是通过校验的办法。\n" +
+      "表格必须完整：每一行的每一格都要写出判断，或写明「证据不足 / 有限可比 / 不可直接比较 / 未找到公开依据」；" +
+      "空白的单元格不会被保存为提案。\n" +
       "如果需要改动摘要，必须额外提供 summary 字段（摘要会被显式列为目标，不会因为改动一个章节而被顺手重写）。" +
-      "新引入的论断必须引用真实存在的 evidenceId。",
+      "新引入的论断必须引用真实存在的 evidenceId。\n" +
+      "提交前服务端会按报告自己的内容契约预检这次改写：不通过时返回 problems，请按问题修正后再提交一次（本次动作只有一次修正机会）；" +
+      "仍然不通过时本工具会拒绝创建提案，请停止提交并如实告诉用户没有生成修改建议。",
     inputSchema: {
       type: "object",
       properties: {
@@ -832,7 +839,19 @@ export function createResearchTools(service: ResearchService): ResearchTools {
         ...(summary === undefined ? {} : { summary }),
         reason,
       });
-      if (!result.ok) return boundedJson({ ok: false, problems: result.problems, guidance: result.guidance });
+      if (!result.ok) {
+        // The refusal carries three audiences at once, on purpose: `problems`
+        // is what the model has to fix, `userMessage` is what the person who
+        // asked for the change is told if it never lands, and `code` is what
+        // the workspace can branch on without reading Chinese.
+        return boundedJson({
+          ok: false,
+          ...(result.code === undefined ? {} : { code: result.code }),
+          problems: result.problems,
+          ...(result.userMessage === undefined ? {} : { userMessage: result.userMessage }),
+          guidance: result.guidance,
+        });
+      }
       const proposal = result.proposal;
       return boundedJson({
         ok: true,

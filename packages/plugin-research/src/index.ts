@@ -5,6 +5,7 @@
  */
 
 export type {
+  ActionDelta,
   AssessmentDirectness,
   AssessmentRelationship,
   BriefFieldName,
@@ -18,6 +19,7 @@ export type {
   Comparability,
   CostStage,
   Dimension,
+  EditActionOutcome,
   Evidence,
   ExportArtifact,
   MatrixCell,
@@ -37,11 +39,16 @@ export type {
   ReportSection,
   ReportTask,
   ReportValidation,
+  ResearchActionOutcome,
   ResearchBudget,
+  ResearchGapNote,
+  ResearchResolution,
+  ResearchResolutionStatus,
   ResearchRunRecord,
   ResearchSection,
   ResearchStage,
   ResearchUsage,
+  RunOutcome,
   Source,
   SourceRole,
   Subject,
@@ -52,6 +59,7 @@ export {
   DEFAULT_BUDGET,
   BRIEF_FIELDS,
   deriveCellCoverage,
+  EMPTY_ACTION_DELTA,
   emptyUsage,
   ID_PREFIX,
   isCellRef,
@@ -94,7 +102,29 @@ export {
   type ClaimVerdict,
 } from "./claims.js";
 
-export { validateArtifactQuality, type ArtifactDraft, type ArtifactInput, type ArtifactVerdict } from "./artifact.js";
+export {
+  BLANK_CELL_REMEDY,
+  blankCellLabel,
+  blankCellsOfTable,
+  tableGapsOf,
+  validateArtifactQuality,
+  type ArtifactDraft,
+  type ArtifactInput,
+  type ArtifactVerdict,
+  type BlankCell,
+  type TableGap,
+} from "./artifact.js";
+
+export {
+  CELL_STATE_WORDS,
+  deriveResearchResolution,
+  newMaterialSentence,
+  proposalFailureCopy,
+  proposalRepairCopy,
+  RESOLUTION_LABELS,
+  type ResolutionCell,
+  type ResolutionInput,
+} from "./outcome.js";
 
 export { canonicalJson, hashOf } from "./hash.js";
 

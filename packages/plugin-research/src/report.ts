@@ -52,6 +52,16 @@ export interface ValidationInput {
   readonly sources?: readonly Source[];
   /** The saved support judgements, needed for claim adequacy. */
   readonly assessments?: readonly SupportAssessment[];
+  /**
+   * Section ids this draft did not write, when it is an edit of a report.
+   *
+   * Passing them keeps the content contract from punishing an edit for a fault
+   * it does not touch: a blank the report already carried is reported as a
+   * warning, while a blank in the content being written now is an error. A
+   * fresh save passes nothing, which is how every new report meets the whole
+   * contract.
+   */
+  readonly carriedOverSectionIds?: readonly string[];
   readonly now: string;
 }
 
@@ -178,6 +188,7 @@ export function validateReport(input: ValidationInput): ValidationResult {
       evidence: input.evidence,
       sources: input.sources ?? [],
       assessments: input.assessments ?? [],
+      ...(input.carriedOverSectionIds === undefined ? {} : { carriedOverSectionIds: input.carriedOverSectionIds }),
     });
     problems.push(...artifact.errors);
     warnings.push(...artifact.warnings);

@@ -685,10 +685,30 @@ interface Bundle {
     readonly summary: string;
     readonly title: string;
   }[];
-  readonly proposals: readonly { readonly proposalId: string; readonly status: string; readonly targets: readonly string[] }[];
+  readonly proposals: readonly {
+    readonly proposalId: string;
+    readonly status: string;
+    readonly targets: readonly string[];
+    /** The action's own delta, as the page reads it. */
+    readonly researchAdded: { readonly sources: number; readonly evidence: number; readonly assessments: number };
+  }[];
   readonly revisions: readonly { readonly revisionId: string; readonly revision: number; readonly isCurrentReport: boolean }[];
   readonly exports: readonly { readonly exportId: string; readonly revisionId: string | null; readonly status: string }[];
-  readonly runs: readonly { readonly stage: string; readonly status: string }[];
+  readonly runs: readonly {
+    readonly stage: string;
+    readonly status: string;
+    readonly userText: string;
+    readonly outcome:
+      | { readonly kind: "research"; readonly resolution: {
+        readonly status: string;
+        readonly summary: string;
+        readonly newEvidenceIds: readonly string[];
+        readonly newSourceIds: readonly string[];
+        readonly targetCells: readonly { readonly subjectId: string; readonly dimensionId: string }[];
+      }; readonly delta: { readonly newSourceIds: readonly string[]; readonly newEvidenceIds: readonly string[] } }
+      | { readonly kind: "edit"; readonly status: string; readonly userMessage: string; readonly delta: { readonly newSourceIds: readonly string[]; readonly newEvidenceIds: readonly string[] } }
+      | null;
+  }[];
   readonly budget: { readonly maxSearches: number; readonly maxReads: number; readonly maxGapRounds: number };
   readonly usage: { readonly searches: number; readonly reads: number; readonly gapRounds: number };
   readonly currentReportId: string | null;
@@ -804,6 +824,18 @@ describe("the assistant's three intents, over HTTP", () => {
     expect(staged.proposals[0]!.status).toBe("pending");
     expect(staged.proposals[0]!.targets).toEqual(["comparison"]);
     expect(staged.currentReportHash).toBe(before.currentReportHash);
+    // The delta on the proposal is the action's own: this Edit looked one thing
+    // up and read it, and the numbers say that rather than how much material
+    // the project happens to hold. `researchAdded` is fed by the action's
+    // baseline, so it can only equal the run's own delta.
+    const editRun = staged.runs.filter((run) => run.stage === "edit" && run.userText.length > 0).slice(-1)[0]!;
+    const editOutcome = editRun.outcome;
+    expect(editOutcome?.kind).toBe("edit");
+    expect(editOutcome?.kind === "edit" ? editOutcome.status : "").toBe("proposal_created");
+    expect(staged.proposals[0]!.researchAdded.sources).toBe(
+      editOutcome?.kind === "edit" ? editOutcome.delta.newSourceIds.length : -1,
+    );
+    expect(staged.proposals[0]!.researchAdded.sources).toBeLessThan(staged.sources.length);
 
     const proposalId = staged.proposals[0]!.proposalId;
     const accepted = await post(`/api/research/proposals/${proposalId}/accept`, {});
@@ -906,6 +938,20 @@ describe("the assistant's three intents, over HTTP", () => {
     // searches accumulate as telemetry, the automatic gap count does not move.
     expect(after.usage.gapRounds).toBe(spent.usage.gapRounds);
     expect(after.usage.searches).toBeGreaterThan(spent.usage.searches);
+    // The action's own result travels with its run: the question it was given,
+    // whether it resolved, and the ids of what this action added — which is the
+    // data the workspace needs to answer「问题解决了吗」and to open exactly this
+    // turn's material instead of the whole matrix.
+    const researchRun = after.runs.filter((run) => run.stage === "gap" && run.userText.length > 0).slice(-1)[0]!;
+    expect(researchRun.userText).toBe("再找独立证据验证构建成本");
+    const outcome = researchRun.outcome;
+    expect(outcome?.kind).toBe("research");
+    if (outcome?.kind !== "research") throw new Error("expected a research outcome");
+    expect(["resolved", "partially_resolved", "unresolved"]).toContain(outcome.resolution.status);
+    expect(outcome.resolution.summary.length).toBeGreaterThan(0);
+    expect(outcome.resolution.summary).not.toContain("ev_");
+    expect(outcome.delta.newEvidenceIds.length).toBeGreaterThan(0);
+    expect(outcome.resolution.newEvidenceIds).toEqual(outcome.delta.newEvidenceIds);
     // Research on a task that has a report does not write another one.
     expect(after.runs.filter((run) => run.stage === "report").length).toBe(1);
     expect((await get(`/api/research/revisions/${revisionId}/html`)).text).toBe(beforeHtml);

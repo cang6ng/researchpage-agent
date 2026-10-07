@@ -8,7 +8,9 @@
 - Upstream sealed baseline：`c5f97ba63f719ec81030746f3eb67fe7c538e01f`；见 [UPSTREAM_BASELINE.md](./UPSTREAM_BASELINE.md)。未修改 upstream，未引入 Phase 5。
 - 实施依据：[COMPETITION_SPEC.md](./COMPETITION_SPEC.md)、`ResearchPage_Product_Redesign.md`（§6/§8/§17/§23）、`What Makes a Great AI-Native Research Artifact?`（§6/§11–13/§17）。
 
-## Current Status（2026-10-07）
+## Current Status（2026-10-08）
+
+- **Step 3.6A（Product Trust & Co-edit Reliability）已完成**：一次独立真实验收发现的「看到的状态、结果与可执行操作不可信」按 P0/P1 修完——待接受提案在生成时就通过报告自身的内容契约（改不下去就不会出现「接受」按钮），比较表与提案表格不再出现空白单元格，补查结果先回答「问题解决了吗」，提案上的「新增」是这次动作真实的增量，来源角色未分类不再被当成「0 个一手材料」，项目状态拆成六个互不代偿的字段。未改视觉、未做 PDF / Mermaid、未进入 Next Action。
 
 - **Step 3.5C-B（Conversational Planning & 50/50 Co-edit UI）已完成**：引导式规划从「一次一问的表单」变成一段真正的规划对话（问题、过渡语、用户的回答与回执按发生顺序重建，刷新后原样恢复，进度按 `readiness / minDecisions / maxDecisions` 说真话，用户随时可以自己确认，助手早退被拒后不会把界面卡在「正在准备」）；报告工作台从「文档 + 右侧插件」变成阅读与 50/50 协作两种形态（打开助手即左右各半、可拖动分隔条 40/60–60/60、1366 不再退回浮层），右栏是一个一级工作区：对话 + 内嵌动作、补查与修改建议，证据在同一栏打开并可一键回到对话。
 
@@ -27,6 +29,69 @@
 - **Vertical Product 可真实演示**：Topic → Task Card → 确认 → 真实检索/读取 → Evidence Matrix → 缺口定向补查（≤2 轮）→ 结构化报告 → HTML 预览 → PDF 下载 → 刷新重开。
 - **Step 1（Research Editing Semantics）已完成**：Ask / Research / Edit 三种正式意图由应用签发 Action Grant 约束；Edit 产出待接受 Proposal；报告版本可冻结、导出只读冻结依赖包；矩阵状态不再由「有正文片段」直接升级为充分。
 - 真实 Demo 两个主题此前均通过（真实模型 + 真实 arXiv + 真实 Chrome PDF）；Step 2 后又用新版各重跑一次（见「Current Status」与「Step 2 的验证入口」）。
+
+## Step 3.6A 新增（本次工作产物）
+
+本轮只修「用户看到的状态、结果与可执行操作必须可信」。没有重新设计产品、没有视觉重构、没有 PDF / Mermaid，没有改 Agent Core / Host / Protocol / Client，没有动 Ask / Research / Edit 的副作用契约、Frozen Revision、Action Budget、Guide min/max、Evidence 真实性边界。
+
+### 提案可信：pending 必须意味着「可以接受」（`service.ts` / `tools.ts` / `artifact.ts`）
+
+- **生成时预检**：`createProposal` 现在先把 `base + 替换内容` 组装成 candidate report，跑**与 Accept 同一个** `validateReport`，通过才写入 pending。以前只校验「章节存在 + 新 claim 的证据真实」，章节的内容义务要等到用户点了「接受」才被检查——真实验收里用户读完提案、按下接受，才被告知「Q03：章节没有 synthesis」。
+- **一次修正机会**：预检失败时把问题原样返回给模型（`code: "proposal_invalid"`），同一个动作内允许再提交一次；第二次仍失败则 `code: "proposal_not_created"`，本次 Edit 不产生提案，第三次及以后同样被拒（没有循环）。
+- **用户语言**：失败结果里 `userMessage` 是给用户的句子（「我准备的改写丢失了这一节必须保留的综合判断，因此没有提交为修改建议。报告正文没有改变。可以换一种写法重新尝试。」），`problems` 仍是给模型的修复指令（含 Q 编号、claim id、hash）。前端 `conversation-logic.refusalOf` 优先取 `userMessage`，`problems` 只出现在 run `activity` 这种开发者日志里。
+- **不放松契约**：没有删除 synthesis 要求、没有降低 Evidence 规则、没有跳过 Claim 校验、没有绕过必需维度——目标始终是让内容满足契约，不是让契约迁就内容。
+- **义务是保留项**：工具说明与 Edit 阶段指令都写明「用户说『改成纯文字 / 去掉表格』改变的是表达形式，不是这一节的内容义务」，阶段指令还从 blueprint 里取出目标章节的 `cognitivePurpose / requiredQuestions / budget` 一并给出（与校验读同一份 blueprint）。首版 Edit 仍然只有 Section content edit，不改变 Blueprint obligation。
+
+### 比较表与提案表格：不允许空白（`artifact.ts` / `document.tsx` / `service.ts`）
+
+- **真实原因（先在真数据上确认过）**：本机 `researchpage-data` 里 4 份 v2 报告的 comparison 表都存成 `columns` + `columnDimensions` + `rowSubjects` 齐全、`rows: [{cells: []}, …]`——**报告结构化数据本身就空**（A），presentation DTO 原样透传（B 排除），而 React 渲染器对「行没写到这一列」的分支渲染的是**既无文字也无状态的空 `<td>`**（C），CSS 只有 `color` 一条规则（D 排除）。真数据断言：修复前 4 份报告存有 16–24 个空单元格；修复后渲染结果 `emptyTd = 0`，每格都有词。
+- **渲染兜底（§8）**：空单元格一律走 `CellBody` 的兜底文案，取自项目真实的 adequacy 状态——`missing → 证据不足`、`unassessed → 有材料，待核对`、`limited → 有限支持`、`conflict → 冲突 / 不可比`、有材料但没写判断 → `尚未写出判断`；没有覆盖记录也不留空。PlainTable 的短行补齐到声明列数，表格永远不是缺角的。
+- **Artifact contract（§7）**：`required comparison matrix` 出现空白单元格（含「行根本没写到这一列」）判 **fail**，消息按「第 n 行第 m 列」定位。给旧报告留了台阶：`carriedOverSectionIds`（本次编辑没有触碰的章节）里的空白记为 **warning**——契约是给现在写的内容的，一条改不了比较表的新规则不该让合成章节的修改变得不可能。新建/重新发布的报告没有任何豁免，仍然全部适用。
+- **Proposal 表格（§9）**：`tableGapsOf(提案里所有表格)` 在预检里先跑，任何一行有空格子（或行短于列）都会被拒绝并走同一次修正机会；空白表格不会显示给用户。
+
+### 研究结果可信：先回答「问题解决了吗」（`domain.ts` / `outcome.ts` / `runner.ts` / `routes.ts`）
+
+- **ResearchResolution**（不新建 domain graph）：`deriveResearchResolution` 从「本轮新增的 evidence 绑定到哪些单元格 + 本轮新增 assessment 的目标单元格」得到本次动作的作用范围，再按这些单元格**当前的真实覆盖状态**给出 `resolved / partially_resolved / unresolved`：全部 `reviewed`（直接、正文级、支持）才算解决，部分算部分解决，全是背景或没落到任何单元格就是未解决。
+- **语义**（§12）：两篇背景论文会写进 source/evidence/assessment，但永远到不了 `reviewed`，因此**结构上**解决不了任何问题——不会因为 `sourceCount > 0` 变成 resolved。没有百分比。
+- **用户结果**（§13）：动作结束后写回 run 记录（`ResearchRunRecord.outcome`），句子里先给结论（「没有找到能直接回答这一问题的材料：… 仍然只有背景或间接材料。本轮新增 2 篇背景材料。报告正文没有改变。」），工具次数降级为次要素材。
+- **「检查本轮新增证据」的上下文**（§14）：resolution 带着 `newSourceIds / newEvidenceIds / newAssessmentIds / supportingEvidenceIds / targetCells / remainingGap`，前端 3.6B 可以直接打开本轮材料而不是整个矩阵。本轮只做 DTO/API，没有改正式前端交互。
+
+### 提案增量：真实 delta（`service.ts` → `proposal.researchAdded`）
+
+- 用户动作签授权（`issueGrant`，`origin: "user"`）时快照 source / evidence / assessment 的 **id 集合**；`researchAdded` 改成 id 差集的大小。以前它写的是 `repo.listSources(task.id).length` 这类**项目总量**，所以「本次修改没有新增检索」也会显示「修改期间新增 17 个来源」。
+- 0 就是 0：提案面板在该情况下显示「本次修改没有新增研究材料。」，不再给含糊状态。
+
+### 来源角色：unknown ≠ none（`presentation.ts` + `sources.tsx`）
+
+- 项目读数的 `sourceRoles` 给出 total / classified / unknown / primary / byRole 与一句 `userMessage`：全部未分类时是「原始论文 / 一手材料：未知（12 个来源尚未分类）」，部分分类时是「…1 个已确认；另有 2 个来源尚未分类（已分类 2 / 4）」——只有真的全部分类且为 0 才会说 0。
+- **顺带修掉一个真实缺陷**：`service.read` 完成读取时用**角色写入之前**拿到的 source 副本回写同一行，把模型刚刚声明的 role 抹掉了（本机项目 11 个来源全部显示「未声明」就是这个原因之一）。现在 role 在读取完成时被显式保留。
+
+### 状态语义：正交的 presentation DTO（`apps/research/src/server/presentation.ts`）
+
+bundle 新增 `presentation`，六个字段各自回答一个问题，都由真实状态推导，都带 `displayName` / `userMessage`：
+
+- `runState`（preparing / researching / report_ready / editing / failed）；
+- `evidenceCoverage`（n / m 个比较项**已有材料**，并写明「材料覆盖不等于结论完成」）；
+- `unresolvedResearch`（unresolved / limited / incomparable / resolved 四个计数）；
+- `reportReview`（clean / needs_review + 原因）；
+- `artifactQuality`（passed / warnings n / blocking n）；
+- `sourceRoles`（见上）。
+
+没有新状态机，没有改大布局。顶栏那一句改成从读数派生（有 `needs_review` 或仍有未决项时不再说「无待查项」），来源页那句改成读 `sourceRoles.userMessage`。
+
+### 引导文案安全（`runner.ts` 的 guide 指令）
+
+- 不推翻「one decision → one field」：引导指令仍然只写 `fieldTarget`，但明确允许模型在 `leadIn` 里说「我注意到你还提到了 X，后面我会继续和你确认」，并禁止说「我已经把你刚才说的都改好了」。没有实现 multi-field patch。
+
+### 测试
+
+- `packages/plugin-research/tests/edit-preflight.test.ts`（8 例，Scenario 1 的真实复现）：义务丢失的改写不会进入 pending、修好后可以接受且接受真的生效、两次失败后动作结束为 `proposal_not_created` 且不再循环、报告自身表格空白时仍可改别的章节（warning 而非 fail）、提案自带空白表格被拒、Edit 未检索时 delta 为 0、有检索时只算本次增量。
+- `packages/plugin-research/tests/research-resolution.test.ts`（7 例，Scenario 2 的真实复现）：只有背景材料 → unresolved、一条直接一条背景 → partially_resolved、全部直接 → resolved、第二次动作没有新材料时 delta 为空、用户文案不泄露 Q 编号 / synthesis / claim / hash、纯 fixture 推导一致。
+- `packages/plugin-research/tests/artifact-quality.test.ts`（+3）：比较表空白 → fail（含行列定位）、写明「证据不足」→ pass、旧报告既有空白 → warning 且不阻塞编辑。
+- `apps/research/tests/presentation-status.test.ts`（8 例）：unknown 不等于 0、四个状态字段互不代偿、runState 的五种形态。
+- `apps/research/tests/prompt-copy.test.ts`（3 例）：Edit 指令带目标章节义务、工具契约写明保留义务与一次修正、引导指令不允许过度承诺。
+- `apps/research/tests/artifact-view.test.ts`（+1 并加强 1 例）：真实报告形状（`rows: [{cells: []}]`）渲染出 6 个有文字的格子、没有空 `<td>`；空单元格兜底为「证据不足 / 有限支持」。
+- `apps/research/tests/editing-api.test.ts`（+2 组断言）：Edit 与 Research 动作结束后的 run `outcome`（含 resolution 与 delta）确实到达 bundle，且 `researchAdded` 等于本次动作的 delta（不是项目总量）。
 
 ## Step 2 新增（本次工作产物）
 
@@ -316,6 +381,16 @@
 
 ## 已知限制
 
+- 可信性与协同修改（Step 3.6A 后仍存在的限制）：
+  - **旧报告的比较表仍然是空的**（本机 4 份 v2 报告实测 16–24 个空单元格）。契约现在拒绝再产生这种内容，渲染层也为每一格给出真实状态词，但**没有改写既有数据**：要真正修好这些报告，需要重写它们的 comparison 章节（属于 artifact 质量，不在本轮范围）。
+  - 因此空白单元格的规则对**本次编辑没有触碰的章节**记为 warning，而不是 error——否则「改合成章节」会因为「比较表是先前的空表」被拒绝，那条路用户走不通。新建与重新发布的报告没有任何豁免。
+  - `presentation` 的六个字段**已经推导好但没有全部接上界面**（本轮只改了顶栏状态句与来源页那句）。正式展示属于 STEP 3.6B。
+  - resolution 的 scope 是「本轮 evidence 绑定的单元格 + 本轮 assessment 的目标」；一个问句里包含几个子目标（例如「中文处理与增量更新」）时，产品不解析自然语言，只如实报告每个作用域的覆盖状态——「仍然缺少」的两项来自单元格的名字，而不是来自对用户句子的切分。
+  - resolution 里没有 claims 字段：本轮的新 evidence 只记录它绑定的单元格与来源，不反查它被哪条 claim 引用（§14 里写作「if known」，本轮未知）。
+  - `userMessage` 是模式匹配出的「丢了哪类内容」（综合判断 / 机制过程 / 比较表 / 依据…），不是逐条问题的翻译；模式表之外的失败会落到「这一节必须保留的内容义务」这一句兜底。
+  - Edit 的修正机会按**授权**计数（一个动作一次），不是按模型调用的次数上限：第三次及以后的提交仍然返回同一个 `proposal_not_created`，但账面上只算一次修正。
+  - 动作基线只对 `origin: "user"` 的授权快照；如果将来有 pipeline 授权也要出提案，`researchAdded` 会是 0（当前不可能：`proposal` 能力只有 edit intent 才有，而 edit 一律由用户发起）。
+
 - 补查轮次上限 2、搜索 ≤6、读取 ≤10、单任务 8 分钟窗口（SPEC 初值，未收紧也未扩大）。这些是**项目预算**，只约束 Agent 自主的研究；用户明确发起的补查/Edit 补查走各自的一次性 Action Budget（Step 3.5C-A，见上）。
 - Edit 只支持 Section 级替换（可显式附带 summary 目标）；不做 Claim/图/任意文本范围编辑、不做字符 diff 与三方合并。
 - 冻结包不复制全文，只保存引用到的 evidence 定位与片段、来源元数据与 read id；历史报告若没有缺口快照，revision 如实标 `gapsCaptured=false`，不伪造。
@@ -350,7 +425,7 @@
   - 协作模式在 **≤1099px** 退回浮层（两半都读不了）；速览 Dock 在 **<1350px** 仍然是浮层。这两种情况都保留原有行为。
   - 动作记录里不再出现工具名与结果 payload（§22 要求），代价是「这次动作做了什么」只剩中文动作名；需要技术细节时仍可从 `GET /tasks/:id` 的 run `activity` 读原文。
   - 协作模式下工具栏隐藏主题菜单与「待复核」chip（正文区的提醒仍在）以保持一行；主题切换在阅读模式里。
-  - 报告**比较表仍然可能是空的**（Step 2 的生成侧问题，本轮未动，见上一条 3.5B 的说明）；协作模式只把它画得更窄、可滚动，不改变内容。
+  - 报告**比较表仍然可能是空的**（Step 2 的生成侧问题，本轮未动，见上一条 3.5B 的说明）；协作模式只把它画得更窄、可滚动，不改变内容。**Step 3.6A 已补上呈现代理与契约**：空单元格现在一定写出真实状态词（证据不足 / 有限支持 / 有材料待核对 / 尚未写出判断），新报告与提案的空白表格会被拒绝；既有报告的空表作为 warning 保留，等它自己被重写。
 
 - 简报与引导（Step 3.5A 后仍存在的限制）：
   - **界面未接**：本轮只做了 API，Brief 页面仍是只读卡片 + 「换个说法重新生成」；正式 Structured / Guided UI 属于 STEP 3.5B。因此现在通过界面**无法**编辑简报，也**无法**手动引导——必须走 API 或 3.5B。
@@ -363,13 +438,25 @@
 
 ## Next Action
 
-**STEP 4 — Artifact Delivery & Semantic Visualization**（下一步）：
+**STEP 3.6B — Navigation, Status & Trust UX**（下一步）：
 
-- **PDF 双主题适配**：把 ThemeSpec 映射到 plugin 的 HTML/PDF renderer，使 Editorial / Swiss 在导出文件里也成立（现在只有 Editorial 有 PDF 版式）。主题已经在冻结版本里记录 `themeId`，位置留好了。
-- **Mermaid / DiagramSpec 机制图**：机制块的结构化数据（input / intermediate / steps / output / tradeoff / failure）已经完整保留，本轮只做了 CSS 步骤流，替换成图形渲染不需要改数据。
-- **File Upload 作为来源**、**第二 Blueprint**、**MCP 集成**：Source Workspace 与 Settings 对未接入能力已如实标注，模板页的 Blueprint/Theme 分离留好了位置。
+- **把 3.6A 的读数接上界面**：`bundle.presentation` 的六个字段（runState / evidenceCoverage / unresolvedResearch / reportReview / artifactQuality / sourceRoles）已经推导好、带 `displayName` 与 `userMessage`，3.6B 负责把它们展示成读者看得懂的一组状态，而不是一句话概括全部。
+- **「检查本轮新增证据」直达本轮材料**：run `outcome.resolution` 已经带着 `newSourceIds / newEvidenceIds / newAssessmentIds / targetCells`，3.6B 用它在同一栏打开这一轮找到的东西，而不是把用户送到整个矩阵。
+- **导航与顶栏**：项目切换、视图入口与状态芯片的信息层级（本轮只把「无待查项」这类与读数冲突的说法改掉，视觉未动）。
+- **提案与聊天的呈现**：失败结果的 `userMessage` 与 resolution 的 `summary` 已经在数据里，3.6B 决定它们长什么样。
 
-3.5B 交付后，界面与语义已经对齐；3.5C-B 交付后「对话式规划」与「协作工作区」也不再欠账，STEP 4 之前没有新的「语义有了、界面没接」的缺口。
+3.6A 交付后，产品看到的状态、结果与可执行操作与它自己知道的真实状态一致；STEP 4（PDF 双主题、Mermaid / DiagramSpec、File Upload、第二 Blueprint、MCP）在此之前没有新的「数据有了、界面没接」的缺口。
+
+## Step 3.6A 的验证入口
+
+- 提案可信与 Scenario 1：`npx vitest run packages/plugin-research/tests/edit-preflight.test.ts`（真实 service + 真实工具，含预检、一次修正、接受真的生效、delta 语义）。
+- 研究结果与 Scenario 2：`npx vitest run packages/plugin-research/tests/research-resolution.test.ts`。
+- 比较表契约：`npx vitest run packages/plugin-research/tests/artifact-quality.test.ts`（末尾「the comparison table must be written, not just declared」三例）。
+- 状态读数与文案：`npx vitest run apps/research/tests/presentation-status.test.ts apps/research/tests/prompt-copy.test.ts apps/research/tests/artifact-view.test.ts`。
+- 全链路（含 run `outcome` 到达 bundle）：`npx vitest run apps/research/tests/editing-api.test.ts`。
+- 真数据断言（可选，需要本机 `researchpage-data`）：把存储的 comparison 表渲染出来数空格子——修复前 4 份报告 16–24 个空单元格，修复后 `emptyTd = 0`、每格有词。临时脚本未入库，做法见本节第一段。
+- 离线全量、类型检查与构建：`pnpm typecheck`、`pnpm build:research`、`EVERY_DAGENT_NO_BROWSER=1 npx vitest run --exclude "**/real-provider.e2e.test.ts" --exclude "**/real-network.test.ts" --exclude "**/render-pdf.test.ts" --exclude "**/research-plugin.real.test.ts" --exclude "**/real-demo.e2e.test.ts"`。
+- 本轮没有跑视觉 browser gate（未改布局，只改了四处文案与比较表渲染），也没有跑真实模型 Demo / PDF。
 
 ## Step 3.5C-B 的验证入口
 

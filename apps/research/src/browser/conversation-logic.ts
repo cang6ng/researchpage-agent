@@ -17,7 +17,7 @@
  * rather than by looking at a screenshot.
  */
 
-import type { AnswerView, ProposalView, RunStepView, RunView, TaskBundle } from "./api.js";
+import type { AnswerView, ProposalView, RunOutcomeView, RunStepView, RunView, TaskBundle } from "./api.js";
 import { TOOL_LABELS } from "./api.js";
 
 /** How many interactions the workspace shows. Enough to be a history, not a log. */
@@ -48,6 +48,14 @@ export interface Interaction {
   readonly steps: readonly { readonly label: string; readonly failed: boolean }[];
   /** When the run failed as a whole, the application's own sentence. */
   readonly failure: string;
+  /**
+   * What this action resolved, when the run carries an outcome.
+   *
+   * It is the answer to「问题解决了吗」, kept with the turn that produced it:
+   * a research action's result is not how many tools ran, and an Edit's result
+   * is not how many claims changed.
+   */
+  readonly outcome: RunOutcomeView | null;
 }
 
 /**
@@ -69,6 +77,11 @@ function countOf(run: RunView, name: string): number {
 
 /** A refusal arrives inside a tool result; the reader gets its sentences. */
 export function refusalOf(detail: string): string {
+  // When the refusal carries a sentence written for the person who asked for
+  // the change, that sentence is the answer — the problems beside it are the
+  // model's repair instructions and name checks, contracts and hashes.
+  const forUser = /"userMessage":"((?:[^"\\]|\\.)*)"/.exec(detail);
+  if (forUser !== null) return unescapeJson(forUser[1]);
   const match = /\{"ok":false,"problems":\[(.*?)\]/.exec(detail);
   if (match === null) return detail.length > 0 ? detail.slice(0, 160) : "";
   return match[1]
@@ -76,6 +89,11 @@ export function refusalOf(detail: string): string {
     .map((part) => part.trim().replace(/^"|"$/g, ""))
     .filter((part) => part.length > 0)
     .join("；");
+}
+
+/** A JSON string's escapes, undone — a refusal may carry quotes and newlines. */
+function unescapeJson(value: string): string {
+  return value.replace(/\\"/g, '"').replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
 }
 
 /** What one step did, said for a reader: what it read, not what a tool is called. */
@@ -130,6 +148,7 @@ export function conversationOf(bundle: TaskBundle, answers: readonly AnswerView[
       refusal: proposalCall === undefined ? "" : refusalOf(proposalCall.detail),
       steps: stepsOf(run),
       failure: run.status === "failed" || run.status === "interrupted" ? run.note : "",
+      outcome: run.outcome ?? null,
     });
   }
   return interactions.slice(-CONVERSATION_LIMIT);

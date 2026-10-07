@@ -640,6 +640,99 @@ export interface ExportArtifact {
  */
 export type ResearchStage = "card" | "guide" | "research" | "gap" | "report" | "synthesis" | "ask" | "edit" | "followup";
 
+/**
+ * What one user action added, measured against the project it started in.
+ *
+ * The counts a project can report about itself are totals, and a total is not
+ * an answer to「这次动作加了什么」: a project that already held forty sources
+ * says forty no matter how little the action did. So the action's start
+ * snapshots the ids it will be compared against, and every number the product
+ * shows about an action is a difference of two id sets — never a length of a
+ * list that belongs to the project.
+ */
+export interface ActionDelta {
+  readonly newSourceIds: readonly string[];
+  readonly newEvidenceIds: readonly string[];
+  readonly newAssessmentIds: readonly string[];
+}
+
+/** The empty delta: what an action that added nothing really added. */
+export const EMPTY_ACTION_DELTA: ActionDelta = Object.freeze({
+  newSourceIds: [],
+  newEvidenceIds: [],
+  newAssessmentIds: [],
+});
+
+/**
+ * Whether one user research action answered the question it was given.
+ *
+ * It is deliberately not a count of what was fetched: two background papers
+ * fetched for a question about official documentation are material, not an
+ * answer. The status is derived from the coverage of the cells the action's own
+ * material landed on — the same derivation the matrix uses — so "resolved"
+ * means a direct, body-level judgement now covers the target, and nothing else
+ * can claim it.
+ */
+export type ResearchResolutionStatus = "resolved" | "partially_resolved" | "unresolved";
+
+/** One target the action left open, in reader-facing words. */
+export interface ResearchGapNote {
+  readonly subjectName: string;
+  readonly dimensionName: string;
+  readonly status: CellStatus;
+  /** Why it is still open, taken from the cell itself. */
+  readonly reason: string;
+}
+
+/**
+ * What a user research action resolved, and on what it stands.
+ *
+ * The ids are the part the workspace needs: they are how「检查本轮新增证据」
+ * opens exactly what this action found instead of the whole matrix. The
+ * sentence is the part the reader needs: an action's result is an answer to
+ * whether the question was resolved, not a report of how many tools ran.
+ */
+export interface ResearchResolution {
+  readonly status: ResearchResolutionStatus;
+  /** The user's own question, kept verbatim. */
+  readonly question: string;
+  readonly newSourceIds: readonly string[];
+  readonly newEvidenceIds: readonly string[];
+  readonly newAssessmentIds: readonly string[];
+  /** Evidence this action's supporting judgements point at, if any. */
+  readonly supportingEvidenceIds: readonly string[];
+  /** The matrix cells this action's material landed on. */
+  readonly targetCells: readonly CellRef[];
+  /** What is still missing for the question, in reader-facing words. */
+  readonly remainingGap: readonly ResearchGapNote[];
+  /** One paragraph: what this action resolved, and what it did not. */
+  readonly summary: string;
+}
+
+/** What one Edit action ended as, once its one repair chance was spent. */
+export interface EditActionOutcome {
+  readonly kind: "edit";
+  readonly status: "proposal_created" | "proposal_not_created";
+  /** Why, in words a reader can act on; never a validator's internals. */
+  readonly userMessage: string;
+  readonly delta: ActionDelta;
+}
+
+/** What one user research action ended as. */
+export interface ResearchActionOutcome {
+  readonly kind: "research";
+  readonly resolution: ResearchResolution;
+  readonly delta: ActionDelta;
+}
+
+/**
+ * What a user action ended as.
+ *
+ * Only runs a person asked for carry one: the program's own passes do not owe
+ * an answer, and recording an outcome for them would invent a question.
+ */
+export type RunOutcome = ResearchActionOutcome | EditActionOutcome;
+
 /** One stage's execution, as the application recorded it. */
 export interface ResearchRunRecord {
   readonly id: string;
@@ -670,6 +763,14 @@ export interface ResearchRunRecord {
    * the process that started it happens to live.
    */
   readonly userText?: string;
+  /**
+   * What the action resolved, written once the stage settled.
+   *
+   * It is stored rather than recomputed on every read because it is a fact
+   * about *this action*: the material of later actions must not be able to
+   * change what an earlier one is said to have answered.
+   */
+  readonly outcome?: RunOutcome;
 }
 
 /** What a cell's coverage is, and the sentence that explains it. */

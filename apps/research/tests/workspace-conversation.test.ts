@@ -37,6 +37,7 @@ function runFixture(overrides: Partial<RunView> & { readonly stage: RunView["sta
     endedAt: "2026-10-07T01:02:00.000Z",
     activity: [],
     userText: "",
+    outcome: null,
     ...overrides,
   };
 }

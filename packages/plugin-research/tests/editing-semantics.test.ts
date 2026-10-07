@@ -623,7 +623,7 @@ describe("C, D, E, F. Proposals", () => {
       });
       const created = harness.service.createProposal(harness.taskId, {
         actionId: "act_edit_stale",
-        sections: [{ id: "comparison", title: "四、共同维度比较", blocks: [{ kind: "paragraph", text: "旧提案内容。", claimIds: [] }] }],
+        sections: [comparisonReplacement(harness.service.getTask(harness.taskId)!, "clm_mechanism_a")],
         reason: "基于旧版本的修改。",
       });
       expect(created.ok).toBe(true);
@@ -677,7 +677,24 @@ describe("C, D, E, F. Proposals", () => {
       expect(evidenceAfterResearch).toBeGreaterThan(evidenceBefore);
       const created = harness.service.createProposal(harness.taskId, {
         actionId: "act_edit_discard",
-        sections: [{ id: "overview", title: "一、研究任务与关键认识", blocks: [{ kind: "paragraph", text: "改写后的认识。", claimIds: [] }] }],
+        // The replacement keeps the section's own obligations: an overview
+        // still has to carry the key recognition, bound to a claim. A bare
+        // paragraph would be refused before it ever became a proposal — which
+        // is the editing contract this file's C-D-E-F section now checks.
+        sections: [
+          {
+            id: "overview",
+            title: "一、研究任务与关键认识",
+            blocks: [
+              {
+                kind: "paragraph",
+                text: "改写后的定向：两份材料都只报告了各自方法的机制与设置，因此比较只能落在构建产物上。",
+                claimIds: ["clm_compare"],
+              },
+              { kind: "list", items: [{ text: "现有材料不能支持性能排名。", claimIds: ["clm_limit"] }] },
+            ],
+          },
+        ],
         reason: "换一种讲法。",
       });
       expect(created.ok).toBe(true);
@@ -725,7 +742,7 @@ describe("C, D, E, F. Proposals", () => {
 
       const first = harness.service.createProposal(harness.taskId, {
         actionId: "act_a",
-        sections: [{ id: "comparison", title: "四", blocks: [{ kind: "paragraph", text: "第一版。", claimIds: [] }] }],
+        sections: [comparisonReplacement(harness.service.getTask(harness.taskId)!, "clm_mechanism_a")],
         reason: "第一次修改。",
       });
       expect(first.ok).toBe(true);

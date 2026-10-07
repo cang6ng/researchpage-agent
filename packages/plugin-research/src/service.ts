@@ -14,10 +14,12 @@
  */
 
 import type {
+  ActionDelta,
   CellRef,
   CoverageAssessment,
   CoverageEvidence,
   ClaimType,
+  EditActionOutcome,
   ReportDraftState,
   ReportFrame,
   Evidence,
@@ -28,14 +30,18 @@ import type {
   ReportSection,
   ReportTask,
   ReadSnapshot,
+  ResearchResolution,
   ResearchRunRecord,
+  RunOutcome,
   Source,
   SourceRole,
   SupportAssessment,
   AssessmentDirectness,
   AssessmentRelationship,
 } from "./domain.js";
-import { deriveCellCoverage, ID_PREFIX, needsAttention, suggestedFieldStates } from "./domain.js";
+import { deriveCellCoverage, EMPTY_ACTION_DELTA, ID_PREFIX, needsAttention, suggestedFieldStates } from "./domain.js";
+import { blankCellLabel, blankCellsOfTable, tableGapsOf, BLANK_CELL_REMEDY } from "./artifact.js";
+import { deriveResearchResolution, proposalFailureCopy, proposalRepairCopy } from "./outcome.js";
 import { draftEvidence, pickParagraphs, scopeLabel, tokenize, verifyEvidenceText } from "./evidence.js";
 import { hashOf } from "./hash.js";
 import type { FrozenRevision } from "./revision.js";
@@ -143,6 +149,23 @@ export interface Refusal {
    * fine on a different draft.
    */
   readonly conflict?: true;
+  /**
+   * A machine-readable reason, when a caller has to tell two refusals apart.
+   *
+   * `proposal_invalid` means the offered change did not pass the report's own
+   * contract and may be submitted once more with the problems fixed;
+   * `proposal_not_created` means that chance was already spent and the action
+   * ends without a proposal.
+   */
+  readonly code?: "proposal_invalid" | "proposal_not_created";
+  /**
+   * What to tell the user, when the reader's sentence differs from the model's.
+   *
+   * The problems are written for whoever has to fix them — the model, in the
+   * tool result. This is the same refusal written for the person who asked for
+   * the change, and it never names a check id, a contract term or a hash.
+   */
+  readonly userMessage?: string;
 }
 
 export interface SearchResult {
@@ -597,6 +620,22 @@ export interface ResearchService {
    * would answer a question nobody asked.
    */
   actionBudgetOf(sessionId: string): ActionBudgetView | undefined;
+  /**
+   * What the session's running user action has added, against its own baseline.
+   *
+   * Zeroes when no user action is running: with no action to attribute material
+   * to, the honest answer is that this action added nothing.
+   */
+  actionDeltaOf(sessionId: string): ActionDelta;
+  /**
+   * What the session's running user action ended as, once it has settled.
+   *
+   * Undefined for the program's own stages and for Ask, which resolve nothing.
+   * The runner calls this while the grant is still live and writes the result
+   * onto the run record, so the answer to「这次动作解决了什么」belongs to the
+   * action rather than being recomputed from a project that has moved on.
+   */
+  actionOutcomeOf(sessionId: string, userText: string): RunOutcome | undefined;
   clearGrant(sessionId: string): void;
 
   // ------------------------------------------------------------ assessments --
@@ -708,8 +747,113 @@ export function createResearchService(options: ResearchServiceOptions): Research
    */
   const actionUsage = new Map<string, ActionUsage>();
 
+  /**
+   * What a user action started with, and what it produced, keyed by its grant.
+   *
+   * Two things live here that a project cannot answer about itself. The first
+   * is the baseline: the ids of the material the action found in the project,
+   * so "this action added two sources" is a difference of two sets rather than
+   * the length of the project's source list. The second is the action's own
+   * outcome — whether it resolved the question, whether it produced a proposal
+   * — which is written at the end and read by whoever records the run.
+   *
+   * Like the usage counters, it dies with the grant: it is a fact about an
+   * action that is still running, and what outlives the process is the run
+   * record the runner writes from it.
+   */
+  interface ActionState {
+    readonly startedAt: string;
+    readonly baseline: ActionDelta;
+    /** How many times this action has been told its proposal failed validation. */
+    proposalAttempts: number;
+    proposalOutcome: EditActionOutcome | null;
+  }
+
+  const actionStates = new Map<string, ActionState>();
+
+  /**
+   * The ids a user action will be measured against when it ends.
+   *
+   * Only a person's action gets one: the program's own passes are bounded by
+   * the task's budget rather than by an instruction, and nothing in the product
+   * reports what an automatic round "added" — so there is no baseline to keep.
+   */
+  function baselineOf(taskId: string | null): ActionDelta {
+    if (taskId === null) return EMPTY_ACTION_DELTA;
+    return {
+      newSourceIds: repo.listSources(taskId).map((source) => source.id),
+      newEvidenceIds: repo.listEvidence(taskId).map((item) => item.id),
+      newAssessmentIds: repo.listAssessments(taskId).map((item) => item.id),
+    };
+  }
+
+  function idsAddedSince(baseline: readonly string[], current: readonly string[]): readonly string[] {
+    const before = new Set(baseline);
+    return current.filter((id) => !before.has(id));
+  }
+
+  /**
+   * What the session's running user action has added so far.
+   *
+   * A difference of id sets, not a count of the project: an action that read
+   * nothing new in a project of forty sources reports zero, because zero is the
+   * honest answer to what *this action* found.
+   */
+  function deltaOfSession(sessionId: string): ActionDelta {
+    const grant = grants.get(sessionId);
+    const state = grant === undefined ? undefined : actionStates.get(grant.id);
+    if (grant === undefined || state === undefined || grant.taskId === null) return EMPTY_ACTION_DELTA;
+    return {
+      newSourceIds: idsAddedSince(state.baseline.newSourceIds, repo.listSources(grant.taskId).map((source) => source.id)),
+      newEvidenceIds: idsAddedSince(state.baseline.newEvidenceIds, repo.listEvidence(grant.taskId).map((item) => item.id)),
+      newAssessmentIds: idsAddedSince(state.baseline.newAssessmentIds, repo.listAssessments(grant.taskId).map((item) => item.id)),
+    };
+  }
+
   function usageOf(grant: ActionGrant): ActionUsage {
     return actionUsage.get(grant.id) ?? EMPTY_ACTION_USAGE;
+  }
+
+  /**
+   * Refuses a proposal whose candidate content failed the report's contract.
+   *
+   * The model gets one repair inside the action that produced the proposal: the
+   * problems go back so it can regenerate the section, and the second failure
+   * ends the action as `proposal_not_created` instead of looping (§2). What is
+   * deliberately *not* here is any softening of the contract to make a proposal
+   * succeed (§3): the content satisfies the contract, or there is no proposal.
+   */
+  function refuseCandidate(grant: ActionGrant, problems: readonly string[]): Refusal {
+    const state = actionStates.get(grant.id);
+    const attempts = (state?.proposalAttempts ?? 0) + 1;
+    if (state !== undefined) state.proposalAttempts = attempts;
+    if (attempts <= 1) {
+      return {
+        ok: false,
+        code: "proposal_invalid",
+        problems,
+        userMessage: proposalRepairCopy(problems),
+        guidance:
+          "这次改写没有通过报告自身的内容契约，因此还没有保存为提案。请按上面每条问题修正后，用 propose_section_edit 再提交一次——这是本次动作唯一一次修正机会。不要靠删除章节义务或降低依据要求来通过校验。",
+      };
+    }
+    const userMessage = proposalFailureCopy(problems);
+    if (state !== undefined) {
+      state.proposalOutcome = {
+        kind: "edit",
+        status: "proposal_not_created",
+        userMessage,
+        delta: deltaOfSession(grant.sessionId),
+      };
+    }
+    return {
+      ok: false,
+      code: "proposal_not_created",
+      problems,
+      userMessage,
+      guidance:
+        "修正机会已用完，这次动作没有产生提案，报告正文保持不变。请停止提交提案，并用一句话向用户说明没有创建修改建议。",
+    };
   }
 
   function spend(grant: ActionGrant, what: "searches" | "reads" | "gapRounds"): void {
@@ -1809,6 +1953,13 @@ export function createResearchService(options: ResearchServiceOptions): Research
       // is the only moment the model has just read the material and knows
       // whether this is the original method, a survey of it, or an evaluation
       // by someone else. It is used by the claim contract, never as a score.
+      //
+      // The value is captured, not just written: finishing the read updates the
+      // same row from a copy of the source taken before this line, so a role
+      // that lived only in that first write would be erased by the read it
+      // belongs to — and the workspace would show「未声明」for material the
+      // agent had in fact classified.
+      const role: SourceRole | null = input.role ?? source.role ?? null;
       if (input.role !== undefined && input.role !== source.role) {
         repo.updateSource({ ...source, role: input.role });
       }
@@ -1831,6 +1982,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         if (outcome.status === "failed" || outcome.scope === null) {
           repo.updateSource({
             ...source,
+            role,
             readStatus: "failed",
             readScope: null,
             readAt: outcome.fetchedAt,
@@ -1862,6 +2014,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         repo.saveSnapshot(snapshot);
         repo.updateSource({
           ...source,
+          role,
           readStatus: "ok",
           readScope: outcome.scope,
           readAt: outcome.fetchedAt,
@@ -2293,7 +2446,22 @@ export function createResearchService(options: ResearchServiceOptions): Research
       // no counter behind: what a finished action used is not a budget anyone
       // can still draw on.
       actionUsage.set(grant.id, EMPTY_ACTION_USAGE);
-      if (previous !== undefined && previous.id !== grant.id) actionUsage.delete(previous.id);
+      if (previous !== undefined && previous.id !== grant.id) {
+        actionUsage.delete(previous.id);
+        actionStates.delete(previous.id);
+      }
+      // A user action is measured against the project as it was when the action
+      // started. Snapshotting here — where the permission is minted, right
+      // before the run begins — is what makes the delta unarguable: it cannot
+      // include material that was already there.
+      if (grant.origin === "user") {
+        actionStates.set(grant.id, {
+          startedAt: grant.createdAt,
+          baseline: baselineOf(grant.taskId),
+          proposalAttempts: 0,
+          proposalOutcome: null,
+        });
+      }
       return grant;
     },
     activeGrant: (sessionId) => grants.get(sessionId),
@@ -2307,9 +2475,47 @@ export function createResearchService(options: ResearchServiceOptions): Research
         gapRoundsRemaining: Math.max(0, grant.budget.maxGapRounds - usage.gapRounds),
       };
     },
+    actionDeltaOf: (sessionId) => deltaOfSession(sessionId),
+    actionOutcomeOf(sessionId, userText) {
+      const grant = grants.get(sessionId);
+      const state = grant === undefined ? undefined : actionStates.get(grant.id);
+      if (grant === undefined || state === undefined || grant.taskId === null) return undefined;
+      const delta = deltaOfSession(sessionId);
+      if (grant.intent === "edit") {
+        // An Edit that never reached the proposal tool still has an outcome:
+        // the action ended without a proposal, and saying so is the point.
+        return (
+          state.proposalOutcome ?? {
+            kind: "edit",
+            status: "proposal_not_created",
+            userMessage: "这次没有生成修改建议；报告正文没有改变。可以换一种说法再试一次。",
+            delta,
+          }
+        ) satisfies RunOutcome;
+      }
+      // Only a research action has something to resolve: Ask writes nothing.
+      if (grant.intent !== "research") return undefined;
+      const task = repo.getTask(grant.taskId);
+      if (task === undefined) return undefined;
+      const resolution: ResearchResolution = deriveResearchResolution({
+        question: userText,
+        delta,
+        sources: repo.listSources(task.id),
+        evidence: repo.listEvidence(task.id),
+        assessments: repo.listAssessments(task.id),
+        cells: cellViews(task),
+        subjectNames: new Map(task.subjects.map((subject) => [subject.id, subject.name])),
+        dimensionNames: new Map(task.dimensions.map((dimension) => [dimension.id, dimension.name])),
+        hasReport: task.currentReportId !== null,
+      });
+      return { kind: "research", resolution, delta } satisfies RunOutcome;
+    },
     clearGrant(sessionId) {
       const grant = grants.get(sessionId);
-      if (grant !== undefined) actionUsage.delete(grant.id);
+      if (grant !== undefined) {
+        actionUsage.delete(grant.id);
+        actionStates.delete(grant.id);
+      }
       grants.delete(sessionId);
     },
 
@@ -2451,7 +2657,23 @@ export function createResearchService(options: ResearchServiceOptions): Research
         };
       }
 
+      // A table the user will be shown has to be complete: a replacement
+      // section carrying a table with unwritten cells would render as headings
+      // and empty rows — the defect this contract exists to stop — so a
+      // proposal that cannot produce a complete table is not created at all.
+      const tableGaps = tableGapsOf(input.sections);
+      if (tableGaps.length > 0) {
+        return refuseCandidate(
+          grant,
+          tableGaps.map(
+            (gap) =>
+              `提案中章节「${gap.sectionTitle}」的表格存在空白单元格（${blankCellLabel(gap.blanks)}）：${BLANK_CELL_REMEDY}`,
+          ),
+        );
+      }
+
       const evidenceIds = [...new Set([...(input.claims ?? []).flatMap((claim) => claim.evidenceIds)])];
+      const delta = deltaOfSession(task.sessionId);
       const proposal = createProposal({
         actionId: input.actionId,
         taskId: task.id,
@@ -2463,14 +2685,52 @@ export function createResearchService(options: ResearchServiceOptions): Research
         evidenceIds,
         reason: input.reason,
         summary: input.summary ?? null,
+        // The material this action really added, as a difference of id sets. A
+        // project that already holds forty sources reports zero here when the
+        // edit found nothing new, because zero is the honest answer to what
+        // *this* action brought in.
         researchAdded: {
-          sources: repo.listSources(task.id).length,
-          evidence: evidenceById.size,
-          assessments: repo.listAssessments(task.id).length,
+          sources: delta.newSourceIds.length,
+          evidence: delta.newEvidenceIds.length,
+          assessments: delta.newAssessmentIds.length,
         },
         now: isoNow(),
       });
+
+      // The preflight. A pending proposal means "if the base has not gone
+      // stale, this change satisfies the report's own contract and can be
+      // accepted" — so the candidate report is assembled here and run through
+      // the same validator the accept path uses. A proposal that would be
+      // refused on accept is never offered as one that could be accepted.
+      const candidate = applyProposal(proposalBaseOf(base), proposal);
+      const validation = validateReport({
+        draft: candidate,
+        task,
+        evidence: repo.listEvidence(task.id),
+        sources: repo.listSources(task.id),
+        assessments: repo.listAssessments(task.id),
+        snapshotText: (readId) => repo.getSnapshot(readId)?.text,
+        // The sections this edit does not touch are the report's own history: a
+        // fault they already carried is reported, not blamed on this change.
+        carriedOverSectionIds: base.sections
+          .map((section) => section.id)
+          .filter((sectionId) => !targets.some((target) => target.targetId === sectionId)),
+        now: isoNow(),
+      });
+      if (!validation.ok) {
+        return refuseCandidate(grant, validation.problems);
+      }
+
       repo.saveProposal(proposal);
+      const state = actionStates.get(grant.id);
+      if (state !== undefined) {
+        state.proposalOutcome = {
+          kind: "edit",
+          status: "proposal_created",
+          userMessage: "已经准备好修改建议，等你决定是否接受；在决定之前报告正文不会改变。",
+          delta,
+        };
+      }
       return { ok: true, proposal };
     },
 
@@ -2531,6 +2791,12 @@ export function createResearchService(options: ResearchServiceOptions): Research
         sources: repo.listSources(task.id),
         assessments: repo.listAssessments(task.id),
         snapshotText: (readId) => repo.getSnapshot(readId)?.text,
+        // The same set the proposal's preflight passed: sections this proposal
+        // does not target are the report's own history, so accept cannot refuse
+        // on a fault the preflight already saw and reported as a warning.
+        carriedOverSectionIds: base.sections
+          .map((section) => section.id)
+          .filter((sectionId) => !proposal.targets.some((target) => target.targetId === sectionId)),
         now: isoNow(),
       });
       if (!validation.ok) {

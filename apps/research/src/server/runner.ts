@@ -40,6 +40,7 @@ import {
   blueprintById,
   needsAttention,
   newId,
+  sectionSpecOf,
   USER_RESEARCH_BUDGET,
 } from "@every-dagent/plugin-research";
 
@@ -258,6 +259,24 @@ function blueprintSectionLines(blueprintId?: string, include?: readonly string[]
     });
 }
 
+/**
+ * The obligation the edited section still has to meet after a rewrite.
+ *
+ * Saying「改成四段纯文字」changes the form of a section, not its cognitive
+ * duty: the synthesis section is still where cross-source judgements are made,
+ * the comparison section still needs its complete table. The line comes from
+ * the same blueprint the validator reads, so what the model is told to keep and
+ * what it is held to are one source of truth.
+ */
+function sectionObligationLine(task: ReportTask, sectionId: string): string {
+  const blueprint = blueprintById(task.blueprintId);
+  const spec = blueprint === undefined ? undefined : sectionSpecOf(blueprint, sectionId);
+  if (spec === undefined) {
+    return "这一节的内容义务：保留它原有的认知责任——改写的是表达形式，不是这一节要回答的问题。";
+  }
+  return `这一节的内容义务（必须保留；改写的是表达形式，不是义务）：${spec.title}｜${spec.cognitivePurpose}；须回答：${spec.requiredQuestions.join("；")}；篇幅预算：${spec.budget}`;
+}
+
 /** The instruction one stage run is started with. Written here, not by a model. */
 export function stageInstruction(input: {
   readonly stage: "card";
@@ -344,6 +363,8 @@ export function stageInstruction(input: {
       `  · 如果这个字段是列表（subjects/dimensions/focus），value 要给出完整的列表，而不是增量的一句描述；`,
       "  · 候选项之间要有真实差别（对应不同的检索与报告取舍），不要给同义改写；",
       `- 只有确实已经完成至少 ${GUIDE_MIN_DECISIONS} 个关键决策，才允许返回 { complete: true, reason: "..." }；在此之前服务端会拒绝它，你必须围绕本次指定字段提出一个真正有区分度的问题。`,
+      "用户的上一条回答里可能还包含其它字段的信息。你可以在 leadIn 里说明你注意到了它（例如「我注意到你还提到了 X，后面我会继续和你确认」），",
+      "但本次回答只写入 fieldTargets 指定的那一个字段——不要说「我已经把你刚才说的都改好了」这类与简报实际内容不符的话：用户会在结构化方案里核对每个字段，说了没做比不说更糟。",
       "调用一次即结束：不要输出 Markdown 正文，不要调用其他工具，不要追问用户原话。",
     ].join("\n");
   }
@@ -442,13 +463,17 @@ export function stageInstruction(input: {
       return [
         "用户要求修改当前报告的指定目标。请只针对该目标生成一份修改提案，不要直接改写正文。",
         `目标章节：${targetSectionId}`,
+        sectionObligationLine(task, targetSectionId),
         "提案的基线（报告 id、该章节当前内容、可用 evidenceId）与用户原话：",
         input.instruction ?? "",
         "执行要求：",
+        "- 用户说的「改成纯文字 / 去掉表格 / 分四段」改变的是表达形式，不是这一节的内容义务：改写后这一节仍要满足上面写明的义务，否则提案不会通过预检；",
         "- 用 propose_section_edit 提交一次提案：section 为目标章节的替换内容（id 必须与目标一致；blocks 形状与 save_report 相同）；",
+        "- 表格必须完整：每一行的每一格都要写出判断，或写明「证据不足 / 有限可比 / 不可直接比较 / 未找到公开依据」；空白的表格不会被保存；",
         "- 如果这次修改会影响摘要，必须同时显式提供 summary 字段，不要指望系统自动同步；",
         '- 新引入的论断必须绑定真实 evidenceId（可复用上面列出的 evidenceId）；拿不到依据的判断写成 callout(tone="gap")，或 kind="inference" 并绑定推断依据；',
         "- 如果被授权补查，最多做一次针对该章节问题的 search_sources 或 read_source，然后提交提案；",
+        "- 提交后服务端会按报告自己的内容契约预检这次改写：返回 problems 时按它修正后只再提交一次（本次动作只有一次修正机会）；仍然不通过时就停止提交，如实说明没有生成修改建议，不要为了通过校验删掉义务或降低依据要求；",
         "- 报告正文在接受前不会改变：提交后简要说明「改了什么、依据是什么」，等待用户接受或放弃。",
       ].join("\n");
     }
@@ -677,6 +702,11 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       }
       if (state.settled) {
         runFailed = state.status !== "completed";
+        // What the action resolved is a fact about this action, and it is read
+        // here — while its grant is still live — so later material can never
+        // change what an earlier action is said to have answered.
+        const outcome =
+          request.userText === undefined ? undefined : service.actionOutcomeOf(request.sessionId, request.userText);
         finish({
           status: state.status === "completed" ? "completed" : "failed",
           note:
@@ -684,6 +714,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
               ? `${stageLabel(request.stage)}：完成`
               : `${stageLabel(request.stage)}：${state.error ?? state.status}`,
           endedAt: new Date().toISOString(),
+          ...(outcome === undefined ? {} : { outcome }),
         });
         break;
       }

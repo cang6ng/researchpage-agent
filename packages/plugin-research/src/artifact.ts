@@ -43,6 +43,19 @@ export interface ArtifactInput {
   readonly evidence: readonly Evidence[];
   readonly sources: readonly Source[];
   readonly assessments: readonly SupportAssessment[];
+  /**
+   * Sections this draft inherited from an existing report, by id.
+   *
+   * The content contract grows: a rule added today must apply to what the
+   * product writes from now on, and must not turn a report written before it
+   * existed into one nobody can edit — an edit of the synthesis section cannot
+   * repair a comparison table it does not touch, and refusing the edit would
+   * take the user's only route away. So a blank the report already carried is
+   * reported as a warning, while a blank in the content being written now is an
+   * error. A fresh save passes nothing here, which is what makes every new
+   * report held to the whole contract.
+   */
+  readonly carriedOverSectionIds?: readonly string[];
 }
 
 export interface ArtifactVerdict {
@@ -68,6 +81,68 @@ function blockText(block: ReportBlock): string {
         .join("\n");
   }
 }
+
+/** A cell position a table declares but leaves unwritten. */
+export interface BlankCell {
+  /** 1-based, so the sentence can name the position a reader would count to. */
+  readonly row: number;
+  readonly column: number;
+}
+
+/** One table that leaves cells unwritten, and where. */
+export interface TableGap {
+  readonly sectionId: string;
+  readonly sectionTitle: string;
+  readonly blanks: readonly BlankCell[];
+}
+
+/**
+ * The cells of a table that carry no judgement.
+ *
+ * A cell is unwritten when its text is empty *or* when the row does not reach
+ * that column at all: a report that writes `rows: [{cells: []}]` under a
+ * three-column heading has declared a comparison and left every judgement out,
+ * which used to render as a table of blanks. Both shapes are the same fact, and
+ * both are invisible to a check that only counts dimensions and subjects.
+ */
+export function blankCellsOfTable(block: Extract<ReportBlock, { kind: "table" }>): readonly BlankCell[] {
+  const blanks: BlankCell[] = [];
+  block.rows.forEach((row, rowIndex) => {
+    const width = Math.max(block.columns.length, row.cells.length);
+    for (let column = 0; column < width; column += 1) {
+      const cell = row.cells[column];
+      if (cell === undefined || cell.text.trim().length === 0) blanks.push({ row: rowIndex + 1, column: column + 1 });
+    }
+  });
+  return blanks;
+}
+
+/** Every table gap in a set of sections, in document order. */
+export function tableGapsOf(sections: readonly ReportSection[]): readonly TableGap[] {
+  const gaps: TableGap[] = [];
+  for (const section of sections) {
+    for (const block of section.blocks) {
+      if (block.kind !== "table") continue;
+      const blanks = blankCellsOfTable(block);
+      if (blanks.length === 0) continue;
+      gaps.push({ sectionId: section.id, sectionTitle: section.title, blanks });
+    }
+  }
+  return gaps;
+}
+
+/** Where a set of blank cells sits, in a sentence a writer can act on. */
+export function blankCellLabel(blanks: readonly BlankCell[]): string {
+  const named = blanks
+    .slice(0, 4)
+    .map((blank) => `第 ${String(blank.row)} 行第 ${String(blank.column)} 列`)
+    .join("、");
+  return blanks.length > 4 ? `${named} 等 ${String(blanks.length)} 处` : named;
+}
+
+/** What a blank cell must say instead, in the contract's own words. */
+export const BLANK_CELL_REMEDY =
+  "每一格必须给出一个有界判断，或写明「证据不足 / 有限可比 / 不可直接比较 / 未找到公开依据」。空白不是判断。";
 
 function sectionText(section: ReportSection): string {
   return section.blocks.map((block) => blockText(block)).join("\n");
@@ -166,6 +241,7 @@ export function validateArtifactQuality(input: ArtifactInput): ArtifactVerdict {
 
   // ------------------------------------------------------- Q03 / components --
   const requiredSections = blueprint.sections.filter((section) => section.required);
+  const carriedOver = new Set(input.carriedOverSectionIds ?? []);
   const missingSections: SectionSpec[] = [];
   const shallowSections: string[] = [];
   for (const spec of requiredSections) {
@@ -174,7 +250,7 @@ export function validateArtifactQuality(input: ArtifactInput): ArtifactVerdict {
       missingSections.push(spec);
       continue;
     }
-    const verdict = checkSectionObligation(spec, section, claimById);
+    const verdict = checkSectionObligation(spec, section, claimById, { carriedOver: carriedOver.has(spec.id) });
     if (verdict.problem !== undefined) shallowSections.push(verdict.problem);
     warnings.push(...verdict.warnings);
   }
@@ -419,6 +495,7 @@ function checkSectionObligation(
   spec: SectionSpec,
   section: ReportSection,
   claimById: ReadonlyMap<string, ReportClaim>,
+  options: { readonly carriedOver: boolean },
 ): { readonly problem?: string; readonly warnings: readonly string[] } {
   const warnings: string[] = [];
   const text = sectionText(section);
@@ -472,9 +549,24 @@ function checkSectionObligation(
       // A conditional comparison needs its shared frame: a table that declares
       // its columns and rows. Which claims support its cells is the claim
       // contract's business (Q07), not this section's.
-      const hasTable = section.blocks.some((block) => block.kind === "table" && block.rows.length > 0);
-      if (!hasTable) {
+      const table = section.blocks.find((block): block is Extract<ReportBlock, { kind: "table" }> => block.kind === "table" && block.rows.length > 0);
+      if (table === undefined) {
         return { problem: `章节「${spec.title}」没有比较表：共同维度下的比较需要一张声明了列维度与行对象的表`, warnings };
+      }
+      // A table is a comparison only if its cells say something. A declared
+      // frame with unwritten cells is the shape this product used to ship: the
+      // reader gets headings, rows, and nothing to compare — so the contract
+      // now holds every cell to a bounded judgement or an explicit state.
+      const blanks = blankCellsOfTable(table);
+      if (blanks.length > 0) {
+        const sentence = `章节「${spec.title}」的比较表存在空白单元格（${blankCellLabel(blanks)}）：${BLANK_CELL_REMEDY}`;
+        if (options.carriedOver) {
+          warnings.push(
+            `Q03：章节「${spec.title}」的比较表存在空白单元格（${blankCellLabel(blanks)}）——这是报告既有的内容，本次修改没有改变它，但报告本身仍应重写该表：${BLANK_CELL_REMEDY}`,
+          );
+        } else {
+          return { problem: sentence, warnings };
+        }
       }
       return { warnings };
     }

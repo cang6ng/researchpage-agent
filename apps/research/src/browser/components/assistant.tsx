@@ -199,10 +199,16 @@ function AssistantTurn({
             </>
           ) : (
             <>
-              <p className="rp-chat__said">
+              <p className="rp-chat__said" data-testid="research-result">
                 {exhausted
                   ? "这次补查已经用完了本轮的检索额度。"
-                  : `找到了 ${String(interaction.reads)} 个来源的可用材料。`}
+                  : /* The result answers whether the question was resolved. A
+                       count of sources fetched is not that answer: two
+                       background papers satisfy「找到 2 个可用来源」while
+                       leaving the question entirely open. */
+                    interaction.outcome?.kind === "research"
+                    ? interaction.outcome.resolution.summary
+                    : `找到了 ${String(interaction.reads)} 个来源的可用材料。`}
               </p>
               <div className="rp-action-card__body">
                 <span>

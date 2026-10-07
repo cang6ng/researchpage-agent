@@ -242,10 +242,17 @@ export function ProposalPanel({
           <dd>{proposal.evidenceIds.length} 条证据</dd>
           {summary !== undefined && (
             <>
-              <dt>修改期间新增</dt>
-              <dd>
-                {summary.researchAdded.sources} 个来源 · {summary.researchAdded.evidence} 条证据 ·{" "}
-                {summary.researchAdded.assessments} 条评估
+              <dt>本次动作新增</dt>
+              <dd data-testid="proposal-delta">
+                {/* These numbers are the action's own delta, so zero is a real
+                    answer rather than a small project total: an edit that
+                    searched for nothing says so, instead of reporting how much
+                    material the project happens to hold. */}
+                {summary.researchAdded.sources === 0 &&
+                summary.researchAdded.evidence === 0 &&
+                summary.researchAdded.assessments === 0
+                  ? "本次修改没有新增研究材料。"
+                  : `${String(summary.researchAdded.sources)} 个来源 · ${String(summary.researchAdded.evidence)} 条证据 · ${String(summary.researchAdded.assessments)} 条评估`}
               </dd>
             </>
           )}

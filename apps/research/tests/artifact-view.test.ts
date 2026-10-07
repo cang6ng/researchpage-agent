@@ -18,12 +18,58 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import type { CellView, DocumentView, DocumentClaim, ReportBlock } from "../src/browser/api.js";
+import type { CellView, DocumentView, DocumentClaim, PresentationReadout, ReportBlock } from "../src/browser/api.js";
 import { DocumentCanvas } from "../src/browser/components/document.js";
 import { boundariesOf, boundarySummary, nameMaps, readerText, warningSummary } from "../src/browser/document-logic.js";
 import type { TaskBundle } from "../src/browser/api.js";
 
 /* ---------------------------------------------------------------- fixtures -- */
+
+/**
+ * The project readout a bundle carries.
+ *
+ * It is a fixture of the *server's* projection, not a second implementation:
+ * the values here are what `presentationOf` derives for this project's matrix
+ * and report, and the page is checked against them rather than against a
+ * summary the page computed for itself.
+ */
+function presentationFixture(): PresentationReadout {
+  return {
+    runState: { state: "report_ready", displayName: "报告已就绪", userMessage: "报告已经写好并保存。" },
+    evidenceCoverage: {
+      cells: 6,
+      withMaterial: 2,
+      reviewed: 1,
+      displayName: "2 / 6 个比较项已有材料",
+      userMessage: "2 / 6 个比较项已有材料；其中 1 项已核对。材料覆盖不等于结论完成。",
+    },
+    unresolvedResearch: {
+      unresolved: 4,
+      limited: 1,
+      incomparable: 0,
+      resolved: 1,
+      displayName: "5 项还没有结论",
+      userMessage: "4 项还没有可用的依据、1 项只有有限支持；这些是研究层面的未解决项。",
+    },
+    reportReview: { state: "clean", reason: null, displayName: "未被标记待复核", userMessage: "报告写成之后没有新材料进入。" },
+    artifactQuality: {
+      state: "warnings",
+      warnings: 1,
+      blocking: 0,
+      displayName: "通过，1 处义务未完全达成",
+      userMessage: "报告通过了发布校验，但有 1 处义务没有完全达成（正文里已如实写出）。",
+    },
+    sourceRoles: {
+      total: 0,
+      classified: 0,
+      unknown: 0,
+      primary: 0,
+      byRole: {},
+      displayName: "还没有来源",
+      userMessage: "还没有找到任何来源。",
+    },
+  };
+}
 
 function claimFixture(overrides: Partial<DocumentClaim> & { readonly id: string }): DocumentClaim {
   return {
@@ -195,6 +241,7 @@ function bundleFixture(): TaskBundle {
       updatedAt: "2026-10-06T10:00:00.000Z",
       reportNeedsReview: null,
     },
+    presentation: presentationFixture(),
     structure: [],
     subjects,
     dimensions,
@@ -357,10 +404,60 @@ describe("the comparison, as a frame", () => {
     const empty = markup.match(/data-empty="true"/g) ?? [];
     expect(empty.length).toBe(2);
     // Each unwritten cell carries the coverage the project actually has for
-    // that pair — one of them is limited rather than missing.
-    expect(visible).toContain("待查");
+    // that pair — one of them is limited rather than missing, and the other
+    // says in words that the evidence is not there.
+    expect(visible).toContain("证据不足");
     expect(visible).toContain("有限支持");
     expect(markup).toContain("rp-doc__cellfill");
+  });
+
+  /**
+   * The shape the real acceptance found.
+   *
+   * Four real v2 reports hold a comparison table whose rows are `{cells: []}`:
+   * the frame is declared, the cells were never written at all. That path used
+   * to render a `<td>` with no text and no state — literally nothing in the
+   * page — and it is what「内容 cell 在页面文本中为空」was describing.
+   */
+  it("says something in a cell whose row never reached that column", () => {
+    const bundle = bundleFixture();
+    const document = documentFixture();
+    const blanked = {
+      ...document,
+      sections: document.sections.map((section) => ({
+        ...section,
+        blocks: section.blocks.map((block) =>
+          block.kind === "table" && block.rowSubjects !== undefined
+            ? { ...block, rows: block.rows.map(() => ({ cells: [] })) }
+            : block,
+        ),
+      })),
+    };
+    const markup = renderToStaticMarkup(
+      createElement(
+        MantineProvider,
+        null,
+        createElement(DocumentCanvas, {
+          document: blanked,
+          mode: "verify",
+          themeId: "editorial",
+          selection: null,
+          names: nameMaps(bundle),
+          boundaries: boundariesOf(bundle),
+          coverage: new Map(bundle.matrix.map((cell) => [`${cell.subjectId}|${cell.dimensionId}`, cell.status])),
+          onSelect: () => undefined,
+          onOpenReference: () => undefined,
+        }),
+      ),
+    );
+    // Every dimension × object cell is drawn, and none of them is empty: the
+    // page says 「证据不足」 rather than pretending there is nothing to say.
+    const cells = markup.match(/data-testid="compare-cell-/g) ?? [];
+    expect(cells.length).toBe(6);
+    const words = (markup.match(/rp-doc__cellfill[^>]*>[^<]*</g) ?? []).map((word) => word.replace(/.*>/, "").replace(/<$/, ""));
+    expect(words).toHaveLength(6);
+    for (const word of words) expect(word.trim().length).toBeGreaterThan(0);
+    expect(markup).toContain("证据不足");
   });
 
   it("offers the evidence for an unwritten cell rather than a dead end", () => {

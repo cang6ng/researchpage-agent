@@ -726,3 +726,108 @@ describe("implications carry their conditions", () => {
     expect(validateClaimContract(conditional, context).errors).toEqual([]);
   });
 });
+
+/**
+ * The comparison matrix as content, not as a frame.
+ *
+ * Four real v2 reports were found holding a comparison table with its columns
+ * and row subjects declared and every cell empty: `rows: [{cells: []}, …]`. The
+ * reader got headings, rows and nothing to compare, and the validator passed it
+ * because it only checked that the dimensions and subjects had been *declared*.
+ * A declared frame is not a comparison — each required cell now has to carry a
+ * bounded judgement or an explicit state.
+ */
+describe("the comparison table must be written, not just declared", () => {
+  it("refuses a report whose comparison cells are empty", () => {
+    const base = baseDraft();
+    const draft = replacing(base, "comparison", [
+      {
+        kind: "table",
+        columns: ["对象", "结构与构建", "评测口径", "成本与资源"],
+        columnDimensions: [null, "dim_build", "dim_eval", "dim_cost"],
+        rowSubjects: ["sub_a", "sub_b"],
+        // The shape the real reports were saved with.
+        rows: base.sections
+          .find((section) => section.id === "comparison")!
+          .blocks.filter((block) => block.kind === "table")
+          .flatMap((block) => (block.kind === "table" ? block.rows.map(() => ({ cells: [] as { text: string; claimIds: string[] }[] })) : [])),
+      },
+      { kind: "callout", tone: "gap", dimensionIds: ["dim_query", "dim_limits", "dim_idea"], text: "其余维度：材料不足，不作结论。" },
+    ]);
+    const result = validate(draft);
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toContain("空白单元格");
+    expect(result.problems.join(" ")).toContain("第 1 行第 1 列");
+  });
+
+  it("accepts a cell that says the evidence is not there", () => {
+    const base = baseDraft();
+    const draft = replacing(base, "comparison", [
+      {
+        kind: "table",
+        columns: ["对象", "结构与构建", "评测口径"],
+        columnDimensions: [null, "dim_build", "dim_eval"],
+        rowSubjects: ["sub_a", "sub_b"],
+        rows: [
+          {
+            cells: [
+              { text: "MethodA", claimIds: [] },
+              { text: "实体图 + 社区摘要", claimIds: ["clm_mech_a"] },
+              // A state word is a judgement about the evidence, and it is
+              // exactly what a blank cell used to hide.
+              { text: "证据不足：只有作者自报口径", claimIds: ["clm_limits"] },
+            ],
+          },
+          {
+            cells: [
+              { text: "MethodB", claimIds: [] },
+              { text: "段落图 + 扩散检索", claimIds: ["clm_mech_b"] },
+              { text: "不可直接比较：数据集与指标不同", claimIds: ["clm_cost"] },
+            ],
+          },
+        ],
+      },
+      { kind: "callout", tone: "gap", dimensionIds: ["dim_query", "dim_cost", "dim_limits", "dim_idea"], text: "其余维度：材料不足。" },
+    ]);
+    const result = validate(draft);
+    expect(result.problems, result.problems.join("; ")).toEqual([]);
+  });
+
+  it("reports a blank the report already carried as a warning, not as a fault of this edit", () => {
+    const base = baseDraft();
+    const blankTable = replacing(base, "comparison", [
+      {
+        kind: "table",
+        columns: ["对象", "结构与构建"],
+        columnDimensions: [null, "dim_build"],
+        rowSubjects: ["sub_a", "sub_b"],
+        rows: [{ cells: [] }, { cells: [] }],
+      },
+      { kind: "callout", tone: "gap", dimensionIds: ["dim_eval", "dim_cost", "dim_limits", "dim_query", "dim_idea"], text: "其余维度：材料不足。" },
+    ]);
+    const edited = replacing(blankTable, "synthesis", [
+      { kind: "paragraph", text: "综合两篇论文可见，差异不在是否使用图，而在结构信息被使用的阶段。", claimIds: ["clm_synthesis"] },
+    ]);
+    // The section being written here satisfies its own obligation, so the only
+    // thing wrong with the draft is the table it inherited.
+    const carriedOver = validateReport({
+      draft: edited,
+      task: makeTask(),
+      evidence: evidence(),
+      sources: sources(),
+      assessments: [],
+      snapshotText: (readId) => (readId === "read_1" ? SNAPSHOT_TEXT : undefined),
+      carriedOverSectionIds: ["comparison"],
+      now: "2026-10-05T00:00:00Z",
+    });
+    expect(carriedOver.problems, carriedOver.problems.join("; ")).toEqual([]);
+    expect(carriedOver.warnings.join(" ")).toContain("空白单元格");
+    expect(carriedOver.warnings.join(" ")).toContain("报告既有");
+
+    // Without the declaration the same draft is refused: the content contract
+    // applies in full to anything written now.
+    const fresh = validate(edited);
+    expect(fresh.ok).toBe(false);
+    expect(fresh.problems.join(" ")).toContain("空白单元格");
+  });
+});

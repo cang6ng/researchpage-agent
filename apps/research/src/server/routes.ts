@@ -37,6 +37,7 @@ import {
   reportContentOf,
 } from "@every-dagent/plugin-research";
 import { exportRevisionPdf, exportTaskReportPdf, renderHtmlOf, revisionHtmlOf } from "./export.js";
+import { presentationOf } from "./presentation.js";
 import type { ResearchRunner } from "./runner.js";
 
 const MAX_BODY_BYTES = 32 * 1024;
@@ -272,6 +273,10 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
       // program's own stages, which is how the workspace tells a turn of the
       // collaboration from the agent working on its own.
       userText: record.userText ?? "",
+      // What the action resolved, when it was one a person asked for: kept with
+      // the run so the history says what each turn answered rather than only
+      // what it fetched.
+      outcome: record.outcome ?? null,
     })),
     budget: task.budget,
     usage: task.usage,
@@ -287,6 +292,25 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
     currentReportHash: current === undefined ? null : service.contentHashOf(taskId),
     currentReportFrozen: current !== undefined && revisions.some((revision) => revision.reportId === current.id),
     hasReport: current !== undefined,
+    /*
+     * Where this project stands, as six separate answers.
+     *
+     * They are deliberately not folded into one status word: material coverage,
+     * unresolved research, whether the report is behind its material, and
+     * whether it met its own content contract are four different facts, and a
+     * page that merges them ends up saying「无待查项」next to「9 处义务未完全
+     * 达成」. Each field carries its own displayName / userMessage so the page
+     * never has to translate an internal term.
+     */
+    presentation: presentationOf({
+      task,
+      cells,
+      sources: service.sourcesOf(taskId),
+      hasReport: current !== undefined,
+      pendingProposal: proposals.some((proposal) => proposal.status === "pending"),
+      runningStage: service.runsOf(taskId).find((record) => record.status === "running")?.stage ?? null,
+      validation: current?.validation ?? null,
+    }),
     busy,
   };
 }

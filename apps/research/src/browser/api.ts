@@ -69,6 +69,48 @@ export interface RunStepView {
   readonly at: string;
 }
 
+/**
+ * What one user action added, measured against the project it started in.
+ *
+ * A difference of id sets, taken while the action ran — never a length of the
+ * project's own lists. That is what makes「本次修改没有新增研究材料」an
+ * answerable sentence: it means the ids did not change, not that the numbers
+ * happened to look small.
+ */
+export interface ActionDeltaView {
+  readonly newSourceIds: readonly string[];
+  readonly newEvidenceIds: readonly string[];
+  readonly newAssessmentIds: readonly string[];
+}
+
+/** What a user research action resolved, and on what it stands. */
+export interface ResearchResolutionView {
+  readonly status: "resolved" | "partially_resolved" | "unresolved";
+  readonly question: string;
+  readonly newSourceIds: readonly string[];
+  readonly newEvidenceIds: readonly string[];
+  readonly newAssessmentIds: readonly string[];
+  readonly supportingEvidenceIds: readonly string[];
+  readonly targetCells: readonly { readonly sectionId: string; readonly subjectId: string; readonly dimensionId: string }[];
+  readonly remainingGap: readonly {
+    readonly subjectName: string;
+    readonly dimensionName: string;
+    readonly status: string;
+    readonly reason: string;
+  }[];
+  readonly summary: string;
+}
+
+/** What a user action ended as: a resolution, or an Edit's own outcome. */
+export type RunOutcomeView =
+  | { readonly kind: "research"; readonly resolution: ResearchResolutionView; readonly delta: ActionDeltaView }
+  | {
+      readonly kind: "edit";
+      readonly status: "proposal_created" | "proposal_not_created";
+      readonly userMessage: string;
+      readonly delta: ActionDeltaView;
+    };
+
 export interface RunView {
   readonly runId: string | null;
   readonly stage: "card" | "guide" | "research" | "gap" | "report" | "synthesis" | "ask" | "edit" | "followup";
@@ -86,6 +128,8 @@ export interface RunView {
    * that carry a sentence here are the ones a person asked for.
    */
   readonly userText: string;
+  /** What the action resolved, for the runs a person asked for. */
+  readonly outcome: RunOutcomeView | null;
 }
 
 export type BriefFieldName =
@@ -401,7 +445,54 @@ export interface TaskBundle {
   /** Whether the current report already has a frozen revision. */
   readonly currentReportFrozen: boolean;
   readonly hasReport: boolean;
+  /**
+   * Where the project stands, as six separate answers.
+   *
+   * Each field carries its own `displayName` / `userMessage`: material
+   * coverage, unresolved research, the report's review flag, its content
+   * contract and the source roles are different facts, and the page must not
+   * merge them into one word that is true of none of them.
+   */
+  readonly presentation: PresentationReadout;
   readonly busy: boolean;
+}
+
+/* ------------------------------------------------------------- readout -- */
+
+export interface PresentationReadout {
+  readonly runState: { readonly state: string; readonly displayName: string; readonly userMessage: string };
+  readonly evidenceCoverage: {
+    readonly cells: number;
+    readonly withMaterial: number;
+    readonly reviewed: number;
+    readonly displayName: string;
+    readonly userMessage: string;
+  };
+  readonly unresolvedResearch: {
+    readonly unresolved: number;
+    readonly limited: number;
+    readonly incomparable: number;
+    readonly resolved: number;
+    readonly displayName: string;
+    readonly userMessage: string;
+  };
+  readonly reportReview: { readonly state: "clean" | "needs_review"; readonly reason: string | null; readonly displayName: string; readonly userMessage: string };
+  readonly artifactQuality: {
+    readonly state: "passed" | "warnings" | "blocking" | "unknown";
+    readonly warnings: number;
+    readonly blocking: number;
+    readonly displayName: string;
+    readonly userMessage: string;
+  };
+  readonly sourceRoles: {
+    readonly total: number;
+    readonly classified: number;
+    readonly unknown: number;
+    readonly primary: number;
+    readonly byRole: Readonly<Record<string, number>>;
+    readonly displayName: string;
+    readonly userMessage: string;
+  };
 }
 
 export type SessionState =
@@ -741,6 +832,26 @@ export const STATUS_LABELS: Readonly<Record<string, string>> = Object.freeze({
   conflict: "冲突 / 不可比",
   missing: "待查",
 });
+
+/**
+ * What an unwritten comparison cell says instead of nothing.
+ *
+ * A cell the report never filled in is not blank: the project knows something
+ * about that pair, and if it knows nothing,「证据不足」is the honest word for
+ * it. A blank cell reads as "nothing to say", which is a conclusion nobody
+ * drew. `reviewed` is the case where material exists but the report has not
+ * written the judgement yet, and it says exactly that.
+ */
+export const CELL_FALLBACK_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  reviewed: "尚未写出判断",
+  limited: "有限支持",
+  unassessed: "有材料，待核对",
+  conflict: "冲突 / 不可比",
+  missing: "证据不足",
+});
+
+/** The fallback for a cell whose pair the project has no coverage row for. */
+export const CELL_UNKNOWN_LABEL = "尚未写出判断";
 
 export const STAGE_LABELS: Readonly<Record<string, string>> = Object.freeze({
   card: "任务卡",
