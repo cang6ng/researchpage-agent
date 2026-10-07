@@ -10,6 +10,8 @@
 
 ## Current Status（2026-10-08）
 
+- **Step 3.6B（Navigation, Status & Trust UX）已完成**：3.6A 已经正确的业务语义接上了界面——项目只剩三个一级工作空间（报告 → 研究 → 来源），研究范围退到项目标题旁（未确认的项目自动以它为主流程），样式退到报告工具栏（不再叫「模板」），顶栏不再常驻检索/读取额度、只回答「这个项目现在发生什么」并可展开六条并列事实；补查结果第一句回答「问题解决了吗」（已解决 / 部分解决 / 未解决），工具次数折叠在结果之后，「查看本轮证据」只打开这一轮新增的来源 / 证据 / 支持评估与仍未解决的缺口，并能回到刚才那一轮对话；提案在待确认时完整展开、决定后折叠成一行、没形成提案时不出现任何「接受」按钮；未知角色、旧报告的空白单元格、质量核验详情、动作提示跨页残留与内部术语全部按读者语言收口。未做 PDF / Mermaid / Upload / MCP / 第二 Blueprint / Tauri，未改任何后端语义（本轮没有一处 server / plugin 改动）。
+
 - **Step 3.6A（Product Trust & Co-edit Reliability）已完成**：一次独立真实验收发现的「看到的状态、结果与可执行操作不可信」按 P0/P1 修完——待接受提案在生成时就通过报告自身的内容契约（改不下去就不会出现「接受」按钮），比较表与提案表格不再出现空白单元格，补查结果先回答「问题解决了吗」，提案上的「新增」是这次动作真实的增量，来源角色未分类不再被当成「0 个一手材料」，项目状态拆成六个互不代偿的字段。未改视觉、未做 PDF / Mermaid、未进入 Next Action。
 
 - **Step 3.5C-B（Conversational Planning & 50/50 Co-edit UI）已完成**：引导式规划从「一次一问的表单」变成一段真正的规划对话（问题、过渡语、用户的回答与回执按发生顺序重建，刷新后原样恢复，进度按 `readiness / minDecisions / maxDecisions` 说真话，用户随时可以自己确认，助手早退被拒后不会把界面卡在「正在准备」）；报告工作台从「文档 + 右侧插件」变成阅读与 50/50 协作两种形态（打开助手即左右各半、可拖动分隔条 40/60–60/60、1366 不再退回浮层），右栏是一个一级工作区：对话 + 内嵌动作、补查与修改建议，证据在同一栏打开并可一键回到对话。
@@ -29,6 +31,58 @@
 - **Vertical Product 可真实演示**：Topic → Task Card → 确认 → 真实检索/读取 → Evidence Matrix → 缺口定向补查（≤2 轮）→ 结构化报告 → HTML 预览 → PDF 下载 → 刷新重开。
 - **Step 1（Research Editing Semantics）已完成**：Ask / Research / Edit 三种正式意图由应用签发 Action Grant 约束；Edit 产出待接受 Proposal；报告版本可冻结、导出只读冻结依赖包；矩阵状态不再由「有正文片段」直接升级为充分。
 - 真实 Demo 两个主题此前均通过（真实模型 + 真实 arXiv + 真实 Chrome PDF）；Step 2 后又用新版各重跑一次（见「Current Status」与「Step 2 的验证入口」）。
+
+## Step 3.6B 新增（本次工作产物）
+
+本轮只做信息架构收敛、状态表达、结果与提案的可信呈现、本轮证据直达与术语清理。**没有修改任何后端语义**：`git diff` 只涉及 `apps/research/src/browser/**`、`apps/research/public/styles.css`、两个 gate 脚本、测试与 tsconfig，没有一处 `src/server` / `packages/**` 改动。没有重做首页 / Brief / Guided Planning / 50-50 骨架，没有动 Ask / Research / Edit 语义、Claim Contract、Artifact Validator、Blueprint、Action Budget、Frozen Revision。
+
+### 信息架构（`routes.ts` / `shell.tsx` / `workspace.tsx`）
+
+- **一级导航只剩三个**：报告 → 研究 → 来源（`PRIMARY_NAV`）。报告在前，因为研究做完之后读者主要在报告上工作。`brief` 与 `gallery` 仍是可达路由，但不再是导航项；`VIEW_LABELS.gallery` 从「模板」改为「样式对照」——这次构建只有一个 Blueprint，一个许诺更多的导航项是产品的虚假陈述。
+- **研究范围退到项目标题旁**：顶栏「研究范围 · 已确认/待确认 [查看]」直接进现有 Brief 页；未确认的项目里它额外出现在导航行首（带「待确认」），因为那时它就是唯一的主流程。
+- **默认视图由项目状态决定**（`defaultViewOf`）：未确认 → Brief，已确认且有报告 → 报告，否则 → 研究。地址不再猜：`parseRoute("#/p/<id>")` 的 `view` 现在是 `null`（「地址没点名」），由 `Workspace` 用项目的真实状态解析后把 hash 补全，而不是把某个猜测冻进 URL 语法。
+- **样式退到报告工具栏**：按钮在任何宽度都叫「样式」（当前值在窄窗口先省略），`DOC_THEME_OPTIONS` 是唯一一份选项列表；并排对照页仍从样式菜单进入，「模板」这个词在用户界面里不再出现。
+
+### 项目状态（`status.ts` 新建 + `shell.tsx`）
+
+- **顶栏只回答一个问题**：优先级是「正在进行的动作 → 等用户决定的提案 → 报告待复核 → 未解决的研究 → 就绪」，一次只说一句（研究中 / 有修改待确认 / 报告待复核 · n 项未定论 / 报告可阅读 · n 项研究问题仍未解决）。「无待查项」这类把材料覆盖当成结论完成的话不再出现。
+- **点击状态展开六条并列事实**（`statusDetails`）：当前动作 / 材料覆盖 / 研究判断 / 报告 / 质量检查 / 来源，每条都用 3.6A 的 `userMessage` 原文，并附一句「有材料不等于有结论，报告通过自己的内容检查也不等于结论已被独立复核」。
+- **顶栏不再常驻额度**：`搜索 4/6 · 读取 7/10` 从 Global Bar 消失；研究页原来的「检索 / 读取 / 补查」三格计分板也换成了「研究范围（n 个比较对象 · m 个研究维度）· 查看研究范围」。额度留在它该在的地方——助手 composer 的本次剩余、补查按钮旁的剩余轮次。
+- `projectState`（旧的一句话芯片）被 `primaryStatusOf` 取代，测试直接断言它不会把「15/15 有材料、0 项已核对」说成就绪。
+
+### 研究结果：先回答「问题解决了吗」（`outcome.ts` 新建 + `components/assistant.tsx`）
+
+- **结果块**：已解决 / 部分解决 / 未解决（`RESOLUTION_LABELS`）+ 服务端的 `resolution.summary` 句子 + 「已解决」（本轮 settled 的 target）+ 「仍缺少」（`remainingGap` 的名字与理由）+ 「本轮新增」（动作自己的 delta；为 0 时说「本轮没有找到新的材料。」）。
+- **不夸大**：`newSources > 0` 不再被说成「找到可用材料 / 问题已有答案 / 补查成功」；升级前运行的老 run 没有 outcome 时说「结果未记录」，并明确说明材料已并入项目，而不是拿材料数冒充答案。
+- **活动折叠**（`<details>`）：「本轮活动 · 2 次检索 · 4 个来源读取 · 1 格覆盖评估」默认收起，结果永远在它上面。额度用尽的提示降为结果下面的一行说明。
+- **提案没形成**（§20）：标题「这次改写没有形成可接受的修改建议」+ 服务端 `userMessage` + 「重新尝试 / 换一种修改方式」两个动作；不渲染 ProposalCard，页面上没有任何「接受」控件（测试断言 edit-outcome 子树里既没有「接受这一节」也没有 `accept-proposal`）。
+
+### 本轮证据直达（`store.tsx` / `components/dock.tsx`）
+
+- 新增 dock 目标 `{ kind: "action", interactionId }`：右栏显示这次动作自己的 resolution、新增来源（角色 + 读取范围）、新增证据（片段 + 定位）、对应的支持评估与「仍未解决的缺口」，顶部「← 返回对话」。材料按 **id 差集**（`actionMaterial`）取，不是把整个材料库缩窄；`newSourceIds/newEvidenceIds/newAssessmentIds` 为空就诚实写「这次动作没有新增来源 / 可引用的片段 / 支持评估」。
+- **返回的是那一轮**：`{ kind: "assistant", focus: interactionId }` 让对话滚回刚才那一轮（`data-interaction-id` + `scrollIntoView`），对话本身由 bundle 重建，不丢上下文。
+- 旧按钮「检查新证据」改名「查看本轮证据」，`verify-workspace.mjs` 里的文本引用同步更新。
+
+### 提案生命周期（`proposal-logic.ts` 新建 + `components/proposal.tsx`）
+
+- **状态用读者的词**：待确认 / 已接受 / 已放弃 / 需要重新生成 / 未生成修改建议（`PROPOSAL_STATUS_LABELS`），不再出现「基线已变化」「内容未通过校验」以及 `invalid` / `Q03` / contract 这类内部说法。
+- **待确认 = 完整展开**（它是用户当前的任务），**已决定 = 折叠成一行**（状态 + 目标 + 时间 + 展开），历史不再长期占据半屏。
+- **删除内容 hash 与 reportId**：面板里的「基线 sha256:…」和「由它产生的报告：rep_…」都去掉了，delta 行改为 `proposalDeltaLine`（0 时说「本次修改没有新增研究材料。」）。
+
+### 术语、状态与提示收口
+
+- **状态词统一**（§9/§27）：`支持有限` / `证据冲突` / `缺少依据` / `有材料，待核对` / `已核对`；表内未写判断的单元格仍是「尚未写出判断 / 证据不足 / 不可直接比较」。
+- **来源角色**（§24）：研究页与来源页都改用 `presentation.sourceRoles.userMessage`；来源表的 id 列删除、未分类写「尚未分类」，筛选器在存在未分类来源时叫「一手材料（已分类）」。
+- **质量核验**（§26）：工具栏显示「需要进一步核验 · n」（blocking 时为「需要先解决的问题 · n」），点击打开「核验详情」——人类语言的句子在前，`Q0x` 校验编号收在默认折叠的「技术细节」里；报告头部的芯片同步改成同一句话。
+- **动作提示不跨页**（§30）：`info` / `success` 提示 6 秒自动消失，切换视图时清掉上一个页面的提示；错误与警告保留。
+- **术语清理**：来源表的 `src_…`、对照页的报告 id 与 `hash …`、提案面板的 hash 全部移除；浏览器 gate 新增「五处页面全文不得出现 Qxx / synthesis / 内部 id / contentHash / grant」的检查（结果：全部未命中）。
+
+### 测试
+
+- `apps/research/tests/trust-ux.test.ts`（20 例）：导航只有三项且顺序固定、默认视图、研究范围入口、结果块（未解决 / 部分解决 / 不夸大 / 折叠 / 老 run 无结果）、单次动作材料按 id 取、提案五个状态的词与可决策性、零 delta、没形成提案时无接受控件、状态优先级（act/提案/复核/未解决/就绪）与六条事实、标签表里没有任何内部词、样式选项。
+- `apps/research/tests/frontend-logic.test.ts` 更新：`parseRoute` 的 `view: null` 语义（地址不点名）与 `defaultViewOf` / `resolveView` / `PRIMARY_NAV` 的断言。
+- `apps/research/tests/artifact-view.test.ts` 更新：报告头部芯片文案改为「需要进一步核验 · n」。
+- 浏览器 gate：新增 `apps/research/scripts/verify-trust-ux.mjs`（29 例，真实 CDP 输入，含 13 张截图）。
 
 ## Step 3.6A 新增（本次工作产物）
 
@@ -439,14 +493,24 @@ bundle 新增 `presentation`，六个字段各自回答一个问题，都由真�
 
 ## Next Action
 
-**STEP 3.6B — Navigation, Status & Trust UX**（下一步）：
+**STEP 4 — Artifact Delivery & Semantic Visualization**（下一步）：
 
-- **把 3.6A 的读数接上界面**：`bundle.presentation` 的六个字段（runState / evidenceCoverage / unresolvedResearch / reportReview / artifactQuality / sourceRoles）已经推导好、带 `displayName` 与 `userMessage`，3.6B 负责把它们展示成读者看得懂的一组状态，而不是一句话概括全部。
-- **「检查本轮新增证据」直达本轮材料**：run `outcome.resolution` 已经带着 `newSourceIds / newEvidenceIds / newAssessmentIds / targetCells`，3.6B 用它在同一栏打开这一轮找到的东西，而不是把用户送到整个矩阵。
-- **导航与顶栏**：项目切换、视图入口与状态芯片的信息层级（本轮只把「无待查项」这类与读数冲突的说法改掉，视觉未动）。
-- **提案与聊天的呈现**：失败结果的 `userMessage` 与 resolution 的 `summary` 已经在数据里，3.6B 决定它们长什么样。
+- **PDF 双主题适配**：把 ThemeSpec 映射到 plugin 的 HTML/PDF renderer，使 Editorial / Swiss 在导出文件里也成立（现在只有 Editorial 有 PDF 版式）。工具栏的「样式（Editorial / Swiss）」已经就位，冻结时也记录 `themeId`，位置留好了。
+- **Mermaid / DiagramSpec 机制图**：机制块的结构化数据（input / intermediate / steps / output / tradeoff / failure）完整保留，交互式报告里现在是 CSS 步骤流，替换成图形渲染不需要改数据。
+- **File Upload 作为来源**、**第二 Blueprint**、**MCP 集成**：Source Workspace 与 Settings 对未接入能力已如实标注；Blueprint 信息现在显示在 Brief 与研究范围里（「技术比较」），模板页已收为「样式对照」，第二 Blueprint 出现之前不会再有「模板」这个误导性入口。
+- 3.6B 交付后，界面看到的状态、结果与可执行操作与 3.6A 的真实语义一致，STEP 4 之前没有新的「数据有了、界面没接」的缺口。
 
 3.6A 交付后，产品看到的状态、结果与可执行操作与它自己知道的真实状态一致；STEP 4（PDF 双主题、Mermaid / DiagramSpec、File Upload、第二 Blueprint、MCP）在此之前没有新的「数据有了、界面没接」的缺口。
+
+## Step 3.6B 的验证入口
+
+- 前端纯逻辑与渲染：`npx vitest run apps/research/tests/trust-ux.test.ts apps/research/tests/frontend-logic.test.ts apps/research/tests/artifact-view.test.ts`（结果块、材料按 id 取、提案五态、状态优先级、标签表无内部词、导航与默认视图，全部不需要浏览器）。
+- 浏览器 gate（真实 CDP 输入，非 DOM stub）：`node apps/research/scripts/verify-trust-ux.mjs --url <product url> --task <有报告的项目> [--warnings-task <有质量 warning 的项目>] --shots <gitignored dir>`。29 例：导航三项与顺序、顶栏不显示额度、状态芯片 + 六条并列事实、研究范围入口、样式切换与正文重排、「需要进一步核验 · n」详情（技术细节默认折叠）、来源角色与无内部 id、矩阵状态词、未解决 / 部分解决的结果块与折叠活动、没形成提案时无接受控件、本轮证据只含本次动作的材料与「返回对话」、待确认提案完整展开 / 已接受折叠一行 / delta=0 的说法、五处页面全文无内部术语、动作提示不跨页、1366/1440/1920 的导航与工具栏。截图 13 张（report-main-1440 / research-main-1440 / sources-main-1440 / status-detail / research-unresolved / research-partial / action-evidence / proposal-pending / proposal-accepted-collapsed / proposal-not-created / brief-entry / report-theme-menu / 1366-report / 1920-report）。
+- 需要 fixture 才能演示的状态（已解决的补查、部分解决、未解决、待确认 / 已接受的提案、没形成提案的 Edit）：在**数据目录的副本**上注入真实形状的记录即可，做法见 `.scratch/trust-ux/inject.mjs` 的思路（payload 就是 service 写的形状，页面从它推导一切）。`researchpage-data` 本身未被改动。
+- 旧 gate 仍然可用：`node apps/research/scripts/verify-workspace.mjs --url <product url> [--task <id>] [--shots <dir>] [--model]`（本轮只同步了它引用的按钮文案与三处用例名，用例本身未改）。
+- 离线全量、类型检查与构建：`pnpm typecheck`、`pnpm build:research`、`EVERY_DAGENT_NO_BROWSER=1 npx vitest run --exclude …`（排除项同 Step 3.6A）。
+- **本次实测**（2026-10-08，真实数据副本 + 注入的 fixture 记录，真实 Chrome）：`verify-trust-ux.mjs` 29/29 PASS；`pnpm typecheck` 三个 project、`pnpm build:research`、离线全量 `1908 passed / 7 skipped`（整仓并行时 `apps/web/tests/shell-*.browser.test.ts` 偶发 CDP 超时，单独重跑 34/34 通过，与本次改动无关）。
+- 本轮没有跑真实模型动作（Ask / Research / Edit 需要数分钟一次且花费额度），也没有跑 PDF / Mermaid；结果块与提案的生命周期是在真实数据形状的 fixture 上、经真实 HTTP + 真实浏览器验证的。
 
 ## Step 3.6A 的验证入口
 
