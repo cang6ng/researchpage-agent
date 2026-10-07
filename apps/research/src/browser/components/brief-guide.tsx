@@ -1,160 +1,121 @@
 /**
- * Guided planning: one decision at a time.
+ * Guided planning: a conversation that ends in one decision at a time.
  *
- * This is not a conversation and must not become one. There is no transcript to
- * scroll and no assistant to greet you: there is one question the application
- * decided is worth asking, the reason it is worth asking, and the answers it
- * already knows how to apply. Answering it writes to the same brief the
- * structured editor writes to, which is why the panel can say what the decision
- * changed instead of describing a chat turn.
+ * This is a transcript, and the transcript is not kept here. Every turn is
+ * derived from the decisions the application already recorded — the question it
+ * wrote, the transition it wrote before asking it, and what the person answered
+ * — so refreshing the page rebuilds the same conversation and the page can
+ * never show a turn the brief does not have.
  *
- * A question that is not there yet is shown as not there yet — the application
- * writes it in a bounded run, and a panel that invented a placeholder question
- * would be answering on the application's behalf.
+ * The styling rule is the product's: this is a research planning conversation,
+ * not a chat app. The assistant speaks on the left without a bubble, the person
+ * answers slightly right of it with a light surface, and the choices stay
+ * inside the message that asked for them instead of becoming a third kind of
+ * card. What the answer changed is said once, in a small line under it.
+ *
+ * One state has to be recovered by the panel itself: the application asked for
+ * another question and got none — a question run that ended without leaving a
+ * question behind. That is retried once for the exact brief it was true for,
+ * and then handed back to the reader, because a loop that keeps asking a model
+ * to ask something is a loop with no floor.
  */
 
-import { Button, Loader, Textarea } from "@mantine/core";
-import { ArrowRight, Check, Info, MessageSquareQuote, Sparkles } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Button, Loader, Textarea, Tooltip } from "@mantine/core";
+import { ArrowRight, MessageSquareQuote, RotateCw, Sparkles } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
-import type { GuideDecisionView, GuideQuestionView } from "../api.js";
-import { BRIEF_FIELD_LABELS } from "../api.js";
+import { BRIEF_FIELD_LABELS, type BriefView } from "../api.js";
+import {
+  guideConfirmState,
+  guideIntro,
+  guideProgress,
+  guideStalled,
+  guideSummaryItems,
+  guideTranscript,
+  type GuideMessage,
+} from "../guide-logic.js";
+import { RichMarkdown } from "./markdown.js";
 
-/** What the reader just decided, said back before the panel moves on. */
+/** How long the stalled state has to hold before the panel retries it once. */
+const RECOVERY_GRACE_MS = 6_000;
+
+/** What the reader just decided, for the receipt under their answer. */
 export interface GuideApplied {
   readonly label: string;
   readonly field: string;
 }
 
-export function GuidePanel({
-  question,
-  complete,
-  reason,
-  decisions,
-  limit,
-  waiting,
-  applied,
-  staleNote,
-  busy,
-  onAsk,
-  onAnswer,
-  onViewStructured,
-  onConfirm,
+function fieldNames(fields: readonly string[]): string {
+  return fields
+    .map((field) => BRIEF_FIELD_LABELS[field as keyof typeof BRIEF_FIELD_LABELS] ?? field)
+    .join("、");
+}
+
+/** One assistant turn: the transition, the question, and — if live — the choices. */
+function AssistantTurn({
+  message,
+  choice,
+  setChoice,
+  freeText,
+  setFreeText,
+  canSubmit,
+  onSubmit,
 }: {
-  readonly question: GuideQuestionView | null;
-  readonly complete: boolean;
-  readonly reason: string;
-  readonly decisions: readonly GuideDecisionView[];
-  readonly limit: number;
-  readonly waiting: boolean;
-  readonly applied: GuideApplied | null;
-  readonly staleNote: string | null;
-  readonly busy: boolean;
-  readonly onAsk: () => void;
-  readonly onAnswer: (input: { readonly optionIds: readonly string[]; readonly freeText: string }) => void;
-  readonly onViewStructured: () => void;
-  readonly onConfirm: () => void;
+  readonly message: GuideMessage;
+  readonly choice: string | null;
+  readonly setChoice: (next: string | null) => void;
+  readonly freeText: string;
+  readonly setFreeText: (next: string) => void;
+  readonly canSubmit: boolean;
+  readonly onSubmit: () => void;
 }) {
-  const [choice, setChoice] = useState<string | null>(null);
-  const [freeText, setFreeText] = useState("");
-
-  // A new question is a new decision: keeping the previous answer selected
-  // would let a reader submit one question's answer to the next one.
-  useEffect(() => {
-    setChoice(null);
-    setFreeText("");
-  }, [question?.questionId]);
-
-  const field = question?.fieldTargets[0];
-  const canSubmit = question !== null && (choice !== null || freeText.trim().length > 0) && !busy;
-
   return (
-    <div className="rp-guide" data-testid="guide-panel">
-      <div className="rp-guide__head">
-        <div>
-          <div className="rp-kicker">智能引导</div>
-          <p className="rp-guide__lede">一次只处理一个关键决策；答案直接写进同一份研究简报。</p>
+    <div className="rp-chat__turn rp-chat__turn--assistant" data-testid="guide-msg-assistant">
+      <div className="rp-chat__who">助手</div>
+      <div className="rp-chat__body">
+        <RichMarkdown text={message.leadIn} className="rp-chat__lead" />
+        <div className="rp-chat__ask" data-testid={message.answerable ? "guide-question" : undefined}>
+          <RichMarkdown text={message.question} />
         </div>
-        <div className="rp-guide__count">
-          关键决策 <b>{decisions.length}</b> / 最多 {limit}
-        </div>
-      </div>
 
-      {staleNote !== null && (
-        <div className="rp-note rp-note--warn" data-testid="guide-stale">
-          <Info size={14} style={{ flex: "none", marginTop: 2 }} />
-          <span>{staleNote}</span>
-        </div>
-      )}
-
-      {applied !== null && (
-        <div className="rp-guide__applied" data-testid="guide-applied">
-          <Check size={14} strokeWidth={2.2} />
-          <span>
-            <b>{applied.field}</b> 已更新：{applied.label} → 已写入 Research Brief
-          </span>
-          <button type="button" className="rp-guide__link" onClick={onViewStructured}>
-            查看结构化 Brief
-          </button>
-        </div>
-      )}
-
-      {question !== null ? (
-        <div className="rp-guide__card" data-testid={`question-${question.questionId}`}>
-          <h2 className="rp-guide__question">{question.question}</h2>
-          {question.whyThisMatters.length > 0 && (
-            <p className="rp-guide__why" data-testid="guide-why">
-              {question.whyThisMatters}
-            </p>
-          )}
-          {field !== undefined && (
-            <p className="rp-guide__field">
-              这一问决定：{BRIEF_FIELD_LABELS[field]}
-              <span className="rp-guide__field-note">（也可以在结构化编辑里直接改）</span>
-            </p>
-          )}
-
-          <div className="rp-choices" role="radiogroup" aria-label={question.question} data-testid="guide-options">
-            {question.options.map((option) => (
-              <label
-                key={option.optionId}
-                className={`rp-choice${choice === option.optionId ? " rp-choice--on" : ""}`}
-                data-testid={`option-${option.optionId}`}
-              >
-                <input
-                  type="radio"
-                  name={`guide-${question.questionId}`}
-                  value={option.optionId}
-                  checked={choice === option.optionId}
-                  onChange={() => {
-                    setChoice(option.optionId);
-                  }}
-                />
-                <span className="rp-choice__body">
-                  <span className="rp-choice__label">
-                    {option.label}
-                    {option.recommended === true && <span className="rp-choice__rec">推荐</span>}
+        {message.answerable && (
+          <>
+            <div className="rp-choices" role="radiogroup" aria-label={message.question} data-testid="guide-options">
+              {message.options.map((option) => (
+                <label
+                  key={option.optionId}
+                  className={`rp-choice${choice === option.optionId ? " rp-choice--on" : ""}`}
+                  data-testid={`option-${option.optionId}`}
+                >
+                  <input
+                    type="radio"
+                    name={`guide-${message.id}`}
+                    value={option.optionId}
+                    checked={choice === option.optionId}
+                    onChange={() => {
+                      setChoice(option.optionId);
+                    }}
+                  />
+                  <span className="rp-choice__body">
+                    <span className="rp-choice__label">
+                      {option.label}
+                      {option.recommended === true && <span className="rp-choice__rec">推荐</span>}
+                    </span>
+                    {option.description !== undefined && option.description.length > 0 && (
+                      <span className="rp-choice__desc">{option.description}</span>
+                    )}
                   </span>
-                  {option.description !== undefined && option.description.length > 0 && (
-                    <span className="rp-choice__desc">{option.description}</span>
-                  )}
-                </span>
-              </label>
-            ))}
-          </div>
+                </label>
+              ))}
+            </div>
 
-          {question.allowFreeText && (
-            <div className="rp-guide__free">
-              <label className="rp-guide__free-label" htmlFor={`free-${question.questionId}`}>
-                或者自己回答
-              </label>
+            <div className="rp-chat__compose">
               <Textarea
-                id={`free-${question.questionId}`}
                 size="sm"
                 autosize
-                minRows={2}
+                minRows={1}
                 maxRows={5}
-                placeholder="用你自己的说法写下来；这会直接写入这一项。"
+                placeholder="也可以直接用自己的说法回答"
                 value={freeText}
                 onChange={(event) => {
                   setFreeText(event.currentTarget.value);
@@ -163,101 +124,262 @@ export function GuidePanel({
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && canSubmit) {
                     event.preventDefault();
-                    onAnswer({ optionIds: choice === null ? [] : [choice], freeText });
+                    onSubmit();
                   }
                 }}
               />
+              <Button
+                size="sm"
+                variant={choice === null && freeText.trim().length === 0 ? "default" : "filled"}
+                disabled={!canSubmit}
+                onClick={onSubmit}
+                rightSection={<ArrowRight size={14} />}
+                data-testid="guide-submit"
+              >
+                发送
+              </Button>
             </div>
-          )}
+            {message.fieldTargets.length > 0 && (
+              <p className="rp-chat__decides">
+                这一问决定：{fieldNames(message.fieldTargets)}
+                <span className="rp-chat__note">（一次只决定一项；也可以切到结构化编辑直接改）</span>
+              </p>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
 
-          <div className="rp-guide__actions">
-            <Button
-              disabled={!canSubmit}
-              onClick={() => {
-                onAnswer({ optionIds: choice === null ? [] : [choice], freeText });
-              }}
-              data-testid="guide-submit"
-            >
-              提交这个决定
-            </Button>
-            <span className="rp-guide__hint">一次只能提交一个决定。</span>
-          </div>
+/** One user turn, and the small line saying what it wrote. */
+function UserTurn({ message, latest }: { readonly message: GuideMessage; readonly latest: boolean }) {
+  return (
+    <>
+      <div className="rp-chat__turn rp-chat__turn--user" data-testid="guide-msg-user">
+        <div className="rp-chat__who">你</div>
+        <div className="rp-chat__body">
+          <p className="rp-chat__said">{message.answerText}</p>
         </div>
-      ) : complete ? (
-        <div className="rp-guide__done" data-testid="guide-complete">
-          <MessageSquareQuote size={18} strokeWidth={1.7} />
-          <div>
-            <h2>研究方案已经足够明确。</h2>
-            <p>{reason.length > 0 ? reason : "没有更值得追问的决策了。"}</p>
-          </div>
-          <div className="rp-guide__done-actions">
-            <Button variant="default" onClick={onViewStructured}>
-              查看研究方案
-            </Button>
-            <Button
-              disabled={busy}
-              onClick={onConfirm}
-              data-testid="guide-confirm"
-            >
-              确认并开始研究
-            </Button>
-          </div>
+      </div>
+      {message.appliedFields.length > 0 && (
+        <div className="rp-chat__receipt" data-testid="guide-receipt" data-latest={latest ? "true" : undefined}>
+          已更新「{fieldNames(message.appliedFields)}」
         </div>
-      ) : waiting ? (
-        <div className="rp-guide__waiting" data-testid="guide-waiting">
-          <Loader size="xs" color="ink" />
-          <div>
-            <b>正在准备下一个问题…</b>
+      )}
+    </>
+  );
+}
+
+export function GuidePanel({
+  brief,
+  busy,
+  waiting,
+  settledGuideRuns,
+  staleNote,
+  onAsk,
+  onAnswer,
+  onViewStructured,
+  onConfirm,
+}: {
+  readonly brief: BriefView;
+  readonly busy: boolean;
+  readonly waiting: boolean;
+  /** Question runs of this project that have already ended. */
+  readonly settledGuideRuns: number;
+  readonly staleNote: string | null;
+  readonly onAsk: () => void;
+  readonly onAnswer: (input: { readonly optionIds: readonly string[]; readonly freeText: string }) => void;
+  readonly onViewStructured: () => void;
+  readonly onConfirm: () => void;
+}) {
+  const [choice, setChoice] = useState<string | null>(null);
+  const [freeText, setFreeText] = useState("");
+  const activeId = brief.guide.active?.questionId ?? null;
+  const progress = guideProgress(brief);
+  const confirmState = guideConfirmState(brief);
+  const transcript = guideTranscript(brief);
+  const stalledKey = guideStalled(brief, busy, settledGuideRuns);
+
+  // A new question is a new decision: keeping the previous answer selected would
+  // let a reader submit one question's answer to the next one.
+  useEffect(() => {
+    setChoice(null);
+    setFreeText("");
+  }, [activeId]);
+
+  // The one recovery the panel runs on its own. It is keyed to the exact brief
+  // the situation was true for, so it happens once and then becomes the
+  // reader's decision; the callback is held in a ref so a parent that re-renders
+  // cannot keep restarting the timer.
+  const recover = useRef(onAsk);
+  recover.current = onAsk;
+  const retried = useRef<string | null>(null);
+  useEffect(() => {
+    if (stalledKey === null || retried.current === stalledKey) return;
+    const timer = window.setTimeout(() => {
+      retried.current = stalledKey;
+      recover.current();
+    }, RECOVERY_GRACE_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [stalledKey]);
+  const stalled = stalledKey !== null && retried.current === stalledKey;
+
+  const lastUserIndex = transcript.reduce((at, message, index) => (message.role === "user" ? index : at), -1);
+  // A disabled control has to say why: a run finishing the previous turn is a
+  // different reason from a draft that cannot be confirmed yet.
+  const confirmBlocked = !confirmState.enabled
+    ? confirmState.reason
+    : busy
+      ? "助手正在收尾上一步，等它停下来就可以确认。"
+      : "";
+  const canSubmit = activeId !== null && (choice !== null || freeText.trim().length > 0) && !busy;
+  const submit = (): void => {
+    onAnswer({ optionIds: choice === null ? [] : [choice], freeText });
+  };
+
+  const started = transcript.length > 0;
+
+  return (
+    <div className="rp-guide" data-testid="guide-panel">
+      <div className="rp-guide__head" data-testid="guide-header">
+        <div>
+          <div className="rp-kicker">智能引导</div>
+          <div className="rp-guide__count" data-testid="guide-progress">
+            {progress.label}
+          </div>
+          <p className="rp-guide__lede">{progress.note}</p>
+        </div>
+        <div className="rp-guide__head-actions">
+          <Button variant="subtle" size="compact-sm" onClick={onViewStructured} data-testid="guide-structured">
+            查看结构化方案
+          </Button>
+          <Tooltip label={confirmState.reason} disabled={confirmState.enabled} withArrow={false} multiline w={280}>
             <span>
-              应用会先看这份简报里还有哪一项最值得确定，再写成一个问题。这一步不检索、不改报告。
+              <Button
+                size="compact-sm"
+                variant={progress.reached ? "light" : "default"}
+                disabled={!confirmState.enabled || busy}
+                onClick={onConfirm}
+                data-testid="guide-confirm"
+              >
+                方案已经够清楚，确认并开始研究
+              </Button>
             </span>
-          </div>
+          </Tooltip>
+          {confirmBlocked.length > 0 && (
+            <span className="rp-guide__why-not" data-testid="guide-confirm-why">
+              {confirmBlocked}
+            </span>
+          )}
         </div>
-      ) : (
+      </div>
+
+      {staleNote !== null && (
+        <div className="rp-note rp-note--warn" data-testid="guide-stale">
+          <MessageSquareQuote size={14} style={{ flex: "none", marginTop: 2 }} />
+          <span>{staleNote}</span>
+        </div>
+      )}
+
+      {!started ? (
         <div className="rp-guide__idle" data-testid="guide-idle">
           <Sparkles size={18} strokeWidth={1.7} />
           <div>
             <h2>从一个决策开始。</h2>
-            <p>
-              应用会按「研究目标 → 读者 → 比较对象 → 维度 → 关注点」的顺序，挑出当前最值得确定的一项来问；
-              已经由你改过的字段不会重复问。
-            </p>
+            <p>{guideIntro(brief)}</p>
           </div>
-          <Button
-            onClick={onAsk}
-            rightSection={<ArrowRight size={14} />}
-            data-testid="guide-start"
-          >
+          <Button onClick={onAsk} rightSection={<ArrowRight size={14} />} data-testid="guide-start">
             开始引导
           </Button>
         </div>
-      )}
+      ) : (
+        <div className="rp-chat" data-testid="guide-transcript">
+          {transcript.map((message, index) =>
+            message.role === "assistant" ? (
+              message.closing ? (
+                <div className="rp-chat__turn rp-chat__turn--assistant" data-testid="guide-complete" key={message.id}>
+                  <div className="rp-chat__who">助手</div>
+                  <div className="rp-chat__body">
+                    <div className="rp-chat__ask">
+                      <RichMarkdown text={message.question} />
+                    </div>
+                    <ul className="rp-chat__summary" data-testid="guide-summary">
+                      {guideSummaryItems(brief).map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                    <div className="rp-chat__done">
+                      <Button
+                        variant="default"
+                        size="compact-sm"
+                        onClick={onViewStructured}
+                        data-testid="guide-done-structured"
+                      >
+                        查看结构化方案
+                      </Button>
+                      <Button
+                        size="sm"
+                        disabled={!confirmState.enabled || busy}
+                        onClick={onConfirm}
+                        data-testid="guide-confirm-done"
+                      >
+                        确认并开始研究
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <AssistantTurn
+                  key={message.id}
+                  message={message}
+                  choice={choice}
+                  setChoice={setChoice}
+                  freeText={freeText}
+                  setFreeText={setFreeText}
+                  canSubmit={canSubmit}
+                  onSubmit={submit}
+                />
+              )
+            ) : (
+              <UserTurn key={message.id} message={message} latest={index === lastUserIndex} />
+            ),
+          )}
 
-      {decisions.length > 0 && (
-        <details className="rp-guide__record" data-testid="guide-record">
-          <summary>已经做过的决定（{decisions.length}）</summary>
-          <ul>
-            {decisions.map((decision) => (
-              <li key={decision.questionId}>
-                <span className="rp-guide__record-q">{decision.question}</span>
-                <span className="rp-guide__record-a">
-                  {decision.optionIds.length > 0 || decision.freeText.length > 0 ? (
-                    <>
-                      {decision.optionIds.length > 0 ? `选项 ${decision.optionIds.join("、")}` : ""}
-                      {decision.optionIds.length > 0 && decision.freeText.length > 0 ? " · " : ""}
-                      {decision.freeText}
-                    </>
-                  ) : (
-                    "已应用"
-                  )}
-                  <span className="rp-guide__record-field">
-                    {decision.appliedFields.map((name) => BRIEF_FIELD_LABELS[name]).join("、")}
-                  </span>
+          {waiting && !stalled && (
+            <div className="rp-chat__turn rp-chat__turn--assistant rp-chat__turn--pending" data-testid="guide-waiting">
+              <div className="rp-chat__who">助手</div>
+              <div className="rp-chat__body">
+                <span className="rp-chat__pending">
+                  <Loader size={12} color="ink" />
+                  正在准备下一个问题…
                 </span>
-              </li>
-            ))}
-          </ul>
-        </details>
+              </div>
+            </div>
+          )}
+
+          {stalled && (
+            <div className="rp-chat__turn rp-chat__turn--assistant" data-testid="guide-stalled">
+              <div className="rp-chat__who">助手</div>
+              <div className="rp-chat__body">
+                <p className="rp-chat__said">助手没有生成下一项决定。</p>
+                <p className="rp-chat__note">
+                  刚才那一步没有留下问题，简报没有变化；可以再让它试一次，也可以直接自己改。
+                </p>
+                <div className="rp-chat__done">
+                  <Button size="compact-sm" variant="default" leftSection={<RotateCw size={13} />} onClick={onAsk} data-testid="guide-retry">
+                    继续引导
+                  </Button>
+                  <Button size="compact-sm" variant="subtle" onClick={onViewStructured} data-testid="guide-stalled-structured">
+                    自己改
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

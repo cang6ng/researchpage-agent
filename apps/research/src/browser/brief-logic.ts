@@ -3,21 +3,15 @@
  *
  * Editing a brief is mostly a correspondence problem: the server states its
  * objections as sentences, the page has to put each one next to the field it is
- * about; a list of rows has to be turned into a patch that keeps the ids the
- * server minted; and the guided question's options have to be turned back into
- * a sentence about what the reader just decided.
+ * about; and a list of rows has to be turned into a patch that keeps the ids
+ * the server minted.
  *
- * Those three are decided here rather than in the component, so that a change
- * of layout cannot change what an edit means — and so that the rules can be
+ * Both are decided here rather than in the component, so that a change of
+ * layout cannot change what an edit means — and so that the rules can be
  * checked without a browser.
  */
 
-import type {
-  BriefFieldName,
-  BriefPatch,
-  BriefView,
-  GuideQuestionView,
-} from "./api.js";
+import type { BriefFieldName, BriefPatch, BriefView } from "./api.js";
 
 /* --------------------------------------------------------------- problems -- */
 
@@ -195,30 +189,6 @@ export function addFocus(focus: readonly string[], value: string): readonly stri
 
 export function removeFocus(focus: readonly string[], value: string): readonly string[] {
   return focus.filter((item) => item !== value);
-}
-
-/* ------------------------------------------------------------------- guide -- */
-
-/**
- * What the reader just decided, in their own words.
- *
- * A choice is named by the option they picked; a free answer is named by what
- * they wrote. This is the sentence the guided panel shows back before moving
- * on — the decision is theirs, so the page repeats it rather than describing
- * the field it happened to touch.
- */
-export function decisionLabel(
-  question: Pick<GuideQuestionView, "options">,
-  optionIds: readonly string[],
-  freeText: string,
-): string {
-  const labels = optionIds
-    .map((optionId) => question.options.find((option) => option.optionId === optionId)?.label ?? "")
-    .filter((label) => label.length > 0);
-  if (labels.length > 0) return labels.join("、");
-  const trimmed = freeText.trim().replace(/\s+/g, " ");
-  if (trimmed.length === 0) return "（空回答）";
-  return trimmed.length > 26 ? `${trimmed.slice(0, 26)}…` : trimmed;
 }
 
 /* ----------------------------------------------------------------- confirm -- */

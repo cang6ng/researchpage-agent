@@ -33,7 +33,6 @@ import {
 } from "../api.js";
 import {
   confirmSummary,
-  decisionLabel,
   dimensionRowsOf,
   dimensionsCommittable,
   dimensionsPatch,
@@ -47,7 +46,7 @@ import {
   type DimensionRow,
   type SubjectRow,
 } from "../brief-logic.js";
-import { GuidePanel, type GuideApplied } from "../components/brief-guide.js";
+import { GuidePanel } from "../components/brief-guide.js";
 import {
   AddRow,
   DimensionRowView,
@@ -129,7 +128,6 @@ export function BriefView() {
   const [regenerating, setRegenerating] = useState(false);
   const [revisedTopic, setRevisedTopic] = useState("");
   const [waiting, setWaiting] = useState(false);
-  const [applied, setApplied] = useState<GuideApplied | null>(null);
   const [guideStale, setGuideStale] = useState<string | null>(null);
   const timers = useRef<number[]>([]);
 
@@ -179,16 +177,6 @@ export function BriefView() {
   useEffect(() => {
     if (activeQuestionId !== null || guideComplete) setWaiting(false);
   }, [activeQuestionId, guideComplete]);
-
-  useEffect(() => {
-    if (applied === null) return;
-    const timer = window.setTimeout(() => {
-      setApplied(null);
-    }, 6000);
-    return () => {
-      window.clearTimeout(timer);
-    };
-  }, [applied]);
 
   const problems = useMemo(() => problemsByField(brief?.validation.problems ?? []), [brief?.validation.problems]);
   const problemsFor = useCallback(
@@ -327,10 +315,11 @@ export function BriefView() {
     setGuideStale(null);
     try {
       const result = await api.guideNext(bundle.task.id);
-      if (result.complete || result.question !== undefined) {
-        await refresh();
-        return;
-      }
+      // A question run is started asynchronously; re-reading now is what shows
+      // the conversation its own next turn as soon as it exists, and it is also
+      // what stops the panel's own recovery from firing while a run is alive.
+      await refresh();
+      if (result.complete || result.question !== undefined) return;
       setWaiting(true);
     } catch (error) {
       say("error", error instanceof Error ? error.message : "没有拿到引导问题");
@@ -354,12 +343,8 @@ export function BriefView() {
         ...(optionIds.length === 0 ? {} : { optionIds }),
         ...(freeText.trim().length === 0 ? {} : { freeText }),
       });
-      setApplied({
-        label: decisionLabel(question, optionIds, freeText),
-        field: BRIEF_FIELD_LABELS[question.fieldTargets[0] ?? "purpose"],
-      });
-      if (!result.complete) setWaiting(true);
       await refresh();
+      if (!result.complete) setWaiting(true);
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {
         setGuideStale(
@@ -472,15 +457,13 @@ export function BriefView() {
 
           {mode === "guided" ? (
             <GuidePanel
-              question={guide?.active ?? null}
-              complete={guideComplete}
-              reason={guide?.reason ?? ""}
-              decisions={guide?.decisions ?? []}
-              limit={guide?.limit ?? 5}
-              waiting={waiting}
-              applied={applied}
-              staleNote={guideStale}
+              brief={brief}
               busy={busy}
+              waiting={waiting}
+              settledGuideRuns={
+                bundle.runs.filter((run) => run.stage === "guide" && run.status !== "running").length
+              }
+              staleNote={guideStale}
               onAsk={() => {
                 void startGuide();
               }}

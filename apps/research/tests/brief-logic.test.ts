@@ -15,7 +15,6 @@ import type { BriefView } from "../src/browser/api.js";
 import {
   addFocus,
   confirmSummary,
-  decisionLabel,
   dimensionsCommittable,
   dimensionsPatch,
   firstProblemField,
@@ -174,31 +173,6 @@ describe("focus is a set of chips", () => {
   it("removes only the one asked for", () => {
     expect(removeFocus(["a", "b"], "a")).toEqual(["b"]);
     expect(removeFocus(["a", "b"], "c")).toEqual(["a", "b"]);
-  });
-});
-
-describe("a guided decision, said back", () => {
-  const question = {
-    options: [
-      { optionId: "opt_1", label: "选型建议为主" },
-      { optionId: "opt_2", label: "证据评估为主" },
-    ],
-  };
-
-  it("names the option the reader picked", () => {
-    expect(decisionLabel(question, ["opt_2"], "")).toBe("证据评估为主");
-  });
-
-  it("names a free answer by what was written", () => {
-    expect(decisionLabel(question, [], "  给组会用，重点讲机制  ")).toBe("给组会用，重点讲机制");
-    expect(decisionLabel(question, [], "  ")).toBe("（空回答）");
-  });
-
-  it("truncates a long free answer rather than repeating it whole", () => {
-    const long = "一句话".repeat(30);
-    const label = decisionLabel(question, [], long);
-    expect(label.length).toBeLessThanOrEqual(27);
-    expect(label.endsWith("…")).toBe(true);
   });
 });
 
