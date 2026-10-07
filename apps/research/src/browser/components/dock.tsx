@@ -16,6 +16,7 @@
 import { ActionIcon, Button, Menu, Select, Textarea, Tooltip } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import {
+  ArrowLeft,
   BookOpen,
   Check,
   ExternalLink,
@@ -744,7 +745,22 @@ const WIDTHS: Readonly<Record<"narrow" | "wide", string>> = Object.freeze({
   wide: "clamp(420px, 32vw, 520px)",
 });
 
-export function ContextDock({ overlay }: { readonly overlay: boolean }) {
+export function ContextDock({
+  overlay,
+  workspace = false,
+  onBackToConversation,
+}: {
+  readonly overlay: boolean;
+  /**
+   * Whether this column is the co-edit workspace rather than a glance panel.
+   *
+   * It changes two things and nothing else: the column fills the half of the
+   * screen the studio gives it, and a panel shown inside the workspace offers
+   * the way back to the conversation it interrupted.
+   */
+  readonly workspace?: boolean;
+  readonly onBackToConversation?: () => void;
+}) {
   const { bundle, document, dock, openDock, setSelection } = useApp();
   const [tab, setTab] = useState<DockTab>("primary");
 
@@ -853,6 +869,10 @@ export function ContextDock({ overlay }: { readonly overlay: boolean }) {
   // A panel that is the assistant has no "primary subject" to switch back to:
   // the tab that would say "助手" beside the assistant tab says nothing.
   const hasPrimary = dock.kind !== "assistant";
+  // The assistant workspace draws its own one-line bar (who it is, what it is
+  // aimed at). A dock header and a tab row above it would say "助手" three
+  // times before the reader reaches the conversation.
+  const bare = workspace && dock.kind === "assistant";
 
   return (
     <aside
@@ -860,9 +880,22 @@ export function ContextDock({ overlay }: { readonly overlay: boolean }) {
       aria-label="上下文面板"
       data-testid="context-dock"
       data-width={TAB_WIDTH[activeTab]}
+      data-workspace={workspace ? "true" : "false"}
     >
+      {!bare && (
       <div className="rp-dock__head">
         <div style={{ minWidth: 0 }}>
+          {workspace && dock.kind !== "assistant" && onBackToConversation !== undefined && (
+            <button
+              type="button"
+              className="rp-dock__back"
+              onClick={onBackToConversation}
+              data-testid="back-to-conversation"
+            >
+              <ArrowLeft size={12} />
+              返回对话
+            </button>
+          )}
           <div className="rp-dock__kicker">{header.kicker}</div>
           <div className="rp-dock__title">{header.title}</div>
           {header.sub.length > 0 && <div className="rp-dock__sub">{header.sub}</div>}
@@ -880,7 +913,9 @@ export function ContextDock({ overlay }: { readonly overlay: boolean }) {
           </ActionIcon>
         </Tooltip>
       </div>
+      )}
 
+      {!bare && (
       <div className="rp-dock__tabs" data-testid="dock-tabs">
         {hasPrimary && (
           <button
@@ -930,6 +965,7 @@ export function ContextDock({ overlay }: { readonly overlay: boolean }) {
           </button>
         )}
       </div>
+      )}
 
       {activeTab === "assistant" ? (
         <AssistantPanel bundle={bundle} />
@@ -1017,15 +1053,32 @@ export function ContextDock({ overlay }: { readonly overlay: boolean }) {
  * reader opened on purpose and can close again. The threshold is measured
  * rather than named: the panel needs its own width plus a document's worth of
  * space, so it pushes whenever that much room actually exists.
+ *
+ * The co-edit workspace is the exception, and it is an exception on purpose:
+ * beside a report it is not a panel asking for room but half of a split screen,
+ * and it stays split at 1366 rather than covering the document it is working
+ * on. The split itself is the view's business — this only stops the panel from
+ * deciding to float.
  */
-export function DockSlot() {
+export function DockSlot({
+  variant = "measure",
+  onBackToConversation,
+}: {
+  readonly variant?: "measure" | "workspace";
+  readonly onBackToConversation?: () => void;
+}) {
   const { dock } = useApp();
-  // The panel pushes when there is room for it *and* a document: a wide
-  // assistant workspace plus a readable page. 1366 is the narrowest window this
-  // product supports, and 376 + 900 fits inside it, so the threshold is that
-  // width rather than a name for a device.
+  // 1366 is the narrowest window this product supports, and 376 + 900 fits
+  // inside it, so the threshold is that width rather than a name for a device.
   const roomy = useMediaQuery("(min-width: 1350px)");
+  // A half of a split screen is a different question from "is there room for a
+  // panel": below 1100 the two halves stop being readable, and the workspace
+  // goes back to covering the document it is working on.
+  const halves = useMediaQuery("(min-width: 1100px)");
   if (dock === null) return null;
+  if (variant === "workspace") {
+    return <ContextDock overlay={halves !== true} workspace onBackToConversation={onBackToConversation} />;
+  }
   return <ContextDock overlay={roomy !== true} />;
 }
 

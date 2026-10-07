@@ -680,7 +680,9 @@ body {
   gap: 16px;
   padding: 12px 0;
   margin: -4px 0 18px;
-  background: linear-gradient(180deg, var(--rp-bg) 74%, rgba(245, 246, 244, 0));
+  /* Solid where the page scrolls under it: a translucent band over a control
+     does not hide it, it ghosts it, and a ghosted button reads as a mistake. */
+  background: linear-gradient(180deg, var(--rp-bg) 93%, rgba(245, 246, 244, 0));
 }
 
 .rp-brief__meta {
@@ -1202,113 +1204,223 @@ body {
   padding: 0;
 }
 
-/* ------------------------------------------------------------ guided mode -- */
+/* ------------------------------------------------------- guided planning -- */
 
+/* A planning conversation, not a chat app.
+   The assistant speaks on the left without a bubble, the person answers to the
+   right of it on a light surface, and the choices stay inside the message that
+   asked for them. Nothing here is a rounded card wall: a turn is a label, its
+   text, and — where the application asked something — the answers to it. */
 .rp-guide {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 20px;
   padding-bottom: 120px;
 }
 
 .rp-guide__head {
   display: flex;
   align-items: flex-start;
-  gap: 20px;
+  gap: 24px;
+  flex-wrap: wrap;
 }
 
 .rp-guide__head .rp-kicker {
   margin-bottom: 6px;
 }
 
+.rp-guide__count {
+  font-size: 15px;
+  color: var(--rp-ink);
+  font-variant-numeric: tabular-nums;
+  font-weight: 550;
+  margin-bottom: 5px;
+}
+
 .rp-guide__lede {
   margin: 0;
-  font-size: 13.5px;
+  font-size: 13px;
   color: var(--rp-ink-2);
   line-height: 1.6;
   max-width: 62ch;
 }
 
-.rp-guide__count {
+.rp-guide__head-actions {
   margin-left: auto;
-  font-size: 12.5px;
-  color: var(--rp-ink-3);
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-
-.rp-guide__count b {
-  color: var(--rp-ink);
-  font-size: 15px;
-}
-
-.rp-guide__applied {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  padding: 11px 14px;
-  border-radius: var(--rp-r-surface);
-  background: var(--rp-verified-bg);
-  color: var(--rp-verified);
-  font-size: 13px;
-  animation: rp-card-in var(--rp-t-med) var(--rp-ease) 1;
+  justify-content: flex-end;
+  max-width: 460px;
 }
 
-.rp-guide__applied b {
-  font-weight: 600;
+.rp-guide__why-not {
+  width: 100%;
+  text-align: right;
+  font-size: 11.5px;
+  color: var(--rp-limited);
+  line-height: 1.5;
 }
 
-.rp-guide__link {
-  appearance: none;
-  border: 0;
-  background: none;
-  font: inherit;
-  font-size: 12.5px;
-  color: var(--rp-brand);
-  text-decoration: underline;
-  cursor: pointer;
-  margin-left: auto;
-  padding: 0;
+.rp-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  max-width: 880px;
 }
 
-.rp-guide__card {
-  background: var(--rp-surface);
-  border: 1px solid var(--rp-hairline);
-  border-radius: var(--rp-r-tile);
-  padding: 26px 28px 22px;
-  box-shadow: var(--rp-sh-surface);
-  max-width: 760px;
+.rp-chat__exchange {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
-.rp-guide__question {
-  font-size: 21px;
-  line-height: 1.4;
-  font-weight: 600;
-  letter-spacing: -0.008em;
-  margin: 0 0 8px;
-  color: var(--rp-ink);
-  max-width: 34ch;
+.rp-chat__turn {
+  min-width: 0;
 }
 
-.rp-guide__why {
+.rp-chat__turn--assistant {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 12px;
+}
+
+.rp-chat__turn--user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+}
+
+.rp-chat__who {
+  font-size: 11px;
+  letter-spacing: 0.09em;
+  color: var(--rp-ink-3);
+  padding-top: 3px;
+}
+
+.rp-chat__turn--user .rp-chat__who {
+  padding-top: 0;
+}
+
+.rp-chat__body {
+  min-width: 0;
+}
+
+.rp-chat__turn--user .rp-chat__body {
+  max-width: 75%;
+  background: rgba(36, 75, 96, 0.055);
+  border-radius: 10px;
+  padding: 9px 13px;
+}
+
+.rp-chat__lead .rp-md {
   font-size: 13.5px;
   color: var(--rp-ink-2);
-  margin: 0 0 4px;
+}
+
+.rp-chat__ask .rp-md {
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.45;
+  letter-spacing: -0.006em;
+}
+
+.rp-chat__ask .rp-md p {
+  margin-bottom: 8px;
+}
+
+.rp-chat__said {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.68;
+  color: var(--rp-ink);
+  overflow-wrap: anywhere;
+}
+
+.rp-chat__turn--user .rp-chat__said {
+  font-size: 13.5px;
+}
+
+.rp-chat__note {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  color: var(--rp-ink-3);
   line-height: 1.6;
-  max-width: 66ch;
 }
 
-.rp-guide__field {
-  font-size: 12px;
+.rp-chat__receipt {
+  text-align: right;
+  font-size: 11.5px;
+  color: var(--rp-verified);
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-chat__receipt::before {
+  content: "✓ ";
+}
+
+.rp-chat__decides {
+  margin: 12px 0 0;
+  font-size: 11.5px;
   color: var(--rp-ink-3);
-  margin: 0 0 18px;
 }
 
-.rp-guide__field-note {
+.rp-chat__compose {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.rp-chat__compose .mantine-Textarea-root {
+  flex: 1;
+  min-width: 0;
+}
+
+.rp-chat__summary {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--rp-ink-2);
+  line-height: 1.7;
+}
+
+.rp-chat__done {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+.rp-chat__turn--pending .rp-chat__who {
   color: var(--rp-ink-3);
 }
 
+.rp-chat__pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--rp-ink-3);
+}
+
+.rp-chat__embedded {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--rp-hairline);
+  border-left: 2px solid var(--rp-brand);
+  border-radius: var(--rp-r-surface);
+  background: var(--rp-surface);
+}
+
+.rp-chat .rp-choices {
+  margin-top: 14px;
+}
+
+/* The choices belong to the message that asked for them, and they are still a
+   real radio group: keyboard-selectable, one answer, no custom widget. */
 .rp-choices {
   display: flex;
   flex-direction: column;
@@ -1319,7 +1431,7 @@ body {
   display: flex;
   align-items: flex-start;
   gap: 12px;
-  padding: 13px 15px;
+  padding: 12px 14px;
   border: 1px solid var(--rp-hairline);
   border-radius: var(--rp-r-surface);
   cursor: pointer;
@@ -1350,7 +1462,7 @@ body {
 }
 
 .rp-choice__label {
-  font-size: 14.5px;
+  font-size: 14px;
   font-weight: 500;
   color: var(--rp-ink);
   display: flex;
@@ -1375,38 +1487,11 @@ body {
   line-height: 1.55;
 }
 
-.rp-guide__free {
-  margin-top: 20px;
-  padding-top: 16px;
-  border-top: 1px solid var(--rp-hairline);
-}
-
-.rp-guide__free-label {
-  display: block;
-  font-size: 12px;
-  color: var(--rp-ink-3);
-  margin-bottom: 7px;
-}
-
-.rp-guide__actions {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin-top: 18px;
-}
-
-.rp-guide__hint {
-  font-size: 12px;
-  color: var(--rp-ink-3);
-}
-
-.rp-guide__done,
-.rp-guide__idle,
-.rp-guide__waiting {
+.rp-guide__idle {
   display: flex;
   align-items: flex-start;
   gap: 16px;
-  padding: 26px 28px;
+  padding: 24px 26px;
   border-radius: var(--rp-r-tile);
   background: var(--rp-surface);
   border: 1px solid var(--rp-hairline);
@@ -1414,7 +1499,6 @@ body {
   max-width: 760px;
 }
 
-.rp-guide__done h2,
 .rp-guide__idle h2 {
   font-size: 17px;
   margin: 0 0 6px;
@@ -1422,7 +1506,6 @@ body {
   font-weight: 600;
 }
 
-.rp-guide__done p,
 .rp-guide__idle p {
   margin: 0;
   font-size: 13.5px;
@@ -1430,86 +1513,12 @@ body {
   max-width: 62ch;
 }
 
-.rp-guide__done-actions {
-  margin-left: auto;
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-
 .rp-guide__idle > button {
   margin-left: auto;
 }
 
-.rp-guide__waiting b {
-  display: block;
-  font-size: 13.5px;
-  color: var(--rp-ink);
-  margin-bottom: 4px;
-}
-
-.rp-guide__waiting span {
-  font-size: 12.5px;
-  line-height: 1.6;
-  color: var(--rp-ink-3);
-  display: block;
-  max-width: 62ch;
-}
-
-.rp-guide__record {
-  font-size: 12.5px;
-  color: var(--rp-ink-2);
-  max-width: 860px;
-}
-
-.rp-guide__record summary {
-  cursor: pointer;
-  color: var(--rp-ink-3);
-  font-size: 12px;
-}
-
-.rp-guide__record ul {
-  list-style: none;
-  margin: 10px 0 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 9px;
-}
-
-.rp-guide__record li {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 14px;
-  padding-top: 9px;
-  border-top: 1px solid var(--rp-hairline);
-}
-
-.rp-guide__record-q {
-  color: var(--rp-ink);
-  line-height: 1.55;
-}
-
-.rp-guide__record-a {
-  color: var(--rp-ink-2);
-  line-height: 1.55;
-}
-
-.rp-guide__record-field {
-  display: block;
-  font-size: 11px;
-  color: var(--rp-ink-3);
-  margin-top: 3px;
-}
-
-@media (max-width: 1100px) {
-  .rp-guide__record li {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 4px;
-  }
-}
-
 /* --------------------------------------------------------------- research -- */
+
 
 .rp-research {
   padding: 28px 32px 80px;
@@ -1804,6 +1813,159 @@ body {
   flex-direction: column;
 }
 
+/* ----------------------------------------------------------------- co-edit -- */
+
+/* Co-edit is a split screen, not a document with a panel beside it: two
+   first-class workspaces, an even default, and a hairline the reader may move.
+   The share is published as one variable so the divider, the two columns and
+   the document's own padding all read the same number. */
+.rp-studio[data-layout="coedit"] {
+  display: grid;
+  grid-template-columns:
+    minmax(0, var(--rp-coedit-split, 50%))
+    1px
+    minmax(0, calc(100% - var(--rp-coedit-split, 50%) - 1px));
+  align-items: stretch;
+  width: 100%;
+  /* Wide windows spend the extra room on the work, up to a point: beyond this
+     the report would be a wall of text and the assistant a runway. */
+  max-width: 1760px;
+  margin: 0 auto;
+}
+
+.rp-studio[data-layout="coedit"] .rp-studio__main {
+  min-width: 0;
+}
+
+.rp-studio[data-layout="coedit"] .rp-dock {
+  width: auto;
+  min-width: 0;
+}
+
+.rp-studio__divider {
+  /* It runs beside what is on screen, not beside the whole document: the
+     columns scroll independently, and a hairline the height of the report
+     would put the thing you grab wherever you are not. */
+  position: sticky;
+  top: calc(var(--rp-bar-h) + var(--rp-nav-h));
+  align-self: start;
+  height: calc(100vh - var(--rp-bar-h) - var(--rp-nav-h));
+  /* Above the column it divides: half of the grab area reaches over the
+     panel's edge, and an edge that eats the drag is an edge that cannot be
+     grabbed. */
+  z-index: 3;
+  background: var(--rp-hairline);
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.rp-studio__divider::after {
+  content: "";
+  position: absolute;
+  inset: 0 -5px;
+}
+
+.rp-studio__divider:focus-visible {
+  outline: none;
+  background: var(--rp-brand);
+}
+
+.rp-studio__grip {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 3px;
+  height: 34px;
+  border-radius: 2px;
+  background: var(--rp-ink-3);
+  transform: translate(-50%, -50%);
+  opacity: 0;
+  transition: opacity var(--rp-t-fast) var(--rp-ease);
+}
+
+.rp-studio__divider:hover .rp-studio__grip,
+.rp-studio__divider:focus-visible .rp-studio__grip {
+  opacity: 0.65;
+}
+
+/* A comparison is the one block that is deliberately wider than the text
+   column. In half a screen there is nothing to bleed into, so it keeps its own
+   width and scrolls inside itself instead of pushing the column. */
+.rp-studio[data-layout="coedit"] .rp-doc__compare {
+  margin-inline: 0;
+}
+
+/* Half a screen is not a narrow version of a full one: the page gives up its
+   generous margins before the text does, and the reading column keeps a
+   readable measure instead of keeping the paper's padding. */
+.rp-studio[data-layout="coedit"] .rp-canvas-scroll {
+  padding: 26px 24px 100px;
+}
+
+.rp-studio[data-layout="coedit"] .rp-canvas {
+  max-width: 940px;
+}
+
+.rp-studio[data-layout="coedit"] .rp-canvas__sheet {
+  padding: 42px 34px 50px;
+}
+
+.rp-studio[data-layout="coedit"] .rp-toolbar {
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
+/* Two half-width columns have to keep the toolbar in one row, at every width:
+   the column is half a screen even on a large monitor. What drops out first is
+   what only repeats something said elsewhere — the theme, the review chip the
+   document already carries, the long form of a status — and the icon keeps the
+   label's place on a selected object's actions, which keep their tooltips. */
+.rp-studio[data-layout="coedit"] .rp-toolbar {
+  gap: 5px;
+  padding-left: 12px;
+  padding-right: 12px;
+}
+
+.rp-studio[data-layout="coedit"] .rp-toolbar__group {
+  padding-right: 6px;
+  margin-right: 2px;
+}
+
+.rp-studio[data-layout="coedit"] .rp-toolbar__optional,
+.rp-studio[data-layout="coedit"] .rp-toolbar__long {
+  display: none;
+}
+
+.rp-studio[data-layout="coedit"] .rp-toolbar__alert {
+  max-width: 168px;
+  overflow: hidden;
+}
+
+.rp-studio[data-layout="coedit"] .rp-toolbar__alert > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rp-studio[data-layout="coedit"] .rp-toolbar__group--selection .rp-rail__label,
+.rp-studio[data-layout="coedit"] .rp-toolbar__group--selection .mantine-Button-label {
+  display: none;
+}
+
+.rp-studio[data-layout="coedit"] .rp-toolbar__group--selection .mantine-Button-root {
+  padding-left: 6px;
+  padding-right: 6px;
+}
+
+/* Below this the two halves stop being readable and the workspace covers the
+   document instead of splitting it — the one case where co-edit floats. */
+@media (max-width: 1099px) {
+  .rp-studio[data-layout="inspect"] .rp-dock,
+  .rp-studio[data-layout="coedit"] .rp-dock {
+    border-radius: 0;
+  }
+}
+
 .rp-toolbar {
   position: sticky;
   top: calc(var(--rp-bar-h) + var(--rp-nav-h));
@@ -2024,6 +2186,27 @@ body {
   margin-bottom: 4px;
 }
 
+/* Inside the co-edit workspace a panel is a detour: opening a sentence's
+   evidence must not be a place the reader can get lost in. */
+.rp-dock__back {
+  appearance: none;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--rp-brand);
+  cursor: pointer;
+  padding: 0;
+  margin-bottom: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.rp-dock__back:hover {
+  text-decoration: underline;
+}
+
 .rp-dock__title {
   font-size: 14.5px;
   font-weight: 550;
@@ -2175,6 +2358,15 @@ body {
   flex: 1;
 }
 
+/* The column's own name, so the workspace says whose it is even before the
+   target line is read. */
+.rp-assistant__label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--rp-ink);
+  flex: none;
+}
+
 .rp-assistant__bar {
   display: flex;
   align-items: center;
@@ -2249,15 +2441,33 @@ body {
 
 .rp-assistant__composer {
   border-top: 1px solid var(--rp-hairline);
-  padding: 12px 14px 14px;
-  background: rgba(255, 255, 255, 0.6);
+  padding: 14px 18px 16px;
+  background: rgba(255, 255, 255, 0.62);
 }
 
+/* The box a reader writes in is the workspace's main input, not a search field:
+   three lines by default and it grows. */
+.rp-assistant__box textarea {
+  min-height: 76px;
+  font-size: 13.5px;
+  line-height: 1.62;
+}
+
+.rp-assistant__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: nowrap;
+}
+
+/* The mode is part of the composer's toolbar and is styled like it: a small
+   segmented control, not the loudest thing in the column. */
 .rp-assistant__modes {
   display: inline-flex;
   gap: 2px;
   padding: 2px;
-  margin-bottom: 8px;
+  flex: none;
   border-radius: var(--rp-r-control);
   background: rgba(31, 44, 51, 0.05);
 }
@@ -2267,9 +2477,9 @@ body {
   border: 0;
   background: none;
   font: inherit;
-  font-size: 12.5px;
-  color: var(--rp-ink-2);
-  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--rp-ink-3);
+  padding: 3px 9px;
   border-radius: 6px;
   cursor: pointer;
   transition: background var(--rp-t-fast) var(--rp-ease), color var(--rp-t-fast) var(--rp-ease);
@@ -2282,15 +2492,30 @@ body {
   box-shadow: var(--rp-sh-surface);
 }
 
-.rp-assistant__submit {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 10px;
-  flex-wrap: wrap;
+.rp-assistant__toolbar > .mantine-Button-root,
+.rp-assistant__toolbar > span:last-child {
+  margin-left: auto;
+  flex: none;
 }
 
 .rp-assistant__help {
+  font-size: 11.5px;
+  color: var(--rp-ink-3);
+  flex: 1;
+  min-width: 0;
+  line-height: 1.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rp-assistant__foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.rp-assistant__note {
   font-size: 11.5px;
   color: var(--rp-ink-3);
   flex: 1;

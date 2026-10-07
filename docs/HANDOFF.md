@@ -8,7 +8,9 @@
 - Upstream sealed baseline：`c5f97ba63f719ec81030746f3eb67fe7c538e01f`；见 [UPSTREAM_BASELINE.md](./UPSTREAM_BASELINE.md)。未修改 upstream，未引入 Phase 5。
 - 实施依据：[COMPETITION_SPEC.md](./COMPETITION_SPEC.md)、`ResearchPage_Product_Redesign.md`（§6/§8/§17/§23）、`What Makes a Great AI-Native Research Artifact?`（§6/§11–13/§17）。
 
-## Current Status（2026-10-06）
+## Current Status（2026-10-07）
+
+- **Step 3.5C-B（Conversational Planning & 50/50 Co-edit UI）已完成**：引导式规划从「一次一问的表单」变成一段真正的规划对话（问题、过渡语、用户的回答与回执按发生顺序重建，刷新后原样恢复，进度按 `readiness / minDecisions / maxDecisions` 说真话，用户随时可以自己确认，助手早退被拒后不会把界面卡在「正在准备」）；报告工作台从「文档 + 右侧插件」变成阅读与 50/50 协作两种形态（打开助手即左右各半、可拖动分隔条 40/60–60/60、1366 不再退回浮层），右栏是一个一级工作区：对话 + 内嵌动作、补查与修改建议，证据在同一栏打开并可一键回到对话。
 
 - **Step 3.5C-A（Guided Conversation & User Research Budget）已完成**：引导式规划有了深度契约（至少 5 个、最多 7 个关键决策，Agent 不能提前收尾，用户随时可以确认开始），引导问题带上 leadIn / 答案带上 answerText（下一轮做对话式界面所需的数据），用户明确发起的补查拿到自己的一次性 Action Budget，不再被项目的自动研究预算与 deadline 永久挡住。
 
@@ -43,6 +45,59 @@
 - 校验失败与警告分开：`validation.checks` 记录每条 Q 规则的 result（pass/fail/warning/not_applicable），`problems` 阻止发布，`warnings` 随报告保存并显示在工作台。
 - 旧报告与新规则解耦：没有 `blueprintId` 的任务沿用 v1 的「必需章节 + 引用真实」规则，老数据不会因为新义务而无法编辑或导出。
 - 页数不是硬约束：card 的 lengthTarget 与各节 budget 作为写作预算写进阶段指令（实测把同一主题从 15 页收到 11 页），但 validator 不会因为页数拒绝报告。
+## Step 3.5C-B 新增（本次工作产物）
+
+本轮只做两件产品交互修正：引导式规划变成对话，报告助手变成与文档地位相当的 50/50 协作工作区。没有改后端语义（引导深度契约、readiness、Action Budget、Action Grant、Proposal、Revision、Claim Contract、Blueprint、Evidence 边界都没动），没有重做首页 / 矩阵 / 来源 / 设置 / PDF renderer，没有引入 Mermaid、Upload、MCP、第二 Blueprint 或 Tauri。
+
+### 引导式规划：从表单变成对话（`guide-logic.ts`、`components/brief-guide.tsx`）
+
+- **对话是推导出来的，不是前端记的**：`guideTranscript(brief)` 把服务端已有的 `guide.decisions`（问题 / leadIn / 选项 label / answerText）与当前 `active` 问题拼成一条条消息——每次决策留下「助手一问 + 用户一答」，正在问的那条可以回答，收束时是助手最后一段总结。刷新页面重建的是同一段对话，前端没有第二份历史。
+- **一轮一个决策的语义没变**：选项与自由回答仍然走 Step 3.5A 的同一个 Guide API、写同一份草稿；UI 像聊天并不允许一次改多个字段（§8）。
+- **视觉语法**（`public/styles.css` 的 `.rp-chat`）：助手左对齐、无气泡、小标签「助手」，leadIn 与问题都走 RichMarkdown（禁止 raw HTML，sanitize 后仍无 `rehype-raw`）；用户稍微右对齐、浅底、最大宽度 75%、小标签「你」；选项嵌在提问那条消息里；决定结果是一行轻量回执（`✓ 已更新「研究目标」`），不是第三张卡片。
+- **进度说两条边界**：`关键决策 3 / 至少 5` → 达到下限后改成 `关键决策 5` 并写明「够清楚就可以开始研究，也可以继续完善」，到上限则说明「已经问到上限」。数值来自 DTO 的 `minDecisions / maxDecisions / readiness`，前端不复制服务端常量。
+- **用户自己的出口**：`[方案已经够清楚，确认并开始研究]` 常驻在头部（二级动作，不与问题争主视觉），`canConfirm` 为假时禁用并直接写出原因（来自 `brief.validation.problems`）。
+- **早退被拒的兜底**（§11）：`guideStalled(brief, busy)` 只在那一种状态给出 key——`complete === false && active === null && !busy && 已经有决策`——并且 key 里带 `taskId/version/readiness`，所以「同一个状态只自动重试一次」是逻辑上可验证的，不是靠计时器侥幸：面板等 6 秒再确认一次，仍然没有问题时改成「助手没有生成下一项决定。[继续引导]」交给用户。正常状态（还没开始、问题在跑、问题待答、已收束）都不会触发它。
+- **收束不空页**：服务端 complete 时，最后一条助手消息说明方案已经完整并列出摘要（对象数 / 维度数 / 篇幅 / 读者），附「确认并开始研究 / 查看结构化方案」。
+- 切回结构化再切回来，对话历史与服务端最新草稿都在；结构化改过的字段不会在引导里被重复提问（3.5C-A 的 readiness 口径仍然生效）。
+
+### Studio：阅读 / 50-50 协作（`views/studio.tsx`、`components/dock.tsx`）
+
+- **三种形态**（`studioLayout()`）：`reading`（没有面板，文档居中）、`inspect`（速览：证据 / 来源 / 论断 / 章节 / 修改建议，仍是 376px 的 Dock，文档仍是主体）、`coedit`（助手工作区打开，左右各半）。打开助手即进入 coedit；在协作模式里看证据、看提案仍然是 coedit（右栏切换主题，不退回速览宽度）。
+- **默认 50/50 与分隔条**：`grid-template-columns` 用 `--rp-coedit-split` 发布比例（默认 50%，`clamp` 在 40–60）；分隔条是 1px 视觉线 + 约 11px 抓取区、`z-index` 高于面板（否则半个抓取区会被右栏吃掉）、`sticky` 到视口高度（否则一条跟文档一样高的线让「抓得到的地方」落在屏幕外）。支持指针拖动、左右方向键（每次 2 点）与双击复位。实测 1440：拖动 −140px → 42%，继续拖 → 停在 40%。
+- **工作区上限 1760px**：1920 下两侧仍各 879px，助手不再是 520px 封顶的侧栏（§33）。
+- **文档在半屏里**：`rp-canvas-scroll` 让出页面边距（26/24），sheet 内距收到 34px，正文实测 604px（1440）/ 640px（1366，正文一栏 683）；`.rp-doc__compare` 的负边距（那是为全宽页设计的出血）在半屏里取消，比较矩阵改为在自身列内横向滚动——页面级横向滚动与画布级溢出都实测为 0。整个工作区不再有横向滚动。
+- **工具栏密度**：协作模式下隐藏只在别处重复的信息（主题菜单、工具栏里的「待复核」chip、状态的英文长文），研究对象动作栏收成图标（保留 Tooltip），研究边界 chip 限宽省略；1366 / 1440 / 1920 下工具栏都是一行且没有被裁切（`scrollWidth === clientWidth`）。
+- **关闭即回到阅读**：右栏完全消失、文档重新居中、不留半屏空列；再次打开恢复对话、目标、composer 草稿与指令方式。
+
+### 助手工作区：对话 + 内嵌动作（`components/assistant.tsx`、`conversation-logic.ts`）
+
+- **对话是项目自己的记录**：`conversationOf(bundle, answers)` 取的是"人发起过的 run"——含有 `userText` 的 ask/gap/edit——按时间排序（最近 10 条）。Agent 自己的阶段（初次研究、自动补查、写作）不在对话里，因为它们不是用户说过的话。
+- **用户原话是持久化的**（一处 presentation 级别的补充，见下）：run 记录里新增可选 `userText`，由 runner 在签发 Ask / 用户补查 / Edit 时写入；它是「用户说过什么」的唯一来源，不做解析、不改任何语义。刷新与重启后对话仍然可读。
+- **助手说的话分两类**：Ask 的回答是模型自己的文字（RichMarkdown）；补查与修改的说明是产品写的，因为这两类 run 的叙述是模型的思考过程（gate 断言里检查它不会把工具名或原始 JSON 露出来）。
+- **动作内嵌**：补查完成 → 一句结论 + 本轮统计（检索 / 读取 / 覆盖评估）+「正文没有改变」+ `[检查新证据] [基于这些材料修改本节]`；额度用尽时结论那句改成「这次补查已经用完了本轮的检索额度。」，下一条指令照常获得新额度（§26）。Edit → 提案以窄边块内嵌在对话里（现在 / 修改后 / 论断 / 证据变化 / 接受或放弃），接受后这段记录留在原地，而不是把对话换成一页。
+- **步骤列表**（折叠）只说中文动作名（`TOOL_LABELS`），失败时标「被拒绝」，不再打印工具名与结果 payload（§22）。**被拒绝的调用不算工作量**：宿主信封对服务端拒绝的调用仍然报 `ok: true`（工具跑完了，是服务端说了不），计数与「额度用尽」的判断因此必须看结果体里的 `{"ok":false}`——否则一次动作会说自己检索了 3 次，而真实情况是检索 2 次、被拒 1 次。
+- **目标行**（§30）：右栏顶部一行 = 「助手」+ 当前对象（项目 / 章节 / 论断 / 比较项 / 比较表）+ 清空回项目；编辑模式在这一行右侧是章节下拉框。
+- **composer**：输入框默认约 76px 高（≥72）、可长到 9 行；指令方式（自动 / 提问 / 补查 / 修改）降级进 composer 的工具条，提交按钮在同一条上；placeholder 按模式变化；每次动作的安全说明只有一句（补查：补充材料，不自动修改报告；Edit：生成修改建议，接受前正文不变；Ask：只回答问题，不写入项目数据）。
+- **额度文案**：补查模式下 composer 显示的是**这次动作自己的额度**（来自 runtime 的 `actionAllowance`），动作在跑时换成 `bundle.actionBudget` 的实时剩余；不再出现任何「项目还剩 n 次补查」的项目口径文案。
+- **证据不迷路**：协作模式里从对话点开证据/缺口，仍在同一个右栏、仍是协作布局，并在标题上方给出 `← 返回对话`（`data-testid="back-to-conversation"`）；返回后对话原样还在。
+
+### 后端改动（全部是 presentation adapter，未触碰语义）
+
+- `packages/plugin-research/src/domain.ts`：`ResearchRunRecord` 增加可选 `userText`（JSON payload 列，无迁移；老记录读回为空）。
+- `apps/research/src/server/runner.ts`：`StageRequest.userText`，只在 Ask / 用户补查 / Edit 三个由人发起的 stage 上设置并随 run 记录落库。
+- `apps/research/src/server/routes.ts`：bundle 的 `runs[]` 增加 `userText`；bundle 增加 `actionBudget`（`service.actionBudgetOf(sessionId)`，只有在用户动作正在跑时非空）；runtime 增加 `actionAllowance`（一次用户补查的额度，取自 `USER_RESEARCH_BUDGET`）。
+- `apps/research/src/browser/components/document.tsx`：报告 frame（研究问题 / 读者 / 范围）的文字也过 `withoutInternalIds`。这是报告正文之外少数几处模型写的文字之一，实测某个真实报告把 `sub_…` 写进了「范围」，读者因此会在正文页看到内部 id；按产品既有规则（内部 id 不出现在读者读到的文字里）修掉，未改任何版式或内容。
+- 没有新增路由、没有改 Guide / 预算 / Proposal 语义、没有引入聊天子系统。
+
+### 测试与浏览器 gate
+
+- `apps/research/tests/guide-conversation.test.ts`（15 例）：对话重建（5 个决策 → 11 条消息、顺序与可回答的那一条）、用户原话（answerText / 选项 label / freeText 的取用顺序）、leadIn 走 RichMarkdown（强调渲染 + `<script>` 不成为元素）、`guideStalled` 的四种正常状态 + key 命名、进度两条边界、用户出口（可确认 / 不可确认带原因）、收束消息与摘要、空闲开场句。
+- `apps/research/tests/workspace-conversation.test.ts`（11 例）：对话只取人发起的 run（agent 自己的阶段被排除）、Ask 的回答挂到自己的那一轮、步骤说成中文动作名且不含工具名/JSON、拒绝原因转述、最近 10 条上限、额度用尽的判定（只对补查）、提案按时间窗口归属到产生它的那次动作、分隔比例（默认 50 / clamp 40–60 / 拖动算术）、三种布局形态。
+- `apps/research/scripts/verify-workspace.mjs`（+新增用例，CDP 真实输入）：引导段现在驱动真实对话——0 个决策的空闲态、逐个决策（其中一次用自由回答，并断言原文出现在用户那一轮）、3 / 5 / free-text 截图、进度口径、第 3 个决策时确认按钮可用、刷新后逐条一致的对话、切结构化再切回来历史仍在、guide run 数有界（每决策一问，最多再多一次自动恢复）、出现早退状态时能自动恢复（没出现则如实 SKIP）；Studio 段新增 50/50 与分隔条（真实拖动 + 上下限）、1366/1440/1920 三档两栏与工具栏不裁切、composer ≥72px、指令方式在 composer 内部、额度文案不含项目口径、补查两轮（第一轮结束后第二条指令照常发起）、证据 → 返回对话、提案内嵌在对话里且接受后只改目标章节。
+- 截图（gitignored）：`guided-0/1/3/5`、`guided-free-text`、`studio-reading-1440`、`studio-coedit-1366/1440/1920`、`studio-ask-1440`、`studio-proposal-1440`、`studio-evidence-1440`。
+
+
+
 ## Step 3.5C-A 新增（本次工作产物）
 
 本轮只改后端语义，不动正式前端视觉。三件事：引导式规划的深度契约、引导对话的数据、用户自己发起的 Research 的预算。没有做前端对话界面、Studio 50/50、Report renderer、PDF、Mermaid、Upload、MCP、第二 Blueprint、Tauri，也没有改 Claim Contract / Frozen Revision / Proposal semantics。
@@ -287,6 +342,16 @@
   - RichMarkdown 没有语法高亮（本轮未要求）；表格与代码靠横向滚动，不做换行重排。
   - 浏览器 gate 的模型用例需要真实模型、一次跑几分钟；没有模型凭据时这些用例报 SKIP 而不是 PASS。
 
+- 对话式规划与协作工作区（Step 3.5C-B 后仍存在的限制）：
+  - 引导对话里**不能编辑已经回答过的那一轮**：回答写进草稿即生效，要改某一项就回结构化模式改（服务端也没有「改写一条历史回答」的语义）；对话只呈现发生过的事。
+  - 补查与修改那两类回复的**文案是产品写的**，不是模型的叙述——这两类 run 的文本是模型围绕工具调用的思考，读出来就是把 thinking 当结论。只有 Ask 的回答是模型原文。
+  - 对话只包含**人发起过的动作**（Ask / 补查 / Edit，最近 10 条）；Agent 自己的阶段（初次检索、自动补查、写作、综合）刻意不出现在对话里。Ask 的回答仍只从会话历史读回（历史很长的项目里，很早以前的回答可能读不回来，3.5B 的限制仍然成立）。
+  - 分隔比例**不持久化**：刷新或重开项目回到默认 50/50；双击分隔条也可以复位。
+  - 协作模式在 **≤1099px** 退回浮层（两半都读不了）；速览 Dock 在 **<1350px** 仍然是浮层。这两种情况都保留原有行为。
+  - 动作记录里不再出现工具名与结果 payload（§22 要求），代价是「这次动作做了什么」只剩中文动作名；需要技术细节时仍可从 `GET /tasks/:id` 的 run `activity` 读原文。
+  - 协作模式下工具栏隐藏主题菜单与「待复核」chip（正文区的提醒仍在）以保持一行；主题切换在阅读模式里。
+  - 报告**比较表仍然可能是空的**（Step 2 的生成侧问题，本轮未动，见上一条 3.5B 的说明）；协作模式只把它画得更窄、可滚动，不改变内容。
+
 - 简报与引导（Step 3.5A 后仍存在的限制）：
   - **界面未接**：本轮只做了 API，Brief 页面仍是只读卡片 + 「换个说法重新生成」；正式 Structured / Guided UI 属于 STEP 3.5B。因此现在通过界面**无法**编辑简报，也**无法**手动引导——必须走 API 或 3.5B。
   - 引导问题**一次只能针对一个字段**（`fieldTargets` 长度为 1），不支持「一个问题同时决定目标与关注点」。决策数量由 Step 3.5C-A 的深度契约管理（下限 5、上限 7），第 5 个之后模型的收尾判断才会被接受，用户也可以在此之前直接确认。
@@ -298,18 +363,21 @@
 
 ## Next Action
 
-**STEP 3.5C-B — Conversational Planning & 50/50 Co-edit UI**（下一步）：
-
-- 把 Guided Mode 做成真正的对话式规划：用本轮下发的 `leadIn` / `answerText` / `selectedOptionLabels`（RichMarkdown 渲染 leadIn）呈现助手与用户的来回，而不是一张问卷；进度按 `readiness / minDecisions / maxDecisions` 说真话，`canConfirm` 明确给出用户随时可以开始的出口。
-- Studio 的 50/50 协作布局（本轮未动前端视觉）。
-
-**STEP 4 — Artifact Delivery & Semantic Visualization**（后续步骤）：
+**STEP 4 — Artifact Delivery & Semantic Visualization**（下一步）：
 
 - **PDF 双主题适配**：把 ThemeSpec 映射到 plugin 的 HTML/PDF renderer，使 Editorial / Swiss 在导出文件里也成立（现在只有 Editorial 有 PDF 版式）。主题已经在冻结版本里记录 `themeId`，位置留好了。
 - **Mermaid / DiagramSpec 机制图**：机制块的结构化数据（input / intermediate / steps / output / tradeoff / failure）已经完整保留，本轮只做了 CSS 步骤流，替换成图形渲染不需要改数据。
 - **File Upload 作为来源**、**第二 Blueprint**、**MCP 集成**：Source Workspace 与 Settings 对未接入能力已如实标注，模板页的 Blueprint/Theme 分离留好了位置。
 
-3.5B 交付后，界面与语义已经对齐；STEP 4 之前没有新的「语义有了、界面没接」的缺口。
+3.5B 交付后，界面与语义已经对齐；3.5C-B 交付后「对话式规划」与「协作工作区」也不再欠账，STEP 4 之前没有新的「语义有了、界面没接」的缺口。
+
+## Step 3.5C-B 的验证入口
+
+- 对话与协作页面的纯逻辑与渲染：`npx vitest run apps/research/tests/guide-conversation.test.ts apps/research/tests/workspace-conversation.test.ts apps/research/tests/brief-logic.test.ts`（含 RichMarkdown 渲染断言，不需要浏览器）。
+- 浏览器 gate（真实输入，非 DOM stub）：`node apps/research/scripts/verify-workspace.mjs --url <product url> --model --shots <gitignored dir>`；引导段与助手动作段需要真实模型，不加 `--model` 时如实 SKIP。引导段会自己建立一份全新草稿（readiness 从 0 开始），因此需要模型与几分钟时间。
+- 离线全量、类型检查与构建：`pnpm typecheck`、`pnpm build:research`、`EVERY_DAGENT_NO_BROWSER=1 npx vitest run --exclude …`（同 Step 2 的排除项）。
+- 已知的既有 flaky（与本次改动无关，单独重跑即过）：`packages/host/tests/tool-policy.test.ts` 的 deadline 毫秒取整断言；`apps/web/tests/shell-*.browser.test.ts` 在整仓并行跑时的 CDP 超时。
+- 本地跑 gate 的注意：产品服务的数据目录不要与正在运行的实例共用（SQLite 会拒绝第二个进程打开）；本次验证是在 `researchpage-data` 的副本上进行的，未改动原有 demo 数据。
 
 ## Step 3.5C-A 的验证入口
 

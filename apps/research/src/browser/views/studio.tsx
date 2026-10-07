@@ -13,6 +13,7 @@
  */
 
 import { Button, Menu, Popover, Tooltip } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import {
   ArrowLeft,
   BookOpen,
@@ -31,9 +32,10 @@ import {
   Snowflake,
   SquarePen,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 
 import { api, type DocumentView } from "../api.js";
+import { COEDIT_SPLIT, clampSplit, splitFromDrag, studioLayout } from "../conversation-logic.js";
 import { coverageKey, DocumentCanvas, type CanvasSelection, type DocMode } from "../components/document.js";
 import { DockSlot } from "../components/dock.js";
 import { boundarySummary, boundariesOf, nameMaps, warningSummary } from "../document-logic.js";
@@ -64,7 +66,18 @@ export function StudioView() {
   const [mode, setMode] = useState<DocMode>("verify");
   const [revisionId, setRevisionId] = useState<string | null>(null);
   const [frozen, setFrozen] = useState<DocumentView | null>(null);
+  // The workspace is open, whatever it is currently showing: opening the
+  // assistant makes the document share the screen with it, and looking at a
+  // sentence's evidence from inside the conversation does not undo that.
+  const [workspace, setWorkspace] = useState(false);
+  const [split, setSplit] = useState<number>(COEDIT_SPLIT.default);
+  const studioRef = useRef<HTMLDivElement | null>(null);
+  const drag = useRef<{ readonly startX: number; readonly startSplit: number; readonly width: number } | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // Below this the two halves stop being readable and the workspace covers the
+  // document instead of splitting it — the one case where the panel still
+  // floats in co-edit mode.
+  const roomy = useMediaQuery("(min-width: 1100px)") === true;
 
   const report = currentReportOf(bundle);
   const currentReportId = bundle?.currentReportId ?? null;
@@ -179,6 +192,17 @@ export function StudioView() {
   };
 
   const assistantOpen = dock !== null && dock.kind === "assistant";
+
+  // Opening the assistant opens the workspace; closing the panel closes it. A
+  // panel that is already the workspace (evidence, a proposal) keeps it open —
+  // the reader is still working beside the document.
+  useEffect(() => {
+    if (dock === null) setWorkspace(false);
+    else if (dock.kind === "assistant") setWorkspace(true);
+  }, [dock]);
+
+  const layout = studioLayout({ dockOpen: dock !== null, workspaceOpen: workspace && roomy });
+
   const toggleAssistant = (): void => {
     if (assistantOpen) {
       openDock(null);
@@ -193,14 +217,45 @@ export function StudioView() {
     });
   };
 
+  /* ------------------------------------------------------------- resizer -- */
+
+  const startDrag = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    const box = studioRef.current?.getBoundingClientRect();
+    if (box === undefined) return;
+    drag.current = { startX: event.clientX, startSplit: split, width: box.width };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const moveDrag = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    const started = drag.current;
+    if (started === null) return;
+    setSplit(splitFromDrag({ startSplit: started.startSplit, startX: started.startX, x: event.clientX, width: started.width }));
+  };
+
+  const endDrag = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (drag.current === null) return;
+    drag.current = null;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+
+  const nudge = (delta: number): void => {
+    setSplit((current) => clampSplit(current + delta));
+  };
+
   return (
-    <div className="rp-studio" data-layout={dock === null ? "reading" : "coedit"} data-testid="studio">
+    <div
+      className="rp-studio"
+      data-layout={layout}
+      data-testid="studio"
+      ref={studioRef}
+      style={{ "--rp-coedit-split": `${String(split)}%` } as CSSProperties}
+    >
       <div className="rp-studio__main">
         <div className="rp-toolbar" data-testid="studio-toolbar">
           <div className="rp-toolbar__group">
             <Popover shadow="md" width={320} position="bottom-start" withinPortal>
               <Popover.Target>
-                <Button size="compact-sm" variant="subtle" leftSection={<ListTree size={14} />}>
+                <Button size="compact-sm" variant="subtle" leftSection={<ListTree size={14} />} className="rp-toolbar__iconlabel">
                   目录
                 </Button>
               </Popover.Target>
@@ -284,7 +339,12 @@ export function StudioView() {
                             <span className="rp-toolbar__long"> · 已有冻结版本</span>
                           </>
                         )
-                      : "工作稿 · Working Draft"
+                      : (
+                          <>
+                            工作稿
+                            <span className="rp-toolbar__long"> · Working Draft</span>
+                          </>
+                        )
                     : `R${frozen?.revision ?? "?"} · 已冻结`}
                 </Button>
               </Menu.Target>
@@ -326,7 +386,7 @@ export function StudioView() {
 
             <Menu shadow="md" width={280} position="bottom-start">
               <Menu.Target>
-                <Button size="compact-sm" variant="subtle" leftSection={<Palette size={14} />} data-testid="theme-menu">
+                <Button size="compact-sm" variant="subtle" leftSection={<Palette size={14} />} data-testid="theme-menu" className="rp-toolbar__optional">
                   {themeId === "swiss" ? "Swiss" : "Editorial"}
                 </Button>
               </Menu.Target>
@@ -431,7 +491,7 @@ export function StudioView() {
 
           {bundle.task.reportNeedsReview !== null && (
             <Tooltip label={bundle.task.reportNeedsReview.reason} withArrow={false}>
-              <span className="rp-chip rp-chip--limited" data-testid="needs-review">
+              <span className="rp-chip rp-chip--limited rp-toolbar__optional" data-testid="needs-review">
                 1 处待复核 · 正文未变
               </span>
             </Tooltip>
@@ -593,7 +653,43 @@ export function StudioView() {
           </div>
         </div>
       </div>
-      <DockSlot />
+      {layout === "coedit" && (
+        <div
+          className="rp-studio__divider"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整文档与助手的宽度"
+          aria-valuenow={split}
+          aria-valuemin={COEDIT_SPLIT.min}
+          aria-valuemax={COEDIT_SPLIT.max}
+          tabIndex={0}
+          data-testid="coedit-divider"
+          onPointerDown={startDrag}
+          onPointerMove={moveDrag}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          onDoubleClick={() => {
+            setSplit(COEDIT_SPLIT.default);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft") {
+              event.preventDefault();
+              nudge(-2);
+            } else if (event.key === "ArrowRight") {
+              event.preventDefault();
+              nudge(2);
+            }
+          }}
+        >
+          <span className="rp-studio__grip" aria-hidden="true" />
+        </div>
+      )}
+      <DockSlot
+        variant={layout === "coedit" ? "workspace" : "measure"}
+        onBackToConversation={() => {
+          openDock({ kind: "assistant" });
+        }}
+      />
     </div>
   );
 }

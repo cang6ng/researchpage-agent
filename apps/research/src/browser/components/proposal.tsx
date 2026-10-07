@@ -28,16 +28,31 @@ function when(iso: string): string {
 export function ProposalPanel({
   bundle,
   proposalId,
+  onSettled,
 }: {
   readonly bundle: TaskBundle;
   readonly proposalId: string;
+  /**
+   * What to do once the decision is made.
+   *
+   * A proposal shown inside the conversation must not close the workspace it is
+   * part of; opened on its own, it closes the panel it filled.
+   */
+  readonly onSettled?: () => void;
 }) {
   const { act, say, openDock, prefillAssistant, document } = useApp();
   const [proposal, setProposal] = useState<ProposalDetailView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pane, setPane] = useState<"proposed" | "current">("proposed");
   const [working, setWorking] = useState(false);
+  const settle = onSettled ?? ((): void => openDock(null));
 
+  // The panel is shown inside the conversation now, so it has to notice when
+  // the project moves on: the decision that settles a proposal happens in the
+  // same column, and a panel that kept the detail it read before the decision
+  // would go on offering a button for something already decided.
+  const summary = bundle.proposals.find((candidate) => candidate.proposalId === proposalId);
+  const summaryStatus = summary?.status ?? "";
   useEffect(() => {
     let cancelled = false;
     void api
@@ -51,7 +66,7 @@ export function ProposalPanel({
     return () => {
       cancelled = true;
     };
-  }, [proposalId]);
+  }, [proposalId, summaryStatus]);
 
   if (error !== null) return <p style={{ fontSize: 13, color: "var(--rp-danger)" }}>{error}</p>;
   if (proposal === null) {
@@ -62,7 +77,6 @@ export function ProposalPanel({
     );
   }
 
-  const summary = bundle.proposals.find((candidate) => candidate.proposalId === proposalId);
   const pending = proposal.status === "pending";
   const currentSection =
     document?.sections.find((section) => section.id === proposal.sections[0]?.id) ?? document?.sections[0];
@@ -87,7 +101,7 @@ export function ProposalPanel({
     setWorking(false);
     if (ok) {
       say("success", "已接受：只有这个目标章节发生变化，其它章节保持原样。");
-      openDock(null);
+      settle();
     }
   };
 
@@ -97,7 +111,7 @@ export function ProposalPanel({
     setWorking(false);
     if (ok) {
       say("info", "已放弃提案；补查得到的材料与证据都保留。");
-      openDock(null);
+      settle();
     }
   };
 

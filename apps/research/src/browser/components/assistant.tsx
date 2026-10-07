@@ -1,27 +1,37 @@
 /**
- * The assistant: a command surface over the project, and a log of what it did.
+ * The assistant: a workspace beside the document, not a panel attached to it.
  *
- * This is not a chat window and must not look like one. The reader chooses what
- * the instruction is about — the project, a section, a sentence — and what it
- * is for (ask, bring material in, propose a change), and the answer comes back
- * as either prose or an account of an action: what was searched, what the run
- * found, whether the report moved.
+ * The right column is half the screen when it is open, and what it holds is the
+ * collaboration itself — what the reader asked for, what came back, and the
+ * actions that follow from it. Each turn is the reader's own sentence and the
+ * assistant's own answer; a research action reports what it brought in and what
+ * it left alone; an edit puts its proposal in the conversation rather than
+ * replacing it. The technical log is a folded line at the bottom of a turn, and
+ * it says what each step did in Chinese instead of printing a tool name or a
+ * result payload.
  *
- * The workspace is wide because an answer is text a reader has to read. What is
- * never wide is the claim about what a submit will do: the target, the mode and
- * the verb are on one line above the box, and an Edit says before it runs that
- * the document will not move until the proposal is accepted.
+ * What the reader will spend is stated before they spend it: the mode line says
+ * whether this instruction may search, this one says what a Research action's
+ * own allowance is, and an allowance that ran out is said in the assistant's
+ * own message rather than left for the reader to infer from a disabled button.
  */
 
-import { Button, Menu, Select, Textarea } from "@mantine/core";
-import { ChevronRight, ListChecks, MessageSquare, Search, Send, Sparkles, SquarePen, X } from "lucide-react";
+import { Button, Menu, Select, Textarea, Tooltip } from "@mantine/core";
+import { Check, ChevronRight, ListChecks, MessageSquare, Search, Send, Sparkles, SquarePen, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
-import { api, type AnswerView, type RunView, type TaskBundle } from "../api.js";
+import { api, type ActionBudgetView, type ProposalView, type TaskBundle } from "../api.js";
+import {
+  budgetExhausted,
+  conversationOf,
+  proposalFor,
+  type Interaction,
+} from "../conversation-logic.js";
 import { currentReportOf, useApp, type AssistantIntent, type Selection } from "../store.js";
 import { navigate, projectHash } from "../router.js";
 import { runningSummary } from "../views/research.js";
 import { RichMarkdown } from "./markdown.js";
+import { ProposalPanel } from "./proposal.js";
 
 const INTENTS: readonly { readonly value: AssistantIntent; readonly label: string }[] = [
   { value: "auto", label: "自动" },
@@ -33,31 +43,25 @@ const INTENTS: readonly { readonly value: AssistantIntent; readonly label: strin
 /** What this mode does, in one line, and what its button says. */
 const INTENT_TEXT: Readonly<Record<AssistantIntent, { readonly help: string; readonly submit: string }>> = Object.freeze({
   auto: { help: "由助手判断这条指令是提问、补查还是修改。", submit: "执行" },
-  ask: { help: "只读现有材料回答问题，不写入任何数据。", submit: "提问" },
-  research: { help: "针对缺口检索并读取新来源；报告正文保持不变。", submit: "补查材料" },
-  edit: { help: "针对目标章节生成修改建议；接受之前正文不变。", submit: "生成修改建议" },
+  ask: { help: "回答只使用这个项目已有的材料。", submit: "提问" },
+  research: { help: "针对缺口检索并读取新来源。", submit: "补查材料" },
+  edit: { help: "针对目标章节起草一份修改建议。", submit: "生成修改建议" },
 });
 
-/**
- * Why a proposal was refused, in the tool's own words.
- *
- * The refusal arrives as the tool's answer — a sentence the model was meant to
- * read and act on. A reader who asked for a change and did not get one deserves
- * the same sentence, not a shrug.
- */
-function refusalOf(detail: string): string {
-  const match = /\{"ok":false,"problems":\[(.*?)\]/.exec(detail);
-  if (match === null) return detail.length > 0 ? detail.slice(0, 160) : "这次动作没有产生提案。";
-  return match[1]
-    .split(",")
-    .map((part) => part.trim().replace(/^"|"$/g, ""))
-    .filter((part) => part.length > 0)
-    .join("；");
-}
+/** What a submit writes — the one line the reader needs near the box (§27). */
+const SCOPE_LINE: Readonly<Record<AssistantIntent, string>> = Object.freeze({
+  auto: "写入之前会先说明这次动作会做什么。",
+  ask: "只回答问题，不写入项目数据。",
+  research: "补充材料，不自动修改报告。",
+  edit: "生成修改建议，接受前正文不变。",
+});
 
-function countTools(run: RunView, name: string): number {
-  return run.activity.filter((step) => step.name === name && step.ok !== false).length;
-}
+const PLACEHOLDERS: Readonly<Record<AssistantIntent, string>> = Object.freeze({
+  auto: "写一条指令，或直接提问",
+  ask: "问一个关于当前报告的问题",
+  research: "告诉我还需要补查什么材料",
+  edit: "告诉我希望怎样修改当前内容",
+});
 
 /**
  * What an instruction will act on.
@@ -100,156 +104,170 @@ function targetOf(
   return { kicker: "项目", label: bundle.task.topic, sectionId: null };
 }
 
-/** One finished action, as an account of what happened rather than a message. */
-function ActionCard({
-  run,
-  answer,
-  onInspect,
-  onEdit,
-  onOpenAssistant,
-}: {
-  readonly run: RunView;
-  readonly answer: AnswerView | undefined;
-  readonly onInspect: (run: RunView) => void;
-  readonly onEdit: () => void;
-  readonly onOpenAssistant: () => void;
-}) {
-  const stage = run.stage;
-  /** What this run did with the proposal tool, read from the run's own record. */
-  const proposalCall = run.activity.filter((step) => step.name === "propose_section_edit").slice(-1)[0];
-  // `ok` is null while the call is still in flight: a proposal is not drafted
-  // until the tool has actually answered.
-  const drafted = proposalCall !== undefined && proposalCall.ok === true;
-  const title =
-    stage === "ask"
-      ? "提问完成"
-      : stage === "gap" || stage === "research"
-        ? run.status === "completed"
-          ? "定向补查完成"
-          : "补查未完成"
-        : stage === "edit"
-          ? "修改建议已就绪"
-          : run.note;
+/** One turn the reader spoke. */
+function UserTurn({ text }: { readonly text: string }) {
+  return (
+    <div className="rp-chat__turn rp-chat__turn--user" data-testid="assistant-msg-user">
+      <div className="rp-chat__who">你</div>
+      <div className="rp-chat__body">
+        <p className="rp-chat__said">{text}</p>
+      </div>
+    </div>
+  );
+}
 
-  const searches = countTools(run, "search_sources");
-  const reads = countTools(run, "read_source");
-  const assessments = countTools(run, "assess_coverage");
+/** The steps a run took, named for a reader and folded away. */
+function Steps({ interaction }: { readonly interaction: Interaction }) {
+  if (interaction.steps.length === 0) return null;
+  return (
+    <details className="rp-action-card__log">
+      <summary>这次动作做了什么</summary>
+      <ul>
+        {interaction.steps.map((step, index) => (
+          <li key={`${step.label}-${String(index)}`}>
+            {step.label}
+            {step.failed && <span className="rp-danger">（被拒绝）</span>}
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+/**
+ * One interaction, as the assistant's reply to it.
+ *
+ * The reply's *shape* is the product's and its *words* are the model's where
+ * there are any: an Ask answers in prose, anything else reports what it did.
+ */
+function AssistantTurn({
+  bundle,
+  interaction,
+  proposal,
+  allowance,
+  answerBudget,
+  onInspect,
+  onOpenProposal,
+  onEditFromResearch,
+  onRewrite,
+}: {
+  readonly bundle: TaskBundle;
+  readonly interaction: Interaction;
+  readonly proposal: ProposalView | null;
+  readonly allowance: { readonly searches: number; readonly reads: number };
+  readonly answerBudget: ActionBudgetView | null;
+  readonly onInspect: () => void;
+  readonly onOpenProposal: () => void;
+  readonly onEditFromResearch: () => void;
+  readonly onRewrite: () => void;
+}) {
+  const running = interaction.status === "running";
+  const exhausted = budgetExhausted(interaction, allowance);
 
   return (
-    <div className="rp-action-card" data-testid={`action-${stage}`}>
-      <div className="rp-action-card__head">
-        {stage === "ask" ? (
-          <MessageSquare size={14} strokeWidth={1.75} />
-        ) : stage === "edit" ? (
-          <SquarePen size={14} strokeWidth={1.75} />
-        ) : (
-          <Search size={14} strokeWidth={1.75} />
-        )}
-        {title}
-        {run.status === "failed" && <span className="rp-chip rp-chip--danger">未完成</span>}
-      </div>
-
-      {stage === "ask" ? (
-        <div className="rp-answerblock">
-          {answer === undefined || answer.text === null ? (
-            <p className="rp-muted">
-              这次回答不在会话历史里（提问本身不写入任何正式数据，回答只存在于会话记录中）。
-            </p>
+    <div className="rp-chat__turn rp-chat__turn--assistant" data-testid={`action-${interaction.kind === "research" ? "gap" : interaction.kind}`}>
+      <div className="rp-chat__who">助手</div>
+      <div className="rp-chat__body">
+        {interaction.kind === "ask" ? (
+          running ? (
+            <p className="rp-chat__said">正在读这个项目已有的材料…</p>
+          ) : interaction.failure.length > 0 ? (
+            <p className="rp-chat__said">这次提问没有完成：{interaction.failure}</p>
+          ) : interaction.answer === null ? (
+            <p className="rp-chat__said">这次回答不在会话历史里（提问本身不写入任何正式数据，回答只存在于会话记录中）。</p>
+          ) : (
+            <RichMarkdown text={interaction.answer} />
+          )
+        ) : interaction.kind === "research" ? (
+          running ? (
+            <>
+              <p className="rp-chat__said">可以。我只补充材料，不会修改当前报告。</p>
+              <p className="rp-chat__note">
+                正在检索与读取…
+                {answerBudget !== null && (
+                  <>
+                    {" "}
+                    本次剩余：{answerBudget.searchesRemaining} 次检索 · {answerBudget.readsRemaining} 个来源
+                  </>
+                )}
+              </p>
+            </>
+          ) : interaction.failure.length > 0 ? (
+            <>
+              <p className="rp-chat__said">这次补查没有完成：{interaction.failure}</p>
+              <p className="rp-chat__note">报告正文没有变化；材料与证据都保留在这次动作之前的状态。</p>
+            </>
           ) : (
             <>
-              {answer.question.length > 0 && <div className="rp-answer__q">{answer.question}</div>}
-              <RichMarkdown text={answer.text} />
+              <p className="rp-chat__said">
+                {exhausted
+                  ? "这次补查已经用完了本轮的检索额度。"
+                  : `找到了 ${String(interaction.reads)} 个来源的可用材料。`}
+              </p>
+              <div className="rp-action-card__body">
+                <span>
+                  本轮：检索 <b className="rp-action-card__num">{interaction.searches}</b> 次 · 读取{" "}
+                  <b className="rp-action-card__num">{interaction.reads}</b> 次 · 覆盖评估{" "}
+                  <b className="rp-action-card__num">{interaction.assessments}</b> 格
+                </span>
+                <span className="rp-muted">报告正文没有改变：补查只增加材料与支持评估。</span>
+              </div>
+              <div className="rp-action-card__actions">
+                <Button size="xs" variant="default" onClick={onInspect}>
+                  检查新证据
+                </Button>
+                <Button size="xs" variant="subtle" leftSection={<SquarePen size={13} />} onClick={onEditFromResearch}>
+                  基于这些材料修改本节
+                </Button>
+              </div>
             </>
-          )}
-          <div className="rp-action-card__actions">
-            <Button size="xs" variant="default" onClick={() => onInspect(run)}>
-              看相关材料
-            </Button>
-          </div>
-        </div>
-      ) : stage === "edit" ? (
-        run.status === "running" ? (
-          <div className="rp-action-card__body">
-            <span>正在起草针对目标章节的修改建议…</span>
-            <span className="rp-muted">提案写好之前，报告正文不会变化。</span>
-          </div>
-        ) : drafted ? (
+          )
+        ) : running ? (
           <>
-            <div className="rp-action-card__body">
-              <span>已针对目标章节起草修改建议，等待你接受或放弃。</span>
-              <span className="rp-muted">接受之前，报告正文没有变化。</span>
-            </div>
-            <div className="rp-action-card__actions">
-              <Button size="xs" onClick={onEdit} data-testid="open-proposal">
-                查看修改建议
-              </Button>
-            </div>
+            <p className="rp-chat__said">可以。我会只针对选中的目标生成修改建议。</p>
+            <p className="rp-chat__note">正在起草…提案写好之前，报告正文不会变化。</p>
+          </>
+        ) : interaction.drafted ? (
+          <>
+            <p className="rp-chat__said">我基于刚才的材料准备了一份修改建议，等你决定。</p>
+            {proposal === null ? (
+              <div className="rp-action-card__actions">
+                <Button size="xs" onClick={onOpenProposal} data-testid="open-proposal">
+                  查看修改建议
+                </Button>
+              </div>
+            ) : null}
           </>
         ) : (
-          // A run can end without a proposal — the instruction may have been
-          // answered instead of acted on. Saying "a proposal is ready" then
-          // would be the page inventing a change nobody made.
           <>
-            <div className="rp-action-card__body">
-              <span>这次没有产生修改建议，报告正文没有变化。</span>
-              <span className="rp-muted">
-                {proposalCall !== undefined
-                  ? refusalOf(proposalCall.detail)
-                  : "模型这一次没有起草提案；可以改一下说法再试。"}
-              </span>
-            </div>
+            <p className="rp-chat__said">这次没有产生修改建议，报告正文没有变化。</p>
+            <p className="rp-chat__note">
+              {interaction.refusal.length > 0 ? interaction.refusal : "模型这一次没有起草提案；可以改一下说法再试。"}
+            </p>
             <div className="rp-action-card__actions">
-              <Button
-                size="xs"
-                variant="default"
-                onClick={() => {
-                  onOpenAssistant();
-                }}
-              >
+              <Button size="xs" variant="default" onClick={onRewrite}>
                 改写指令再试
               </Button>
             </div>
           </>
-        )
-      ) : (
-        <>
-          <div className="rp-action-card__body">
-            <span>
-              本轮：检索 <b className="rp-action-card__num">{searches}</b> 次 · 读取{" "}
-              <b className="rp-action-card__num">{reads}</b> 次 · 覆盖评估 <b className="rp-action-card__num">{assessments}</b> 格
-            </span>
-            <span className="rp-muted">报告正文未改变：补查只增加材料与支持评估。</span>
-          </div>
-          <div className="rp-action-card__actions">
-            <Button size="xs" variant="default" onClick={() => onInspect(run)}>
-              检查证据
-            </Button>
-            <Button size="xs" variant="subtle" leftSection={<SquarePen size={13} />} onClick={onEdit}>
-              创建修改建议
-            </Button>
-          </div>
-        </>
-      )}
+        )}
 
-      {run.activity.length > 0 && (
-        <details className="rp-action-card__log">
-          <summary>这次动作做了什么</summary>
-          <ul>
-            {run.activity.slice(-8).map((step, index) => (
-              <li key={`${step.name}-${String(index)}`}>
-                {step.detail.length > 0 ? step.detail : step.name}
-                {step.ok === false && <span className="rp-danger">（失败）</span>}
-              </li>
-            ))}
-          </ul>
-        </details>
-      )}
+        {interaction.kind === "edit" && proposal !== null && interaction.drafted && (
+          <div className="rp-chat__embedded" data-testid="assistant-proposal">
+            {/* Decided here, the proposal stays here: the turn keeps its record
+                and the conversation is not replaced by the thing it produced. */}
+            <ProposalPanel bundle={bundle} proposalId={proposal.proposalId} onSettled={() => undefined} />
+          </div>
+        )}
+
+        <Steps interaction={interaction} />
+      </div>
     </div>
   );
 }
 
 export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
-  const { assistant, answers, selection, setSelection, openDock, prefillAssistant, updateAssistant, refresh, busy, say } =
+  const { assistant, answers, runtime, selection, setSelection, openDock, prefillAssistant, updateAssistant, refresh, busy, say } =
     useApp();
   const composer = useRef<HTMLTextAreaElement | null>(null);
   const [sending, setSending] = useState(false);
@@ -289,10 +307,8 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
     }
   };
 
-  const actions = [...bundle.runs]
-    .filter((run) => run.stage === "ask" || run.stage === "gap" || run.stage === "research" || run.stage === "edit")
-    .slice(-6)
-    .reverse();
+  const interactions = conversationOf(bundle, answers);
+  const allowance = runtime?.actionAllowance ?? { searches: 2, reads: 4 };
 
   const inspect = (): void => {
     const gap = bundle.gaps[0];
@@ -320,9 +336,6 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
       openDock({ kind: "proposal", proposalId: pending.proposalId });
       return;
     }
-    // A settled proposal is still worth reading — it is the record of what was
-    // proposed and what was decided. Only when there is none at all is there
-    // nothing to open, and then the composer is where the reader goes next.
     const latest = proposals.slice(-1)[0];
     if (latest !== undefined) {
       openDock({ kind: "proposal", proposalId: latest.proposalId });
@@ -336,12 +349,20 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
   // composer says so before it is submitted rather than after it is refused.
   const needsSection = intent === "edit" && target.sectionId === null;
   const help = needsSection
-    ? { help: "先选择要修改的章节：在报告里点一个标题，或用右边的下拉框选。", submit: INTENT_TEXT.edit.submit }
+    ? { help: "先选择要修改的章节：在报告里点一个标题，或用上方的下拉框选。", submit: INTENT_TEXT.edit.submit }
     : INTENT_TEXT[intent];
+
+  const budgetLine =
+    intent === "research"
+      ? bundle.actionBudget === null
+        ? `这次补查的额度独立计算：最多 ${String(allowance.searches)} 次检索 · ${String(allowance.reads)} 个来源读取。`
+        : `本次剩余：${String(bundle.actionBudget.searchesRemaining)} 次检索 · ${String(bundle.actionBudget.readsRemaining)} 个来源。`
+      : "";
 
   return (
     <div className="rp-assistant">
-      <div className="rp-assistant__bar">
+      <div className="rp-assistant__bar" data-testid="assistant-bar">
+        <span className="rp-assistant__label">助手</span>
         <span className={`rp-assistant__kicker rp-assistant__kicker--${target.kicker === "项目" ? "project" : "object"}`}>
           {target.kicker}
         </span>
@@ -364,7 +385,7 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
         {intent === "edit" && sections.length > 0 && (
           <Select
             size="xs"
-            w={168}
+            w={150}
             ml="auto"
             placeholder="选择章节"
             value={target.sectionId}
@@ -378,7 +399,7 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
         )}
       </div>
 
-      <div className="rp-assistant__body">
+      <div className="rp-assistant__body" data-testid="assistant-thread">
         {running !== null && (
           <div className="rp-note rp-note--quiet rp-assistant__running">
             <Sparkles size={14} style={{ flex: "none", marginTop: 2 }} />
@@ -396,27 +417,38 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
           </div>
         )}
 
-        <div className="rp-log">
-          {actions.length === 0 && running === null && (
-            <p className="rp-muted rp-assistant__empty">
-              还没有动作。可以问一个关于材料的问题，也可以让助手补查某个缺口；需要改报告时，先在报告里选一个章节或一句话。
-            </p>
-          )}
-          {actions.map((run) => (
-            <ActionCard
-              key={run.runId ?? `${run.stage}-${run.startedAt}`}
-              run={run}
-              answer={answers.find((entry) => entry.runId === run.runId)}
+        {interactions.length === 0 && running === null && (
+          <p className="rp-muted rp-assistant__empty" data-testid="assistant-empty">
+            还没有对话。可以问一个关于材料的问题，也可以让助手补查某个缺口；需要改报告时，先在报告里选一个章节或一句话。
+          </p>
+        )}
+
+        {interactions.map((interaction) => (
+          <div className="rp-chat__exchange" key={interaction.id}>
+            <UserTurn text={interaction.userText} />
+            <AssistantTurn
+              bundle={bundle}
+              interaction={interaction}
+              proposal={proposalFor(interaction, bundle.proposals, Date.now())}
+              allowance={allowance}
+              answerBudget={bundle.actionBudget}
               onInspect={inspect}
-              onEdit={() => {
+              onOpenProposal={() => {
                 void openProposal();
               }}
-              onOpenAssistant={() => {
+              onEditFromResearch={() => {
+                prefillAssistant({
+                  intent: "edit",
+                  sectionId: target.sectionId,
+                  text: target.sectionId === null ? "" : `基于刚才补查到的材料，修改「${target.label}」这一节。`,
+                });
+              }}
+              onRewrite={() => {
                 updateAssistant({ intent: "edit" });
               }}
             />
-          ))}
-        </div>
+          </div>
+        ))}
       </div>
 
       <div className="rp-assistant__composer" data-testid="assistant-composer">
@@ -439,36 +471,13 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
           </div>
         )}
 
-        <div className="rp-assistant__modes" role="group" aria-label="指令方式" data-testid="assistant-intent">
-          {INTENTS.map((entry) => (
-            <button
-              key={entry.value}
-              type="button"
-              aria-pressed={intent === entry.value}
-              onClick={() => {
-                updateAssistant({ intent: entry.value });
-              }}
-            >
-              {entry.label}
-            </button>
-          ))}
-        </div>
-
         <Textarea
           ref={composer}
-          size="sm"
+          className="rp-assistant__box"
           autosize
-          minRows={2}
-          maxRows={8}
-          placeholder={
-            intent === "ask"
-              ? `问一个关于${target.kicker === "项目" ? "当前材料" : `「${target.label}」`}的问题`
-              : intent === "edit"
-                ? "说明这一处要怎么改"
-                : intent === "research"
-                  ? "说明要补查什么"
-                  : "写一条指令，或直接提问"
-          }
+          minRows={3}
+          maxRows={9}
+          placeholder={PLACEHOLDERS[intent]}
           value={text}
           onChange={(event) => {
             updateAssistant({ text: event.currentTarget.value });
@@ -488,23 +497,51 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
           </p>
         )}
 
-        <div className="rp-assistant__submit">
-          <Button
-            size="sm"
-            leftSection={<Send size={14} />}
-            loading={sending}
-            disabled={text.trim().length === 0 || busy || needsSection}
-            onClick={() => {
-              void send();
-            }}
-            data-testid="assistant-submit"
-          >
-            {help.submit}
-          </Button>
-          <span className="rp-assistant__help">{help.help}</span>
+        <div className="rp-assistant__toolbar">
+          <div className="rp-assistant__modes" role="group" aria-label="指令方式" data-testid="assistant-intent">
+            {INTENTS.map((entry) => (
+              <button
+                key={entry.value}
+                type="button"
+                aria-pressed={intent === entry.value}
+                onClick={() => {
+                  updateAssistant({ intent: entry.value });
+                }}
+              >
+                {entry.label}
+              </button>
+            ))}
+          </div>
+
+          <span className="rp-assistant__help" data-testid="assistant-help">
+            {budgetLine.length > 0 ? budgetLine : help.help}
+          </span>
+
+          <Tooltip label={help.help} disabled={needsSection} withArrow={false} multiline w={280}>
+            <span>
+              <Button
+                size="sm"
+                leftSection={<Send size={14} />}
+                loading={sending}
+                disabled={text.trim().length === 0 || busy || needsSection}
+                onClick={() => {
+                  void send();
+                }}
+                data-testid="assistant-submit"
+              >
+                {help.submit}
+              </Button>
+            </span>
+          </Tooltip>
+        </div>
+
+        <div className="rp-assistant__foot">
+          <span className="rp-assistant__note" data-testid="assistant-scope">
+            {SCOPE_LINE[intent]}
+          </span>
           <Menu shadow="md" position="top-end" width={260}>
             <Menu.Target>
-              <Button size="sm" variant="subtle" rightSection={<ChevronRight size={13} />} aria-label="更多动作" px="sm">
+              <Button size="compact-xs" variant="subtle" rightSection={<ChevronRight size={12} />} aria-label="更多动作" px="xs">
                 更多
               </Button>
             </Menu.Target>
@@ -526,6 +563,14 @@ export function AssistantPanel({ bundle }: { readonly bundle: TaskBundle }) {
                 }}
               >
                 转为生成修改建议
+              </Menu.Item>
+              <Menu.Item
+                leftSection={<MessageSquare size={13} />}
+                onClick={() => {
+                  updateAssistant({ intent: "ask" });
+                }}
+              >
+                转为提问
               </Menu.Item>
               <Menu.Divider />
               <Menu.Item

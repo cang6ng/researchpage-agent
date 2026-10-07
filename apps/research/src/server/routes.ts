@@ -28,6 +28,7 @@ import type {
 } from "@every-dagent/plugin-research";
 import {
   DEFAULT_BUDGET,
+  USER_RESEARCH_BUDGET,
   buildCitations,
   findPdfBrowser,
   classifyIntent,
@@ -267,9 +268,17 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
       startedAt: record.startedAt,
       endedAt: record.endedAt,
       activity: record.activity,
+      // The reader's own sentence, for the runs they asked for. Empty for the
+      // program's own stages, which is how the workspace tells a turn of the
+      // collaboration from the agent working on its own.
+      userText: record.userText ?? "",
     })),
     budget: task.budget,
     usage: task.usage,
+    // What a user action may still spend, while one is actually running: the
+    // grant lives exactly as long as its stage, so this is null between
+    // actions rather than a project-wide remainder dressed up as an allowance.
+    actionBudget: service.actionBudgetOf(task.sessionId) ?? null,
     // The brief travels with the rest of the project: it is the same draft the
     // structured editor and the guided assistant write to, so a page that polls
     // one endpoint sees both ways of working on it.
@@ -1026,6 +1035,11 @@ export function createResearchRouter(
         // this machine has.
         pdfRenderer: routeOptions.browserPath ?? findPdfBrowser() ?? null,
         budget: DEFAULT_BUDGET,
+        // What one explicit Research instruction gets. Every instruction gets a
+        // fresh allowance, so this is a per-action number and not a project
+        // remainder: the composer says what the next 补查 may cost without the
+        // page keeping its own copy of the number.
+        actionAllowance: { searches: USER_RESEARCH_BUDGET.maxSearches, reads: USER_RESEARCH_BUDGET.maxReads },
         dataDir: routeOptions.reportDir,
         busy: busyState() || runner.busy || runner.queued > 0,
       });

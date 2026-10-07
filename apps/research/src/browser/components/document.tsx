@@ -34,6 +34,7 @@ import {
   carriesOwnNumber,
   nameOf,
   readerText,
+  withoutInternalIds,
   type BoundaryItem,
   type DocumentNames,
 } from "../document-logic.js";
@@ -652,7 +653,13 @@ export function DocumentCanvas({
   const warnings = document.validation?.warnings ?? [];
 
   return (
-    <article className="rp-doc" data-theme={themeId} data-mode={mode} data-testid="document-canvas">
+    <article
+      className="rp-doc"
+      data-theme={themeId}
+      data-mode={mode}
+      data-report-id={document.reportId}
+      data-testid="document-canvas"
+    >
       <header className="rp-doc__head">
         <div className="rp-doc__kicker">
           {document.revision === null ? "工作稿 · Working Draft" : `R${String(document.revision)} · 已冻结`}
@@ -660,18 +667,21 @@ export function DocumentCanvas({
         <h1 className="rp-doc__title">{document.title}</h1>
         <p className="rp-doc__summary">{document.summary}</p>
         {document.frame !== null && (
+          // The frame is model-written prose like any other: it is the one
+          // place a writer tends to name the objects it was shown, and the
+          // reader reads names.
           <div className="rp-doc__frame">
             <div>
               <b>研究问题</b>
-              {document.frame.question}
+              {withoutInternalIds(document.frame.question)}
             </div>
             <div>
               <b>读者</b>
-              {document.frame.audience}
+              {withoutInternalIds(document.frame.audience)}
             </div>
             <div>
               <b>范围</b>
-              {document.frame.scope}
+              {withoutInternalIds(document.frame.scope)}
             </div>
           </div>
         )}

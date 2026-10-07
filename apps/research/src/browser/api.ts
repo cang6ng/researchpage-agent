@@ -77,6 +77,15 @@ export interface RunView {
   readonly startedAt: string;
   readonly endedAt: string | null;
   readonly activity: readonly RunStepView[];
+  /**
+   * What the reader asked for, when the run is one they started themselves.
+   *
+   * Empty for the program's own stages — the automatic research, gap and
+   * writing passes are work the product decided on, not turns in a
+   * conversation — which is exactly what makes this a conversation: the runs
+   * that carry a sentence here are the ones a person asked for.
+   */
+  readonly userText: string;
 }
 
 export type BriefFieldName =
@@ -377,8 +386,15 @@ export interface TaskBundle {
     readonly deadlineMs: number;
   };
   readonly usage: { readonly searches: number; readonly reads: number; readonly gapRounds: number; readonly startedAt?: string };
-  /** The Research Brief: the editable draft, or the frozen record once confirmed. */
   readonly brief: BriefView;
+  /**
+   * What the user action now running may still spend, if one is running.
+   *
+   * A user action's own allowance, live from the application — not the
+   * project's remaining research budget, which the agent's own passes draw on
+   * and which has nothing to say about what the reader may still ask for.
+   */
+  readonly actionBudget: ActionBudgetView | null;
   readonly currentReportId: string | null;
   /** The current report's own content hash; null when there is no report. */
   readonly currentReportHash: string | null;
@@ -420,6 +436,15 @@ export interface RuntimeView {
     readonly maxGapRounds: number;
     readonly deadlineMs: number;
   };
+  /**
+   * What one explicit Research action is allowed to spend.
+   *
+   * The project budget above is the agent's own; this is the allowance a
+   * reader's instruction gets, and each instruction gets a fresh one. It is
+   * published here so the composer can say what the next 补查 may cost before
+   * anything is spent, without the page keeping its own copy of the number.
+   */
+  readonly actionAllowance: { readonly searches: number; readonly reads: number };
   readonly dataDir: string;
   readonly busy: boolean;
 }

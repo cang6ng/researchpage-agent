@@ -659,6 +659,17 @@ export interface ResearchRunRecord {
     readonly ok: boolean | null;
     readonly at: string;
   }[];
+  /**
+   * What the user asked for, when the run is one they asked for.
+   *
+   * The program's own stages — the first research pass, the automatic gap
+   * rounds, the writing passes — carry nothing here, because nobody asked for
+   * them in words. The stages that do carry it are the turns of the
+   * collaboration the workspace shows; keeping the sentence with the run is
+   * what lets that history be read back whole instead of only for as long as
+   * the process that started it happens to live.
+   */
+  readonly userText?: string;
 }
 
 /** What a cell's coverage is, and the sentence that explains it. */

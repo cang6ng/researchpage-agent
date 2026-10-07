@@ -208,6 +208,7 @@ function bundleFixture(): TaskBundle {
     revisions: [],
     exports: [],
     runs: [],
+    actionBudget: null,
     budget: { maxSearches: 6, maxCandidatesPerSearch: 5, maxReads: 10, maxGapRounds: 2, deadlineMs: 480000 },
     usage: { searches: 1, reads: 1, gapRounds: 0 },
     brief: {

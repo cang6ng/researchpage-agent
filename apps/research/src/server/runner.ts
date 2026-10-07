@@ -165,6 +165,14 @@ interface StageRequest {
   readonly targetSectionId?: string | null;
   /** Set for an Ask: the user's own question, for the action log. */
   readonly question?: string;
+  /**
+   * What the user asked for, when this stage is one they asked for.
+   *
+   * The stage instruction is written by the application and carries material
+   * the reader never typed; this is their own sentence, kept so the workspace
+   * can show the collaboration as it happened rather than as a prompt.
+   */
+  readonly userText?: string;
 }
 
 const STAGE_LABELS: Readonly<Record<ResearchStage, string>> = Object.freeze({
@@ -622,6 +630,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
             endedAt: null,
             note: `${stageLabel(request.stage)}：已启动`,
             activity: [],
+            ...(request.userText === undefined ? {} : { userText: request.userText }),
           };
     if (record !== undefined) service.recordRun(record);
 
@@ -1098,6 +1107,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
             ...(view.allowResearch ? { budget: EDIT_RESEARCH_BUDGET } : {}),
           },
           targetSectionId: section.id,
+          userText: input.text,
         });
         return view;
       }
@@ -1115,6 +1125,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         instruction: stageInstruction({ stage: "ask", task, question: input.text }),
         grant: { intent: "ask", allowResearch: false, targetType: "project", targetId: null, scope: view.scope, origin: "user" },
         question: input.text,
+        userText: input.text,
       });
       return view;
     },
@@ -1143,6 +1154,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         stage: "gap",
         instruction,
         grant: { ...STAGE_GRANTS.gap, origin: "user", budget: USER_RESEARCH_BUDGET, scope },
+        userText: input.text,
       });
       return {
         intent: "research",
