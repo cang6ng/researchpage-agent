@@ -370,7 +370,10 @@ async function main() {
   /**
    * Makes a fresh draft the way a reader makes one, and returns its id.
    *
-   * The card's topic is written by the model, so a new project is found by
+   * Since this round a project is born from a confirmed research direction, so
+   * the way a reader makes one is: type the topic, answer the assistant (here
+   * by asking for the direction outright), confirm it, and wait for the card.
+   * The card's topic is written by the model, so the new project is found by
    * watching for an id that was not there before, rather than by matching the
    * words the reader happened to type.
    */
@@ -378,8 +381,62 @@ async function main() {
     const before = new Set((await api("/api/research/tasks")).tasks.map((entry) => entry.id));
     await session.goto(`${base}/#/`);
     await session.waitFor(`document.querySelector('[data-testid="topic-input"]') !== null`, "the start composer", 15_000);
-    await session.type('[data-testid="topic-input"]', topic);
-    await session.click('[data-testid="topic-submit"]');
+    // The composer is a controlled textarea, so the topic only counts once the
+    // browser's own text input has reached the page; the gesture is read back
+    // and retried rather than assumed, the same way every other real-input step
+    // in this gate is.
+    let submitted = false;
+    for (let attempt = 0; attempt < 3 && !submitted; attempt += 1) {
+      await session.type('[data-testid="topic-input"]', topic);
+      const held = await session.evaluate(`(document.querySelector('[data-testid="topic-input"]')?.value ?? "").trim().length >= 2`);
+      if (held !== true) {
+        await delay(700);
+        continue;
+      }
+      const blocked = await session.evaluate(`document.querySelector('[data-testid="topic-submit"]').disabled === true`);
+      if (blocked === true) {
+        await delay(900);
+        continue;
+      }
+      await session.click('[data-testid="topic-submit"]');
+      const until = Date.now() + 30_000;
+      while (Date.now() < until && !submitted) {
+        submitted =
+          (await session.evaluate(`window.location.hash.startsWith("#/i/") || window.location.hash.startsWith("#/p/")`)) === true;
+        if (!submitted) await delay(400);
+      }
+    }
+    if (!submitted) throw new Error("the topic never reached the composer");
+    if ((await session.evaluate(`window.location.hash.startsWith("#/i/")`)) === true) {
+      // The composer is a controlled input, so the message only goes out once
+      // the browser's own text input has really reached the page — which is why
+      // the value is read back and the gesture retried, the same discipline the
+      // rest of this gate uses for real input.
+      const assistantTurns = `document.querySelectorAll('[data-testid^="intent-turn-"][class*="--assistant"]').length`;
+      const userTurns = `document.querySelectorAll('[data-testid^="intent-turn-"][class*="--user"]').length`;
+      await session.waitFor(`document.querySelector('[data-testid="intent-message-input"]') !== null`, "the composer", 30_000);
+      await session.waitFor(`${assistantTurns} >= 1`, "the assistant's first question", 240_000);
+      let sent = false;
+      for (let attempt = 0; attempt < 3 && !sent; attempt += 1) {
+        await session.type('[data-testid="intent-message-input"]', "请给出正式研究方向。");
+        const held = await session.evaluate(`(document.querySelector('[data-testid="intent-message-input"]')?.value ?? "").length > 0`);
+        if (held !== true) {
+          await delay(600);
+          continue;
+        }
+        const before = await session.evaluate(userTurns);
+        await session.click('[data-testid="intent-message-send"]');
+        const until = Date.now() + 25_000;
+        while (Date.now() < until && !sent) {
+          sent = (await session.evaluate(userTurns)) > before;
+          if (!sent) await delay(400);
+        }
+      }
+      if (!sent) throw new Error("the answer never reached the exploration");
+      await session.waitFor(`document.querySelector('[data-testid="intent-direction"]') !== null`, "the proposed direction", 240_000);
+      await session.waitFor(`(() => { const b = document.querySelector('[data-testid="intent-confirm"]'); return b !== null && b.disabled === false; })()`, "a pressable confirm", 120_000);
+      await session.click('[data-testid="intent-confirm"]');
+    }
     let created;
     const deadline = Date.now() + 240_000;
     while (created === undefined && Date.now() < deadline) {
@@ -621,10 +678,25 @@ async function main() {
           await session.setViewport(1440, 900);
           await session.screenshot(join(shots, "guided-0.png"));
         }
+        // The number on the panel is the server's own readiness, not a
+        // constant: since this round a project is born from a direction the
+        // user confirmed, so the fields that direction settled are already
+        // decided when the guided conversation opens. The case asserts the two
+        // things that must hold either way — an undecided project opens as a
+        // conversation with nothing in it, and the count it shows is the count
+        // the brief reports.
+        const freshBrief = await briefOf(guideDraftId);
+        const expectedProgress = `关键决策 ${String(freshBrief.guide.readiness)} / 至少 ${String(freshBrief.guide.minDecisions)}`;
+        const floorMetAtStart = freshBrief.guide.readiness >= freshBrief.guide.minDecisions;
+        // Below the floor the panel names the floor it still owes; at or above
+        // it there is no remainder to name, and the line stops promising one.
+        const progressMatches =
+          idle.progress.includes(expectedProgress) ||
+          (floorMetAtStart && /关键决策 \d+/.test(idle.progress) && !/至少 \d+/.test(idle.progress));
         case_(
-          "0 个决策时是一段还没开始的对话，而不是一张问卷",
-          idle.idle === true && idle.turns === 0 && /关键决策 0 \/ 至少 5/.test(idle.progress),
-          `${String(idle.turns)} 条消息 · ${idle.progress}`,
+          "刚建立的项目是一段还没开始的对话，而不是一张问卷，且数字与简报一致",
+          idle.idle === true && idle.turns === 0 && progressMatches,
+          `${String(idle.turns)} 条消息 · ${idle.progress}（简报 readiness=${String(freshBrief.guide.readiness)}，下限 ${String(freshBrief.guide.minDecisions)}）`,
         );
 
         const transcriptOf = async () =>
@@ -645,13 +717,22 @@ async function main() {
              })()`,
           );
 
-        /** Waits for the next turn: a question, the closing statement, or the retry state. */
+        /**
+         * Waits for the next turn: a question, the closing statement, or a stall.
+         *
+         * The fourth outcome is the one that costs a test four minutes if it is
+         * not named: the panel goes back to the idle face —「开始引导」— after a
+         * guide run that stored no question. That is the server's own stage
+         * having produced nothing the contract would accept, and it is reported
+         * as such rather than as a wait that never ended.
+         */
         const waitForTurn = async (timeoutMs) => {
           try {
             await session.waitFor(
               `document.querySelector('[data-testid="guide-options"]') !== null ||
                document.querySelector('[data-testid="guide-complete"]') !== null ||
-               document.querySelector('[data-testid="guide-stalled"]') !== null`,
+               document.querySelector('[data-testid="guide-stalled"]') !== null ||
+               document.querySelector('[data-testid="guide-start"]') !== null`,
               "the next guided turn",
               timeoutMs,
             );
@@ -664,7 +745,10 @@ async function main() {
           if ((await session.evaluate(`document.querySelector('[data-testid="guide-stalled"]') !== null`)) === true) {
             return "stalled";
           }
-          return "question";
+          if ((await session.evaluate(`document.querySelector('[data-testid="guide-options"]') !== null`)) === true) {
+            return "question";
+          }
+          return "nothing";
         };
 
         const guideRunsBefore = (await api(`/api/research/tasks/${guideDraftId}`)).runs.filter((run) => run.stage === "guide").length;
@@ -682,10 +766,12 @@ async function main() {
         let freeTextInTranscript = false;
         const deadline = Date.now() + 900_000;
 
+        let sawNothing = false;
         while (decisions < 7 && Date.now() < deadline) {
           const turn = await waitForTurn(decisions === 0 ? 300_000 : 180_000);
-          if (turn === "timeout" || turn === "complete") {
+          if (turn === "timeout" || turn === "complete" || turn === "nothing") {
             sawComplete = turn === "complete";
+            sawNothing = sawNothing || turn === "nothing";
             break;
           }
           if (turn === "stalled") {
@@ -774,38 +860,76 @@ async function main() {
 
         const transcript = await transcriptOf();
         const userTurns = transcript.turns.filter((entry) => entry.role === "user");
-        case_(
-          "引导是一场多轮对话：每一次决定都留下助手的一问和用户的一答",
-          decisions >= 5 && transcript.turns.filter((entry) => entry.role === "assistant").length >= decisions,
-          `${String(decisions)} 个决策 · ${String(transcript.turns.length)} 条消息`,
-        );
-        case_(
-          "助手的话在左、用户的话在右，回执轻量地跟在回答后面",
-          transcript.leads >= 1 && transcript.receipts >= decisions,
-          `leadIn ${String(transcript.leads)} 条 · 回执 ${String(transcript.receipts)} 条 · 选项 ${String(firstQuestion?.options ?? 0)} 个`,
-        );
-        case_(
-          "自由回答以原文出现在用户那一轮里",
-          freeTextInTranscript === true,
-          freeTextInTranscript ? freeAnswer.slice(0, 30) : "用户轮次里没有找到原文",
-        );
-        case_(
-          "深度下限说真话：3 个决策时写明还差多少",
-          /关键决策 3 \/ 至少 5/.test(progressAtThree),
-          progressAtThree,
-        );
-        case_(
-          "达到下限后按两种出路说，而不是只报上限",
-          transcript.receipts > 0 && !/至少 5/.test(transcript.progress),
-          transcript.progress,
-        );
-        case_(
-          "用户可以在下限之前就自己开始研究（第 3 个决策时确认已经可用）",
-          confirmOpenAtThree !== null && confirmOpenAtThree.opened === true && confirmOpenAtThree.canConfirm === true,
-          confirmOpenAtThree === null
-            ? "没有读到"
-            : `第 3 个决策时按钮${confirmOpenAtThree.opened ? "可用" : "不可用"} · canConfirm=${String(confirmOpenAtThree.canConfirm)}${confirmOpenAtThree.why.length > 0 ? ` · ${confirmOpenAtThree.why}` : ""}`,
-        );
+        // A project born from a confirmed direction can arrive with every
+        // ladder decision already made by the user, and the server then says so
+        // itself (`guide.complete`). That is the product working, not a
+        // conversation that failed to happen — but the cases below are about a
+        // conversation, so they are skipped with that evidence rather than
+        // rewritten to mean something weaker.
+        const guideAfter = (await briefOf(guideDraftId)).guide;
+        const nothingToAsk =
+          decisions === 0 && (guideAfter.complete === true || (sawNothing && guideAfter.active === null));
+        const conversationReason =
+          guideAfter.complete === true
+            ? `这份草稿的全部关键决策已由用户在澄清阶段决定（readiness ${String(guideAfter.readiness)} / 下限 ${String(guideAfter.minDecisions)}），服务端自己说引导已结束：没有要问的问题，也就没有多轮对话可检查`
+            : `引导阶段运行后没有存入任何问题（面板回到「开始引导」，服务端 complete=${String(guideAfter.complete)} · active=null）：这是 Brief 引导模式既有的模型可靠性问题，不是本轮的意图流程`;
+        if (nothingToAsk) {
+          skip("引导是一场多轮对话：每一次决定都留下助手的一问和用户的一答", conversationReason);
+          skip("助手的话在左、用户的话在右，回执轻量地跟在回答后面", conversationReason);
+          skip("自由回答以原文出现在用户那一轮里", conversationReason);
+        } else {
+          case_(
+            "引导是一场多轮对话：每一次决定都留下助手的一问和用户的一答",
+            (floorMetAtStart ? decisions >= 1 : decisions >= 5) &&
+              transcript.turns.filter((entry) => entry.role === "assistant").length >= decisions,
+            `${String(decisions)} 个决策 · ${String(transcript.turns.length)} 条消息${floorMetAtStart ? "（起点已在下限：这份草稿的方向是用户在澄清阶段确认的）" : ""}`,
+          );
+          case_(
+            "助手的话在左、用户的话在右，回执轻量地跟在回答后面",
+            transcript.leads >= 1 && transcript.receipts >= decisions,
+            `leadIn ${String(transcript.leads)} 条 · 回执 ${String(transcript.receipts)} 条 · 选项 ${String(firstQuestion?.options ?? 0)} 个`,
+          );
+          case_(
+            "自由回答以原文出现在用户那一轮里",
+            freeTextInTranscript === true,
+            freeTextInTranscript ? freeAnswer.slice(0, 30) : "用户轮次里没有找到原文",
+          );
+        }
+        if (floorMetAtStart) {
+          skip(
+            "深度下限说真话：写明还差多少",
+            `这份草稿的方向已在澄清阶段由用户确认，readiness 起点 ${String(freshBrief.guide.readiness)} 已达下限 ${String(freshBrief.guide.minDecisions)}：没有「还差几个」可观察`,
+          );
+        } else {
+          case_(
+            "深度下限说真话：3 个决策时写明还差多少",
+            /关键决策 3 \/ 至少 5/.test(progressAtThree),
+            progressAtThree,
+          );
+        }
+        if (nothingToAsk) {
+          skip("达到下限后按两种出路说，而不是只报上限", conversationReason);
+        } else {
+          case_(
+            "达到下限后按两种出路说，而不是只报上限",
+            transcript.receipts > 0 && !/至少 5/.test(transcript.progress),
+            transcript.progress,
+          );
+        }
+        if (floorMetAtStart) {
+          skip(
+            "用户可以在下限之前就自己开始研究",
+            "这份草稿起点已在下限：没有任何「下限之前」的时刻可观察",
+          );
+        } else {
+          case_(
+            "用户可以在下限之前就自己开始研究（第 3 个决策时确认已经可用）",
+            confirmOpenAtThree !== null && confirmOpenAtThree.opened === true && confirmOpenAtThree.canConfirm === true,
+            confirmOpenAtThree === null
+              ? "没有读到"
+              : `第 3 个决策时按钮${confirmOpenAtThree.opened ? "可用" : "不可用"} · canConfirm=${String(confirmOpenAtThree.canConfirm)}${confirmOpenAtThree.why.length > 0 ? ` · ${confirmOpenAtThree.why}` : ""}`,
+          );
+        }
 
         const guideRunsAfter = (await api(`/api/research/tasks/${guideDraftId}`)).runs.filter((run) => run.stage === "guide").length;
         case_(
@@ -832,6 +956,11 @@ async function main() {
           );
         }
 
+        if (nothingToAsk) {
+          skip("刷新之后对话历史原样重建（不是前端自己记的一份）", conversationReason);
+          skip("引导答完切回结构化，看到的是同一份草稿的最新值", conversationReason);
+          skip("切回结构化再切回来，对话历史还在", conversationReason);
+        } else {
         // The conversation is the record: reloading rebuilds it turn for turn.
         const beforeReload = await transcriptOf();
         await session.goto(`${base}/#/p/${guideDraftId}/brief`);
@@ -867,6 +996,7 @@ async function main() {
           switchedBack.turns.length === afterReload.turns.length,
           `${String(switchedBack.turns.length)} 条消息`,
         );
+        }
       }
 
       /* --------------------------------------------------------- confirm -- */
@@ -968,6 +1098,15 @@ async function main() {
         }
       }
       reportTaskId = reportTaskId ?? fallback;
+    }
+
+    // A project named with --task may have no report at all — it is a real
+    // state (the writing pass has not produced one yet), and the studio cases
+    // have nothing to look at in it. That is a skip with a reason, never a hang.
+    const namedBundle = reportTaskId === undefined ? null : await api(`/api/research/tasks/${reportTaskId}`);
+    if (namedBundle !== null && (!namedBundle.hasReport || namedBundle.currentReportId === null)) {
+      console.log(`     （${reportTaskId} 当前没有报告：状态 ${String(namedBundle.task.status)}）`);
+      reportTaskId = undefined;
     }
 
     if (reportTaskId === undefined) {

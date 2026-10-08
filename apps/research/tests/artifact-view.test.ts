@@ -320,6 +320,8 @@ function bundleFixture(): TaskBundle {
     currentReportHash: "hash",
     currentReportFrozen: false,
     hasReport: true,
+    documents: [],
+    intent: null,
     busy: false,
   };
 }

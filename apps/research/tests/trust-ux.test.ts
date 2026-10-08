@@ -260,6 +260,8 @@ function bundleFixture(overrides: Partial<TaskBundle> = {}): TaskBundle {
       waitingUntil: null,
     },
     activityLog: [],
+    documents: [],
+    intent: null,
     busy: false,
     ...overrides,
   };

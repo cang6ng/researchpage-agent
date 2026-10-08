@@ -16,7 +16,16 @@
 import { describe, expect, it } from "vitest";
 
 import { blockIsSynthesis, citationNumbersFor, claimChanges, firstClaimByNumber } from "../src/browser/claims.js";
-import { defaultViewOf, parseRoute, PRIMARY_NAV, projectHash, resolveView, VIEWS, VIEW_LABELS } from "../src/browser/routes.js";
+import {
+  defaultViewOf,
+  intentHash,
+  parseRoute,
+  PRIMARY_NAV,
+  projectHash,
+  resolveView,
+  VIEWS,
+  VIEW_LABELS,
+} from "../src/browser/routes.js";
 
 describe("the page's addresses", () => {
   it("opens the view a project URL names", () => {
@@ -65,6 +74,29 @@ describe("the page's addresses", () => {
     for (const view of VIEWS) {
       expect(parseRoute(projectHash("task_x", view))).toEqual({ kind: "project", taskId: "task_x", view });
     }
+  });
+
+  it("gives an exploration its own address rather than a view of a project", () => {
+    // Before a direction is confirmed there is no project to open, so an
+    // exploration cannot be a project view: it is the thing the reader reloads,
+    // keeps in a second window, or sends to themselves, and it has to mean the
+    // same thing each time.
+    expect(parseRoute("#/i/itn_1")).toEqual({ kind: "intent", intentId: "itn_1" });
+    expect(parseRoute(intentHash("itn_1"))).toEqual({ kind: "intent", intentId: "itn_1" });
+    expect(intentHash("itn_1")).toBe("#/i/itn_1");
+  });
+
+  it("does not mistake an exploration address for a project or the front page", () => {
+    expect(parseRoute("#/i")).toEqual({ kind: "start" });
+    expect(parseRoute("#/i/")).toEqual({ kind: "start" });
+    expect(parseRoute("#/p/itn_1")).toEqual({ kind: "project", taskId: "itn_1", view: null });
+  });
+
+  it("keeps the navigation at three workspaces with an exploration open", () => {
+    // The exploration is not a fourth workspace: it is where a reader is before
+    // there is a project to navigate around.
+    expect(PRIMARY_NAV).toEqual(["report", "research", "sources"]);
+    expect(VIEWS).not.toContain("intent");
   });
 });
 
