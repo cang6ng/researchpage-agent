@@ -43,7 +43,7 @@ import {
   needsAttention,
   reportContentOf,
 } from "@every-dagent/plugin-research";
-import type { ConversionManager, ConversionProblem } from "./conversions.js";
+import { publicProblem, type ConversionManager, type ConversionProblem } from "./conversions.js";
 import { exportRevisionPdf, exportTaskReportPdf, renderHtmlOf, revisionHtmlOf } from "./export.js";
 import { MINERU_FLASH_MAX_BYTES, MINERU_FLASH_MAX_PAGES } from "./mineru.js";
 import { presentationOf, researchProgressOf } from "./presentation.js";
@@ -1263,9 +1263,13 @@ export function createResearchRouter(
 
     // GET /api/research/mineru — is the converter actually reachable?
     //
-    // It answers with what the MCP server itself said (its name, version and
-    // tools), not with a guess from「uvx 在不在」. Asked by the workspace before
-    // it offers a conversion, and by anyone verifying this integration.
+    // It answers a real MCP conversation, not a guess from「uvx 在不在」: `ok`
+    // can only be true after this server has started the converter, heard its
+    // `initialize` and listed its tools. What it does *not* do is repeat what
+    // the converter said about itself — its self-reported name, version and
+    // tool names are the peer's own strings, and this is a browser's route. The
+    // published fields are this server's own, and `problem` is looked up by
+    // code in the same allowlist a failed job reads from.
     if (path === "/api/research/mineru" && method === "GET") {
       const status = await conversions.readiness();
       sendJson(response, status.ok ? 200 : 503, {
@@ -1275,8 +1279,6 @@ export function createResearchRouter(
           command: status.command,
           package: status.package,
           mode: status.mode,
-          server: status.server,
-          tools: status.tools,
           parseDocuments: status.parseDocuments,
           durationMs: status.durationMs,
         },
@@ -1289,7 +1291,7 @@ export function createResearchRouter(
           online: true,
           dataHandling: "文件会上传到 MinerU 的在线服务（mineru.net）解析；需要用户明确同意才会发起。",
         },
-        problem: status.problem,
+        problem: status.code === null ? null : publicProblem(status.code),
       });
       return;
     }

@@ -37,6 +37,18 @@
  * successful call; `--fail-handshake=<payload>` writes one to stderr and dies
  * before answering. `--marker=<path>` appends one line per tool call.
  *
+ * Three more options script the parts of a peer that are chosen by the *server*,
+ * not by the tool's answer — the metadata a client can read on a route that
+ * never converts anything:
+ *
+ * - `--server-name=<value>` / `--server-version=<value>` — the identity this
+ *   peer reports during `initialize`.
+ * - `--tool-names=a|b|c` — the tool list, verbatim. A name is the peer's own
+ *   string, so it can carry a credential, a URL or a path; `parse_documents`
+ *   being absent from the list is what makes the adapter report a missing tool.
+ * - `--extract-path=<value>` — the entry's `extract_path`, verbatim, whether or
+ *   not that path is inside the directory the adapter handed over.
+ *
  * `--markdown` overrides the Markdown it returns, so a test can put a known
  * string (or a known number of characters) into the library. Every successful
  * answer also carries a trailing comment naming the file it was handed and the
@@ -237,6 +249,11 @@ function answer(args) {
     entry["truncated"] = true;
     entry["extract_path"] = join(outputDir, "..", "..", "outside.md");
   }
+  // A path the peer names itself, believed by nothing: this is where a
+  // third-party process points at a file of its choosing — inside the working
+  // directory or nowhere near it.
+  const extractPath = option("extract-path", "");
+  if (extractPath !== "") entry["extract_path"] = extractPath;
   return {
     status: "success",
     results: [entry],
@@ -245,8 +262,19 @@ function answer(args) {
   };
 }
 
+/**
+ * The tool list, when a test names it.
+ *
+ * A tool name is the peer's own string, so a test can hand the client a list
+ * where every name would be a leak if the client ever echoed one back.
+ */
+const toolNames = option("tool-names", "");
 const tools = [];
-if (mode !== "no-tool") {
+if (toolNames !== "") {
+  for (const name of toolNames.split("|")) {
+    tools.push({ name, title: "", description: "", inputSchema: { type: "object", properties: {}, additionalProperties: false } });
+  }
+} else if (mode !== "no-tool") {
   tools.push({
     name: "parse_documents",
     title: "Parse documents to Markdown",
@@ -264,16 +292,16 @@ if (mode !== "no-tool") {
       additionalProperties: false,
     },
   });
+  tools.push({
+    name: "get_ocr_languages",
+    title: "List OCR language codes",
+    description: "Scripted stand-in for MinerU's get_ocr_languages.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  });
 }
-tools.push({
-  name: "get_ocr_languages",
-  title: "List OCR language codes",
-  description: "Scripted stand-in for MinerU's get_ocr_languages.",
-  inputSchema: { type: "object", properties: {}, additionalProperties: false },
-});
 
 const server = new Server(
-  { name: "fake-mineru-open-mcp", version: "0.0.1-test" },
+  { name: option("server-name", "fake-mineru-open-mcp"), version: option("server-version", "0.0.1-test") },
   { capabilities: { tools: {} }, instructions: "A scripted stand-in for mineru-open-mcp." },
 );
 

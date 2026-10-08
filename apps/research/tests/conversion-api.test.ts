@@ -283,9 +283,10 @@ describe("a conversion that works", () => {
 
     const call = settled["toolCall"] as Record<string, unknown>;
     expect(call["tool"]).toBe("parse_documents");
-    expect((call["server"] as Record<string, unknown>)["name"]).toBe("fake-mineru-open-mcp");
     expect(call["status"]).toBe("success");
     expect(call["fromFile"]).toBe(false);
+    // What the peer said about itself is not part of the record a client reads.
+    expect(Object.keys(call).sort()).toEqual(["contentChars", "durationMs", "fromFile", "inlineTruncated", "status", "tool"]);
 
     const conversion = settled["conversion"] as Record<string, unknown>;
     expect(conversion["trust"]).toBe("server_verified");
@@ -368,7 +369,10 @@ describe("a conversion that works", () => {
     expect(ready.status, JSON.stringify(ready.json)).toBe(200);
     const mineru = ready.json["mineru"] as Record<string, unknown>;
     expect(mineru["parseDocuments"]).toBe(true);
-    expect(mineru["tools"]).toContain("parse_documents");
+    // `parseDocuments` is the answer, and it was computed from a real
+    // `tools/list` — but the list itself is the peer's own strings, so it is
+    // not republished here.
+    expect(Object.keys(mineru).sort()).toEqual(["command", "durationMs", "mode", "package", "parseDocuments", "transport"]);
     expect(mineru["transport"]).toBe("stdio");
     expect(mineru["mode"]).toBe("flash");
     const limits = ready.json["limits"] as Record<string, unknown>;
@@ -542,10 +546,16 @@ describe("what the converter's refusals look like", () => {
     const noTool = await appWithMode("no-tool");
     try {
       const session = await newSession(noTool, "服务没有 parse_documents");
+      const readiness = await get(noTool, "/api/research/mineru");
+      expect(readiness.status).toBe(503);
+      // The sentence names the tool this product needs, never the ones the
+      // converter offered instead — those are the peer's own strings.
+      expect(readiness.json["problem"]).toBe("MinerU MCP 未提供所需的文档解析工具。");
       const created = await convert(noTool, { sessionId: session, filename: "paper.pdf" }, pdfBytes);
       const settled = await waitForJob(noTool, session, jobOf(created)["jobId"] as string);
       expect(settled["status"]).toBe("failed");
       expect((settled["failure"] as Record<string, unknown>)["code"]).toBe("mcp_tools_missing");
+      expect((settled["failure"] as Record<string, unknown>)["problem"]).toBe("MinerU MCP 未提供所需的文档解析工具。");
     } finally {
       await noTool.close();
     }

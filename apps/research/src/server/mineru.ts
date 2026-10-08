@@ -130,6 +130,17 @@ export interface MineruToolCall {
   readonly stderrTail: readonly string[];
 }
 
+/**
+ * How the converter answered a readiness probe.
+ *
+ * Its `server` and `tools` are what the peer *said* about itself — a name, a
+ * version and a list of tool names, each of them an arbitrary string chosen by
+ * a third-party process. They are kept here because they are what the probe
+ * learned (and what `parseDocuments` is computed from), and they are the reason
+ * this type is not serialized to a client as it stands: a route that publishes
+ * a status publishes an allowlist of it, with the reason as a `code` and the
+ * sentence looked up on the server side.
+ */
 export interface MineruStatus {
   readonly ok: boolean;
   readonly transport: "stdio";
@@ -139,7 +150,8 @@ export interface MineruStatus {
   readonly server: MineruServerInfo | null;
   readonly tools: readonly string[];
   readonly parseDocuments: boolean;
-  readonly problem: string | null;
+  /** Why the converter is not usable, when it is not. A code, not a sentence. */
+  readonly code: MineruFailureCode | null;
   readonly detail: string | null;
   readonly durationMs: number;
 }
@@ -371,9 +383,13 @@ async function withServer<T>(
       tools: listed.tools.map((tool) => tool.name),
     };
     if (!run.tools.includes(MINERU_TOOL)) {
+      // What the peer offers instead is an operator's question, so it is asked
+      // in `detail` (the server's own log) rather than in a sentence a client
+      // reads: a tool name is the peer's string, and it is the peer that chose
+      // whether it means a version mismatch or a credential.
       return failure(
         "mcp_tools_missing",
-        `MinerU MCP 服务没有提供 ${MINERU_TOOL} 工具（它提供的是：${run.tools.join("、") || "无"}）。这通常意味着安装的是另一个版本的 mineru-open-mcp。`,
+        `MinerU MCP 未提供所需的文档解析工具（${MINERU_TOOL} 缺失）。它通常意味着安装的是另一个版本的 mineru-open-mcp。`,
         `tools/list = ${run.tools.join(",")}`,
       );
     }
@@ -462,7 +478,7 @@ export async function probeMineru(settings: MineruSettings, signal?: AbortSignal
       server: null,
       tools: [],
       parseDocuments: false,
-      problem: run.problem,
+      code: run.code,
       detail: run.detail,
       durationMs: Date.now() - started,
     };
@@ -474,7 +490,7 @@ export async function probeMineru(settings: MineruSettings, signal?: AbortSignal
     server: answered.server,
     tools: answered.tools,
     parseDocuments: answered.tools.includes(MINERU_TOOL),
-    problem: null,
+    code: null,
     detail: null,
     durationMs: Date.now() - started,
   };

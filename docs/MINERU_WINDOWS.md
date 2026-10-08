@@ -80,9 +80,11 @@ uvx --from mineru-open-mcp==1.0.22 mineru-open-mcp --transport streamable-http -
 # 1) 转换器是否真的可用（会真的启动一次 MCP 服务并 tools/list）
 curl -s http://127.0.0.1:8791/api/research/mineru
 # → {"ok":true,"mineru":{"transport":"stdio","package":"mineru-open-mcp==1.0.22",
-#    "mode":"flash","server":{"name":"MinerU — SOTA PDF & Document Parser for AI Workflows",
-#    "version":"4.0.11"},"tools":["parse_documents","get_ocr_languages"],"parseDocuments":true},
-#    "limits":{...,"online":true,...}}
+#    "command":"...uvx...","mode":"flash","parseDocuments":true,"durationMs":1580},
+#    "limits":{...,"online":true,...},"problem":null}
+# `ok` 只有在真的起过转换器、听过它的 initialize 并列出工具之后才为 true。
+# 这个响应**不回传 MCP 自报的服务名/版本与工具名**（那是第三方进程自己选的字符串，
+# 进了浏览器就是一条数据出口）；想知道对方到底是谁，用上面第 1 节的手工命令看。
 
 # 2) 真实转换（把 PDF 换成你自己的文件；consent 是用户同意标记）
 curl -s -X POST \

@@ -97,6 +97,19 @@ export interface ConversionFailureView {
 }
 
 /**
+ * The tool's verdict, as a client may read it.
+ *
+ * The peer chooses the string it reports, so the published value is one of the
+ * three words the contract has and「unknown」for anything else. This is not a
+ * filter over the peer's text: it is a closed set with nowhere for text to go.
+ */
+export type PublicToolStatus = "success" | "partial_success" | "error" | "unknown";
+
+function publicToolStatus(raw: string): PublicToolStatus {
+  return raw === "success" || raw === "partial_success" || raw === "error" ? raw : "unknown";
+}
+
+/**
  * The sentences this server publishes, by code — an allowlist, not a filter.
  *
  * Everything the user is told is composed here from constants of our own, so
@@ -124,7 +137,7 @@ const PUBLIC_FAILURES: Readonly<Record<string, ConversionFailureView>> = Object.
   },
   mcp_tools_missing: {
     code: "mcp_tools_missing",
-    problem: "MinerU 服务没有提供文档转换所需的工具，转换无法执行。",
+    problem: "MinerU MCP 未提供所需的文档解析工具。",
     guidance: "服务端安装的 mineru-open-mcp 版本可能不对，请按部署说明确认版本后重试。",
   },
   mcp_disconnected: {
@@ -202,6 +215,18 @@ const PUBLIC_FAILURES: Readonly<Record<string, ConversionFailureView>> = Object.
 /** The answer for a code nobody taught this table, or for one that is missing. */
 const GENERAL_FAILURE: ConversionFailureView = PUBLIC_FAILURES["conversion_failed"] as ConversionFailureView;
 
+/**
+ * The sentence a client gets for a failure code — the only source of one.
+ *
+ * The readiness route publishes a `problem` too, and it publishes it through
+ * here rather than by passing the adapter's own text along: a converter's
+ * status is allowed to say more to an operator (its log, its detail) than it is
+ * allowed to say to a browser.
+ */
+export function publicProblem(code: string): string {
+  return publicFailure(code).problem;
+}
+
 /** What a client is allowed to read about a failed conversion. */
 function publicFailure(code: string): ConversionFailureView {
   return PUBLIC_FAILURES[code] ?? GENERAL_FAILURE;
@@ -270,21 +295,25 @@ export interface ConversionJobView {
     readonly trust: "server_verified";
   } | null;
   /**
-   * What the converter was asked to do and what it answered.
+   * What this server observed about the call, and nothing the peer chose.
    *
-   * The tool's identity, the server that answered, the timing and the size of
-   * the result — all of it this server's own observations. The *arguments* and
-   * the converter's log stay out of it: the first names paths on this machine,
-   * the second is the converter's own text (see `ConversionFailureView`).
+   * The fields are all this server's own: the tool it asked for, how long the
+   * call took, the size of the answer, whether the answer had to be completed
+   * from a file, and the tool's verdict read as one of a fixed set of words.
+   * What stays out is everything a third-party process authored: the arguments
+   * (paths on this machine), its log (see `ConversionFailureView`), the file it
+   * says its result was saved to (`extract_path` — a path, or a presigned URL
+   * that authorizes a download), and the name and version it reports for
+   * itself. Those are kept on the job record internally, where they are used —
+   * to read a controlled file, to classify a failure, to say whether the result
+   * came from one — but they are not serialized to a client.
    */
   readonly toolCall: {
     readonly tool: string;
-    readonly server: { readonly name: string; readonly version: string };
     readonly durationMs: number;
-    readonly status: string;
+    readonly status: PublicToolStatus;
     readonly contentChars: number | null;
     readonly inlineTruncated: boolean;
-    readonly extractPath: string | null;
     readonly fromFile: boolean;
   } | null;
   readonly failure: ConversionFailureView | null;
@@ -434,7 +463,7 @@ export function createConversionManager(options: ConversionManagerOptions): Conv
       server: call.server,
       tools: [call.tool],
       parseDocuments: call.tool === MINERU_TOOL,
-      problem: null,
+      code: null,
       detail: null,
       durationMs: call.durationMs,
     };
@@ -491,12 +520,10 @@ export function createConversionManager(options: ConversionManagerOptions): Conv
           ? null
           : {
               tool: job.toolCall.tool,
-              server: job.toolCall.server,
               durationMs: job.toolCall.durationMs,
-              status: job.toolCall.status,
+              status: publicToolStatus(job.toolCall.status),
               contentChars: job.toolCall.contentChars,
               inlineTruncated: job.toolCall.inlineTruncated,
-              extractPath: job.toolCall.extractPath,
               fromFile: job.fromFile,
             },
       failure: job.failure,
