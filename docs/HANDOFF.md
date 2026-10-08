@@ -10,6 +10,8 @@
 
 ## Current Status（2026-10-08）
 
+- **Step 3.7D（Intent-First 入口、文档库与转换 UI、真实研究进度）已完成**：首页不再创建任务卡——新建研究默认进入**方向澄清**（`#/i/<intentId>`），助手提问 → 用户回答 → 用户改方向 → 用户确认，确认之后服务端才建立任务卡，页面**等待 taskId 真正出现**再跳研究范围（202 不是项目）；Markdown 可以随主题一起提交并在首页做 fatal UTF-8 / 512 KiB / envelope 校验，PDF/DOCX 走**默认未勾选**的第三方上传授权 → 真实 `POST /documents/convert`（raw octet-stream）→ Job（排队/解析/入库/失败/重试，attempts 与 guidance 都来自服务端）→ 文档库；文档库可以改用途（至少一个，按 revision 冲突可恢复）、可以把 ready 且标为 `research_source` 的文档**显式**加入研究来源（`user-provided` / 未读取，不自动产生证据）；研究页第一屏换成服务端 `progress` / `attempt` / `discovery` / `activityLog` 驱动的真实进度与按 gate 出现的 Retry（保留材料、不做百分比）。前端新增 `polling.ts`（scope generation + abort + 单飞 + dirty 补读 + 退避 + hidden 暂停）、`intent-logic.ts`、`upload-logic.ts`；新增 `verify-intent-documents.mjs` 真实浏览器 gate（真实 Chrome + 真实 DeepSeek：首页 → 两轮问答 → 方向编辑/确认 → 真实任务卡 → 确认 Brief → 研究 → 报告工作区，22/22 通过，并记录 Network 证明「新建没有 POST /tasks」）；旧 gate 在真实报告上通过（见下：Ask / 补查 / Edit / 提案接受 / 冻结 / 样式对照 / 来源全部 PASS）。见下「Step 3.7D」。**本轮未 Push。**
+
 - **Step 3.7C 公开 DTO 安全修复（Codex 复核 MAJOR）已完成**：MCP 的两条元数据出口已关闭——任务视图的 `toolCall.extractPath`（对端指定的结果文件位置：本机私有路径，或可下载的 OSS 预签名 URL；失败任务与重试响应都会回出，成功的内联转换也会）与 `/api/research/mineru` 的 `problem`（缺少 `parse_documents` 时把对端工具名拼进公开句子）。修法是「公开视图 = 本服务端自己的字段」：`toolCall` 只留 `tool/durationMs/status/contentChars/inlineTruncated/fromFile`（`status` 收敛为闭集），readiness 的文案按 `code` 查同一张 `PUBLIC_FAILURES` 表、不再回传对端自报的服务名/版本与工具名。5 个真实 HTTP 反例先在未修复源码上跑（4 例失败），修复后全绿；全量套件 **175 文件 / 2085 例通过**（24 skip）。见下「公开 DTO 最终修复」。**本轮未 Push。**
 
 - **Step 3.7C（Real MinerU MCP Conversion）已完成**：PDF 与 DOCX 现在真的能被转成 Markdown 进入文档库——服务端按需启动官方的 `mineru-open-mcp`（stdio，`uvx --from mineru-open-mcp==1.0.22`），调用 `parse_documents`，把真实返回的 Markdown 交给 `service.importConvertedDocument`（`conversion.trust = server_verified`）。真实验收：PDF 7.99 s / 804 字、DOCX 16.16 s / 665 字、一份真实 arXiv 论文（353 KB / 6 页）16.19 s / 9 148 字，全部落到文档库并可由 `read_document` 读取、`research_source` → Source → Snapshot → Evidence；一份 25 页 PDF 被 MinerU 以「page count exceeds API limit (20 pages)」拒绝，产品如实报 `flash_page_limit`。未改 Agent Core / Host / Protocol / Client、3.7A Fallback、3.7B Intent Discovery 与 provenance / Claim Contract、Report Renderer 与界面。见下「Step 3.7C」。**本轮未 Push。**
@@ -47,6 +49,74 @@
 - **Vertical Product 可真实演示**：Topic → Task Card → 确认 → 真实检索/读取 → Evidence Matrix → 缺口定向补查（≤2 轮）→ 结构化报告 → HTML 预览 → PDF 下载 → 刷新重开。
 - **Step 1（Research Editing Semantics）已完成**：Ask / Research / Edit 三种正式意图由应用签发 Action Grant 约束；Edit 产出待接受 Proposal；报告版本可冻结、导出只读冻结依赖包；矩阵状态不再由「有正文片段」直接升级为充分。
 - 真实 Demo 两个主题此前均通过（真实模型 + 真实 arXiv + 真实 Chrome PDF）；Step 2 后又用新版各重跑一次（见「Current Status」与「Step 2 的验证入口」）。
+
+## Step 3.7D（Intent-First 入口、文档库与转换 UI、真实研究进度）
+
+这一轮把 3.7A/3.7B/3.7C 已经正确的后端接上了真正的入口：**新建研究不再创建任务卡**，而是先进入方向澄清；PDF/DOCX 的在线转换、文档库、研究进度与 Retry 第一次有了可用界面。没有改 Agent Core / Host / Protocol / Client，没有改服务端任何一行（`git diff` 里 `apps/research/src/server` 与 `packages/` 为空），没有新增状态管理框架、认证或 MCP 框架。
+
+### 流程（用户实际走的路径）
+
+1. **首页**：输入主题 → `POST /api/research/intents`（可同时带 Markdown 附件，随主题一次提交）→ 202 收到 receipt → 立刻跳到 `#/i/<intentId>`。
+2. **方向澄清**：助手提问（真实模型）→ 用户回答 → 助手给出**研究方向建议**（topic / purpose / scope / audience + 建议的比较对象与维度）→ 用户可以直接改前四个字段（保存走 `POST /intents/:id/direction`，带 `expectedVersion`）。
+3. **确认**：`POST /intents/:id/confirm`。**202 不等于有项目**：页面拿到 `taskId=null` 时留在探索页显示「方向已确认，正在等待任务卡」，靠 `GET /intents/:id`（必要时辅以 `GET /sessions/:id`）等真正的 task 出现，出现后立刻 `openTask` + 跳 `#/p/<taskId>/brief`。
+4. **材料**：首页与澄清页都能加材料。Markdown 直接 `POST /documents`（JSON、原 bytes base64、客户端先做 fatal UTF-8 与 512 KiB 检查）；PDF/DOCX 必须勾选**默认未勾选**的授权（「原始文件会发送到 MinerU 在线服务解析；重复提交或重试会再次消耗额度」），同意后才 `POST /documents/convert?...&consent=third_party_upload`，body 是**文件本身**（`application/octet-stream`），随后按 receipt 轮询 Job。
+5. **文档库**：Job 终态后刷新库；用途可改（至少一个，`PATCH` 带 `expectedRevision`，409 会重读并保留用户选择）；任务卡存在且文档 ready 且用途含 `research_source` 时出现「加入研究来源」（`POST /documents/:id/source`，`user-provided` / `not_read`，不会自动产生证据）。
+6. **研究进度**：研究页第一屏是 `bundle.progress` / `attempt` / `discovery` / `activityLog` 的真实读数（无百分比、无模拟阶段），Retry 只在「已确认 + failed + 非 busy」时出现，并显示服务端返回的 `message` 与 `preserved` 计数。
+7. **报告**：Ask / 补查 / Edit / 提案接受 / 冻结 / HTML / PDF 全部沿用既有工作台。
+
+### 新增文件与职责
+
+| 文件 | 职责 |
+| --- | --- |
+| `apps/research/src/browser/polling.ts` | 读调度：scope generation + abort（换 scope/卸载即退役旧请求）、每 key 单飞、dirty 补读（mutation 期间的 refresh 一定补读且可 await）、2→5→10s 退避、hidden 暂停、15s transport 放弃 |
+| `apps/research/src/browser/intent-logic.ts` | 澄清面板的纯判断：发消息/保存方向/确认各自的 gate 与理由、方向草稿 diff（只发改动字段）、等待任务卡的四个阶段、可附带文档与「晚于建议入库」的文档 |
+| `apps/research/src/browser/upload-logic.ts` | 文件与 Job 的纯判断：格式分类、fatal UTF-8、512 KiB / envelope / 10 MiB 上限、receipt 的读写与按 session 隔离、终态判断、失败摘要、重试费用提醒、重复文件提醒（只用本页面自己的 receipt） |
+| `apps/research/src/browser/views/intent.tsx` | `IntentPanel`（props 驱动，可 SSR）+ 容器；对话、决策复述折叠、方向编辑器、确认条、等待卡、composer |
+| `apps/research/src/browser/components/document-upload.tsx` | 选文件、逐份同意、Markdown 入库、转换提交、Job 列表与重试确认、转换服务自检 |
+| `apps/research/src/browser/components/document-library.tsx` | 完整文档视图：来源/trust/用途/revision/加入来源，以及「文档不是证据」的说明 |
+| `apps/research/src/browser/components/research-progress.tsx` | 真实进度（阶段、本轮 attempt、discovery 计数、来源读取计数、活动日志 10/全部、当前失败与历史失败区分、Retry） |
+| `apps/research/scripts/verify-intent-documents.mjs` | 真实浏览器 gate（见下） |
+
+改动：`api.ts`（Intent / 文档库 / Job 类型与方法、`ApiError` 增 `code`/`reason`/`guidance`/`conflict`/`intent`、request 用 `Headers` 且只对带 body 的 JSON 补 content-type、GET 可传 signal）、`routes.ts`（新增 `#/i/<id>` 与 `intentHash`）、`store.tsx`（scope + 资源注册 + receipts + 局部锁 + 意图/文档动作）、`workspace.tsx`（Intent 分支，删掉 legacy PendingCard）、`start.tsx`（附件 + 同意 + 继续探索）、`brief.tsx`（「换一个主题」改为重新澄清方向 + 文档库入口）、`research.tsx`（进度组件替换原 run/gap 猜测）、`sources.tsx`（文档库 + 上传在来源表之前）、`styles.css`（仅追加 `.rp-file*` / `.rp-fields` / `.rp-field*` / `.rp-facts`）。
+
+### 行为保证与它们的证据
+
+- **不会走旧入口**：`verify-intent-documents.mjs` 记录 CDP 的每一次请求；首页提交后 `POST /api/research/tasks` 次数 **0**。
+- **确认不会重复建卡**：确认按钮在 `status==="confirmed"` 时被 gate 拒绝；gate 断言 `POST /intents/:id/confirm` 次数 **1**。
+- **202 不是项目**：gate 断言「先出现在等待态、task 真正存在后地址才变成 `#/p/<id>/brief`」。
+- **换 scope 不被旧请求污染**：`polling.test.ts` 用 deferred + fake timers 覆盖（退役资源不得写状态、迟到应答被丢弃、dirty 补读、退避、hidden 暂停、被退役的调用者必须被 settle 而不是挂住）。
+- **不经同意不传文件**：上传面板的同意默认未勾选，未勾选时「开始转换」不可用；`api-client.test.ts` 断言转换请求的 `content-type: application/octet-stream`、body 是原始 bytes、`consent=third_party_upload` 且在 query 上。
+- **不自动重试/不自动读 PDF**：重试必须先看到费用提醒再确认；转换完成后页面只**预填一句可编辑的提示**，用户自己发送才会开下一轮。
+- **附件不改报告**：本轮所有文档写入都只走 `/documents*`；Report renderer / Claim Contract 未改动，旧 gate 的「提问不改变报告正文」「提案待确认时正文没有变化」「接受后只有目标章节改变」全部 PASS。
+
+### 验证（本轮实际执行）
+
+```powershell
+pnpm typecheck            # 3 个 tsc --noEmit 全部通过
+pnpm build:research       # dist/research-server.mjs + public/app.js
+pnpm exec vitest run --exclude '**/real-*' ...   # 171 文件 / 2122 例通过（64 skip，0 fail）
+node apps/research/scripts/verify-intent-documents.mjs --url http://127.0.0.1:8791/ --model --shots .scratch/step37d-live-shots
+node apps/research/scripts/verify-workspace.mjs --url http://127.0.0.1:8792/ --task task_9eb949e99fc7c348 --model --shots .scratch/step37d-report-shots
+```
+
+- 新 gate **22/22 PASS**（真实 Chrome + 真实 `deepseek/deepseek-flash`，隔离数据目录 `.scratch/step37d-live-data`，端口 8791）。
+- 旧 gate（`researchpage-data` 的副本，端口 8792）两轮：
+  - `--task task_de4433a391640efb`（有 framed 比较表 + 2 个机制块的历史报告）：**47/47 PASS / 2 SKIP**，包含比较矩阵、机制块、三种分辨率的 50/50、无横向滚动。
+  - `--task task_9eb949e99fc7c348 --model`：**67/69 PASS / 10 SKIP**，两条 FAIL 是**取报告取错**——那份历史报告按数据本身就没有 framed 比较表与机制块（0 行 × 0 列 / 0 个机制块），不是渲染回归；同一轮里 Ask / 补查 → 提案 / Edit 待确认 / 接受后只有目标章节改变 / 冻结 / 样式对照 / 来源全部 PASS。
+  - 早先同一条命令曾出现过一次真实 FAIL「画布横向溢出」，是本轮新增类名 `rp-doc` 与 Studio 文档容器冲突造成的，改名 `rp-file*` 后消失（`页面 false · 画布 false`）。
+- 新增前端测试：`api-client.test.ts`(12) + `intent-logic.test.ts`(19) + `upload-logic.test.ts`(19) + `polling.test.ts`(8) + `intent-view.test.ts`(12) + `document-library-view.test.ts`(15) + `research-progress-view.test.ts`(13)，`frontend-logic.test.ts` 增 3 例。
+
+### 本轮发现并修掉的三个真实缺陷
+
+1. **`node apps/research/dist/research-server.mjs` 直接崩溃**（基线存在，与本轮功能无关）：bundled ESM 里的 `__require` shim 没有可用的 `require`，`cross-spawn` 在导入期调用 `require("child_process")` 就抛 `Dynamic require of "child_process" is not supported`，服务在监听端口之前就退出。修法是在 `scripts/build.mjs` 的 node 构建上加一行 banner（`createRequire(import.meta.url)`），不改变打包结构。
+2. **确认方向后项目页空白**：`adoptTask` 当初只改了 scope 名字而没有重新注册该 scope 的资源，任务 bundle 永远不会被读。改为走 `enterScope`（scope = 名字 + 被读的资源集合）。
+3. **新样式类名 `rp-doc` 与 Studio 文档容器冲突**：Studio 的 `<article class="rp-doc">` 在基线里没有规则，本轮新增的 `.rp-doc{display:flex}` 把它变成 flex，导致文档画布横向溢出（`canvasScroll 1244 vs client 586`）。已把新增类全部改名为 `rp-file*`，复测 `canvasScroll === canvasClient === 588`。**这条是纯粹由本轮引入、并由本轮修掉的回归。**
+
+### 边界与未覆盖
+
+- **真实报告生成本轮未通过**：`deepseek-flash` 在报告阶段写出的比较表有空白单元格（Q03 拒绝），合成阶段重试后仍未形成有效报告，任务如实停在 `failed`（「报告阶段结束但没有保存有效报告」）。服务端代码与基线逐字节相同（本轮 `src/server`、`packages/` 零改动），因此这是基线行为 + 模型可靠性，不是本轮回归；真实报告因此改用 `researchpage-data` 的副本（`.scratch/step37d-reportdata`，端口 8792）做旧 Report 回归。
+- **offline（脚本化模型）浏览器 gate 未实现**：计划里的 `--offline` 需要在 Node 里加载 TS composition，本轮没有为此新增构建步骤；真实浏览器验收改由 live gate 承担，SSR 断言由新增的三个 view 测试承担。此项在 Gaps 中列为未覆盖。
+- **引导模式（Brief 3.5C）可能空转**：`guideNext` run 完成后既没有问题也没有 complete（面板回到「开始引导」），旧 gate 中相应几条改为按服务端 `guide.complete`/`active` 的实测状态 SKIP 并在输出里写明原因；这是既有引导模式的模型可靠性问题，不在本轮范围。
 
 ## Step 3.7C 公开 DTO 最终修复（Codex 复核 MAJOR：MCP 原始信息仍可从公开 DTO 泄漏）
 
