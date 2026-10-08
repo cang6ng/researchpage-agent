@@ -16,6 +16,7 @@ import { join } from "node:path";
 
 import type { ModelClient, ModelEvent, ModelMessage, ModelRequest, RuntimeContext } from "@every-dagent/agent-core";
 import { DEFAULT_MODEL_FRAMING } from "@every-dagent/agent-core";
+import { UNTRUSTED_DOCUMENT_NOTE } from "@every-dagent/plugin-research";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { startResearchApp, type ResearchApp } from "../src/server/composition.js";
@@ -464,6 +465,35 @@ describe("a table of contents cannot spend the model's context", () => {
     expect(instruction).toContain("目录");
     expect(instruction).toContain("只列出前");
     expect(instruction).toContain("不可信数据");
+  }, 60_000);
+
+  it("carries a short document to the model whole, and marks the text as data once", async () => {
+    // The other end of the same budget: a document that fits is not cut for the
+    // sake of a sentence about being cut, and the model is told it has all of it.
+    const body = "短文档正文".repeat(8);
+    expect(body.length).toBe(40);
+    const created = await post("/api/research/intents", {
+      seedTopic: "一个很短的材料",
+      documents: [{ filename: "short.md", content: `# Short\n\n${body}` }],
+    });
+    expect(created.status, JSON.stringify(created.json).slice(0, 300)).toBe(202);
+    const documentId = (created.json["documents"] as readonly { documentId: string }[])[0]?.documentId ?? "";
+
+    await waitFor(
+      () => Promise.resolve(seenInstructions.some((text) => text.includes(documentId))),
+      "the first instruction for this short document",
+    );
+    const instruction = seenInstructions.find((text) => text.includes(documentId) && text.includes("这是一段对话，不是问卷")) ?? "";
+    expect(instruction.length).toBeGreaterThan(0);
+    // Every character of the body reached the model, and the line says the
+    // fragment is the whole document rather than a partial read.
+    expect(instruction).toContain(body);
+    expect(instruction).toContain("本次片段已包含全文");
+    expect(instruction).not.toContain("部分读取，不要当成读完了全文");
+    // The sentence that makes the file's contents data rather than instruction is
+    // written exactly once — it is not appended beside the budget as well as
+    // inside it.
+    expect(instruction.split(UNTRUSTED_DOCUMENT_NOTE).length - 1).toBe(1);
   }, 60_000);
 });
 

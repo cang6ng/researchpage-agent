@@ -893,11 +893,14 @@ function sectionOwner(outline: readonly DocumentHeading[], charIndex: number): D
  * The bound is on the *answer*, not on the paragraphs it quotes: `maxChars`
  * covers the fragments, the outline and the sentences that explain them
  * together, and it is spent exactly — `readChars + outlineChars + note.length ≤
- * maxChars`, with no floor raising a small budget to a comfortable one. A
- * paragraph longer than what is left is cut at a real position in the user's
- * text (never padded, never merged) and marked `truncated`; a budget too small
- * for the sentences carries fewer words, not more characters. That is the whole
- * reason this function exists in the library rather than in the caller: a
+ * maxChars`, with no floor raising a small budget to a comfortable one. It is
+ * also spent in that order of preference: a read whose complete answer fits
+ * returns the whole document and says `full`, because cutting text to make room
+ * for a sentence about cutting is how a limit does damage it was never meant to
+ * do. A paragraph longer than what is left is cut at a real position in the
+ * user's text (never padded, never merged) and marked `truncated`; a budget too
+ * small for the sentences carries fewer words, not more characters. That is the
+ * whole reason this function exists in the library rather than in the caller: a
  * 100,000-character paragraph must not be able to answer a 400-character request
  * with all of itself, and neither must a 100,000-character heading.
  */
@@ -996,33 +999,71 @@ export function readDocument(input: {
   };
 
   /**
-   * What the fragments may cost, once the outline and the sentences about them
-   * are paid for.
+   * What the fragments may cost in the fallback path, where the sentences about
+   * them are paid for out of the same budget.
    *
    * The strategy's sentence is reserved in the longest wording it can be written
    * in — its counts are at their largest before the fit — so the room is known
    * before a fragment is chosen, and the answer cannot end up over budget
-   * because a sentence turned out longer than expected. The sentence finally
-   * written names smaller numbers and is bounded by the room the fragments
-   * really left.
+   * because a sentence turned out longer than expected. It is capped at half of
+   * what the status sentence leaves, though: an answer that spends its whole
+   * budget saying「只返回了前 3 段」and returns no text has explained nothing, so
+   * the explanation may never cost more than the text it explains and gives way
+   * first on a budget too small for both. Slack in this reservation is safe;
+   * overflow is not.
    */
-  const contentBudget = (strategySentence: AnswerSentence | null): number =>
-    Math.max(
-      0,
-      asked -
-        outline.chars -
-        sentencesRoom(
-          {
-            complete: false,
-            readChars: asked,
-            totalChars: input.parsed.text.length,
-            opening: false,
-            outline,
-            strategy: strategySentence,
-          },
-          outlineRoom,
-        ),
-    );
+  const contentBudget = (strategySentence: AnswerSentence | null): number => {
+    const facts = {
+      complete: false,
+      readChars: asked,
+      totalChars: input.parsed.text.length,
+      opening: false,
+      outline,
+    };
+    const statusRoom = sentencesRoom({ ...facts, strategy: null }, outlineRoom);
+    const room = Math.max(0, asked - outline.chars - statusRoom);
+    if (strategySentence === null) return room;
+    const explanation = sentencesRoom({ ...facts, strategy: strategySentence }, outlineRoom) - statusRoom;
+    return Math.max(0, room - Math.min(explanation, Math.floor(room / 2)));
+  };
+
+  /**
+   * What a complete answer would cost, measured before anything is cut.
+   *
+   * A budget exists to lose as little as possible inside it, so the first
+   * question each strategy asks is not「how do I cut this to fit」but「does all of
+   * it fit」: the paragraphs this strategy would return, the outline, and the
+   * sentence the answer really writes when it is complete — no truncation
+   * sentence, because nothing is being left out, and no room held for one. When
+   * that sum is inside `maxChars` the answer is the whole thing, and `scope`
+   * says `full`; only when it is not does the reader fall back to fitting
+   * fragments against a budget the explanation has to fit in too.
+   */
+  const fullReading = (candidates: readonly Paragraph[]): { readonly text: number; readonly whole: boolean; readonly room: number } => {
+    const text = candidates.reduce((sum, paragraph) => sum + paragraph.text.length, 0);
+    // The same truth `settle` will compute, from the same counts: a complete
+    // answer here means every paragraph of the document came back whole.
+    const whole = candidates.length === paragraphs.length && text === input.parsed.text.length && !input.parsed.truncated;
+    return {
+      text,
+      whole,
+      room: writeSentences(
+        answerSentences({
+          complete: whole,
+          readChars: text,
+          totalChars: input.parsed.text.length,
+          opening: false,
+          outline,
+          strategy: null,
+        }),
+        Number.MAX_SAFE_INTEGER,
+      ).length,
+    };
+  };
+
+  /** The fragments' budget when all of them fit with the sentences that describe them. */
+  const fullBudget = (full: { readonly text: number; readonly room: number }): number | null =>
+    outline.chars + full.text + full.room <= asked ? asked - outline.chars - full.room : null;
 
   /** Paragraphs are added while they fit whole; the first one may be clipped. */
   const fit = (candidates: readonly Paragraph[], windowOf: (paragraph: Paragraph) => number, budget: number): readonly DocumentFragment[] => {
@@ -1050,14 +1091,16 @@ export function readDocument(input: {
   if (input.request.paragraphIndex !== undefined) {
     const paragraph = paragraphs.find((candidate) => candidate.index === input.request.paragraphIndex);
     if (paragraph === undefined) return settle("paragraph", [], null);
-    // The sentence is reserved from the paragraph and the budget rather than
-    // from the fragment, so its room is known before the fit and its numbers are
-    // upper bounds: a paragraph longer than everything the answer has will be
-    // cut, and a shorter one writes a shorter sentence or none at all.
+    // A paragraph that fits — with the sentence that says the read is complete —
+    // is returned whole; only when it does not does the answer become a located
+    // window with a sentence about where that window is. This line is only
+    // reached in that second case, so the sentence is reserved: the paragraph is
+    // certainly longer than what is left, and its numbers are upper bounds.
+    const complete = fullBudget(fullReading([paragraph]));
+    if (complete !== null) return settle("paragraph", fit([paragraph], () => 0, complete), null);
     const most = Math.max(0, asked - outline.chars);
     const from = sourceOffsetOf(paragraph);
-    const reserved =
-      paragraph.text.length > most ? clippedParagraphSentence(paragraph.text.length, from, from + most) : null;
+    const reserved = clippedParagraphSentence(paragraph.text.length, from, from + most);
     const fragments = fit([paragraph], () => 0, contentBudget(reserved));
     const first = fragments[0];
     return settle(
@@ -1076,7 +1119,12 @@ export function readDocument(input: {
       (paragraph) => paragraph.charStart >= heading.charStart && paragraph.charEnd <= Math.max(heading.charEnd, heading.charStart),
     );
     const offered = inside.slice(0, MAX_DOCUMENT_FRAGMENTS);
-    const fragments = fit(offered, () => 0, contentBudget(sectionSentence(inside.length, offered.length)));
+    const complete = fullBudget(fullReading(offered));
+    const fragments = fit(
+      offered,
+      () => 0,
+      complete ?? contentBudget(sectionSentence(inside.length, offered.length)),
+    );
     return settle(
       "section",
       fragments,
@@ -1137,7 +1185,8 @@ export function readDocument(input: {
       spread.push(paragraph);
       if (spread.length >= MAX_DOCUMENT_FRAGMENTS) break;
     }
-    const fragments = fit(spread, () => 0, contentBudget(spreadSentence(spread.length, paragraphs.length)));
+    const complete = fullBudget(fullReading(spread));
+    const fragments = fit(spread, () => 0, complete ?? contentBudget(spreadSentence(spread.length, paragraphs.length)));
     return settle(
       "spread",
       fragments,
@@ -1145,7 +1194,8 @@ export function readDocument(input: {
     );
   }
 
-  const fragments = fit(picked, matchWindow, contentBudget(matchSentence(picked.length, picked.length)));
+  const complete = fullBudget(fullReading(picked));
+  const fragments = fit(picked, matchWindow, complete ?? contentBudget(matchSentence(picked.length, picked.length)));
   return settle("match", fragments, fragments.length < picked.length ? matchSentence(picked.length, fragments.length) : null);
 }
 

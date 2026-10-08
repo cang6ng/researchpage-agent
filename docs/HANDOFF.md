@@ -10,6 +10,8 @@
 
 ## Current Status（2026-10-08）
 
+- **Step 3.7B F4 短文档回归修复（Full-first / Partial-fallback）已完成**：第四次复核确认字符预算硬上限本身成立，但指出严格化带来的反向伤害——预算先为「截断说明」留位，再问要不要截断，于是「40 字正文 + 一个标题」的文档在 `maxChars=100` 时返回 38 / 35 / 34 字（默认 / 关键词 / 章节策略）并标成 `partial`，而完整结果只需 58 字。本轮只改这一个决策点：四种策略现在先算「完整答案真实需要多少字」（正文 + 目录 + 完整状态下真正会写的那句话），放得下就整篇返回、`scope=full`、不写任何截断说明；放不下才回到截断记账，并且说明不得贵过它解释的正文（不超过剩余空间的一半）。实测：`maxChars=100` 四种策略都返回全部 40 字且 `scope=full`；`58` 字（真实成本）恰好完整、`57` 字转为 partial；`0/1/10/30` 仍严格不超预算；长文档 100/200 的硬上限、partial 与原文定位均无回归；真实 runner 指令里短文整篇到达模型且不可信声明只出现一次。未放宽任何断言、未重新引入 `Math.max(200, maxChars)`。见下「Step 3.7B F4 短文档回归修复」。
+
 - **Step 3.7B F4 最终修复（`maxChars` 硬上限）已完成**：第三次复核只盯一件事——上一轮对 F4 的修复不彻底：`readDocument` 把预算强制抬高到 200（`maxChars=100` 的读取实际返回 170–199 字）、Context 块在预览之外追加了 100 字的不可信声明（`maxChars=100/200` 的块实际 200/301 字），而当时的测试断言没有覆盖这两处。本轮把口径收紧为「整份回答（正文 + 目录 + 截断提示 + 其它说明 + 分隔符）≤ 调用方给的 `maxChars`」：取消一切下限强制扩容，四种读取策略与预览 / Context 统一按「目录 → 回答自身的句子 → 正文」记账，句子放不下就用短语或整句省略（信息由 `scope` / `truncated` / `complete` / `outlineTruncated` 承载），Context 的不可信声明计入同一份 share。10 万字标题 + 10.8 万字正文实测：`maxChars=100` 时 Preview 99 / Context 99 / 四种读取 68–97 字，`maxChars=200` 时 Preview 199 / Context 200 / 读取 169–198 字（修复前为 174 / 200 / 301），原文定位与 `scope=partial` 语义不变。未改 F1/F2/F3/F5/F6、未重构文档库、未动前端 / Agent Core / Host / Protocol / Client、未进 MinerU。见下「Step 3.7B F4 最终修复」。
 
 - **Step 3.7B 收尾修复（复核剩余三项）已完成**：第二次复核在 3.7B Repair 之后又证实三项，本轮只关这三项——`GET /documents?sessionId=B&intentId=<A 的探索>` 会返回 A 的文档、`POST /documents/<A 的文档>/source?sessionId=B`（body 带 A 的 `taskId`）会成功建立来源（多作用域声明只被读取一项）；10 万字标题让 `maxChars=100/200` 的目录返回 208 字而正文拿到 0 字（`boundedOutline` 的第一条不受预算约束）；`POST /intents` 附带超过 512 KiB 的 Markdown 返回 400 而不是 413（服务层算出的 `document_too_large` 在路由处被丢掉）。分别按「所有入口统一收集全部作用域声明并交叉验证，冲突即 403」/「第一条目录同样遵守预算，且回答自身的句子计入预算」/「用同一个 `sendRefusal` 映射，拒绝不留半成品」修完，并新增 8 个反例测试（Service + 真实 HTTP + 真实任务）。未重写文档库、未改 Intent Discovery、未进 MinerU、未动前端。见下「Step 3.7B 收尾修复」。
@@ -204,6 +206,51 @@
 - **多段落文档的 `scope` 口径未改**：`scope=full` 的判定是 `readChars === parsed.text.length`，而 `readChars` 只累计段落文字、不含段落之间的空行，因此一个「所有段落都返回了」的多段文档仍然报 `partial`（收尾轮之前就是这个行为，本轮未改动，也不在 F4 范围内）。单段文档、以及 `preview.complete` 的判定都不受此影响。
 - **极小预算是「简短」而不是「聪明」**：`maxChars=100` 对 10 万字标题的文档，先保证目录与那句话，正文只剩几到几十个字；这是预算本身的结论，不是新的截断逻辑。
 - **`maxChars` 仍然是 bearer 范围内的自我约束**：它保护的是「调用方给模型/自己准备的额度」，不是服务端的资源上限（真正的内容上限仍是 512 KiB / 20 份）。
+
+## Step 3.7B F4 短文档回归修复（Full-first / Partial-fallback）
+
+第四次复核确认硬上限本身成立（0/1/10/40/60/100/200 都不再超限、Runner 无重复追加、长文档 partial 与定位正确），但发现严格化引入的**反向伤害**：预算在问「要不要截断」之前就先为「截断说明」留了位。40 字正文 + 一个标题的文档，完整结果只要 58 字，`maxChars=100` 时却返回 38 / 35 / 34 字（默认 / 关键词 / 章节策略）并标成 `partial`——被挤掉的正是本来能完整返回的正文。本轮只改这一个决策点。
+
+### 1. 根因
+
+- 四种策略在 fit 之前统一按 `contentBudget(...)` 拿预算，而它先把「本次只返回了前 N 段」「长段落：…」这类**说明**按最长措辞预留出去。短文档里这些句子**根本不会被写出**（没有东西被丢下），预留却是实打实的：正文因此少拿 22–27 字，40 字的短文被切成 34–38 字，`scope` 也从 `full` 掉成 `partial`。
+- 边界也随之失真：完整结果的真实成本是 58 字，但 `maxChars=58..69` 全部报 `partial`，只有到 70 才「恰好」完整返回——「差 1 字放不下」其实差的是十几字。
+
+### 2. 修复：先问「整份放得下吗」，放不下才进入截断记账
+
+- **`fullReading(candidates)`**：在动刀之前算出完整答案的真实成本——该策略会返回的段落文字 + 目录 + **完整状态下真正会写的那句话**（完整时是「已读取全文（N 字）」，不是「只读取了…」），并用 `writeSentences(..., MAX_SAFE_INTEGER)` 实测句子长度，而不是估上限。`whole` 的判定与 `settle` 用同一组计数，因此不会出现「预算内说 full、结构字段说 partial」的分裂。
+- **`fullBudget(full)`**：`目录 + 正文 + 说明 ≤ maxChars` 时返回「正文可以拿到的全部空间」；四种策略（default / question / section / paragraph）都先走这一条，命中即整篇返回、不写任何截断说明、`scope=full`、`truncated=false`。只有返回 `null` 时才回落到原来的 `contentBudget(...)` 记账。
+- **说明不得贵过它解释的正文**：回落路径里那句「本次只返回了前 N 段」最多只能拿走「状态句之后剩余空间」的一半——否则会出现「59 字预算下正文 0 字、只写了一句『只读取了 0 字』」这种解释了什么都没解释的答案（本轮实现过程中确实出现过，已由这条规则消除：现在同样预算下正文 12 字，且随预算单调）。空间太小就先丢掉说明，`scope` / `truncated` / `sourceStart/sourceEnd` 仍把事实说全。
+- **没有放宽任何断言**：`text + outline + note ≤ maxChars` 仍然成立（`maxChars=0/1/10/30/40/60/100/200` 全部满足），也没有重新引入 `Math.max(200, maxChars)`。
+
+### 3. 实测（`# Short` + 40 字正文）
+
+| 预算 | 默认 / 关键词 / 章节 / 段落策略 | scope | 说明 |
+| --- | --- | --- | --- |
+| 100（修复前） | 38 / 35 / 34 / 40 字 | partial（前三个） | 完整结果只需 58 字 |
+| 100（修复后） | 40 / 40 / 40 / 40 字 | **full** | 总量 58 字，未用满预算 |
+| 57 / 58（修复后） | 11 字（partial）/ 40 字（**full**） | 按真实成本切换 | 恰好放得下才完整，差 1 字就 partial |
+| 0 / 1 / 10 / 30（修复后） | 0 / 1 / 5 / 6 字 | partial | 仍严格 ≤ 预算 |
+
+长文档（10.5 万字标题 + 10.8 万字正文）无回归：`maxChars=100` 时 Preview 99 / Context 99 / 四种读取 82 字；`maxChars=200` 时 Preview 199 / Context 200 / 读取 169–198，全部 `scope=partial`、`truncated=true`、`located=true`。
+
+### 4. 本轮新增测试（3 例）
+
+先在**未打补丁**的源码上跑过（`git stash push -- documents.ts`），失败信息为 `spread: expected 38 to be 40` 与 `expected 'partial' to be 'full'`；恢复补丁后全部通过。
+
+- `packages/plugin-research/tests/documents-repair.test.ts`（+2）：「短文档整篇返回」——四种策略在 `maxChars=100` 下都返回全部 40 字、`scope=full`、`truncated=false`、说明含「已读取全文」且不含「部分读取」、片段不截断、`sourceStart/sourceEnd` 精确、总量 ≤ 100；「只在真的放不下时才截断」——从完整读取反推真实成本，断言 `cost / cost+1 / 100` 都完整、`cost-1` 转为 partial 且 ≤ 预算、`1 / 10 / 30` 也 partial 且有界，Preview 在 `cost` / `cost-1` 上同样切换。
+- `apps/research/tests/document-isolation.test.ts`（+1，真实 HTTP + 真实 runner）：短文随主题提交后，模型真正收到的指令里包含全部 40 字正文与「本次片段已包含全文」，不含「部分读取」，且不可信声明**只出现一次**（没有一边计预算、一边旁挂）。
+- 既有 F4 严格套件（长文档 100/200/600/1500、极小预算、Context 块总量）全部保留并通过。
+
+### 5. 本轮改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `packages/plugin-research/src/documents.ts` | `fullReading` / `fullBudget`（先试完整、命中即整篇返回）、`contentBudget` 改为回落路径并对说明设「不超过剩余空间一半」的上限、四种策略接入同一条优先路径 |
+| `packages/plugin-research/tests/documents-repair.test.ts` | 新增 2 例短文档回归（含边界预算与 Preview 一致性） |
+| `apps/research/tests/document-isolation.test.ts` | 新增 1 例真实 runner 端到端（短文整篇到达模型 + 不可信声明只出现一次） |
+
+未改动：`service.ts` / `routes.ts` / `tools.ts` / 前端 / Agent Core / Host / Protocol / Client、F1 / F2 / F3 / F5 / F6 的关闭项、Intent Discovery、MinerU 契约。
 
 ## Step 3.7B 新增（本次工作产物）
 

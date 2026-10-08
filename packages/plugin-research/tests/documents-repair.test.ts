@@ -24,6 +24,7 @@ import {
   MAX_DOCUMENT_BYTES,
   MAX_DOCUMENT_EXCERPT_CHARS,
   MAX_DOCUMENT_OUTLINE_CHARS,
+  UNTRUSTED_DOCUMENT_NOTE,
   createResearchService,
   documentPreview,
   openResearchRepository,
@@ -730,8 +731,11 @@ describe("a heading longer than the budget cannot spend the budget", () => {
       if (block === undefined) throw new Error("no context block");
       expect(blockChars(block), `context ${maxChars}`).toBeLessThanOrEqual(maxChars);
       expect(block.complete).toBe(false);
-      // The block's own sentence is inside the budget rather than appended to it.
+      // The block's own sentence is inside the budget rather than appended to it,
+      // and the sentence that marks the text as data is written once — not once
+      // inside the budget and once beside it.
       expect(block.note.length, `context ${maxChars}`).toBeLessThanOrEqual(maxChars);
+      expect(block.note.split(UNTRUSTED_DOCUMENT_NOTE).length - 1, `context ${maxChars}`).toBeLessThanOrEqual(1);
     }
   });
 
@@ -822,6 +826,128 @@ describe("a heading longer than the budget cannot spend the budget", () => {
     // is not, so the section it names can still be found in the file.
     expect(heading.text.length).toBeLessThan(LABEL.length);
     expect(document.slice(heading.titleStart, heading.titleEnd)).toBe(LABEL);
+  });
+});
+
+/**
+ * The regression the third review found inside the strict budget: room was
+ * reserved for「本次只返回了前 N 段」*before* asking whether anything was going to
+ * be left out, so a document that fits — 40 characters of text under one heading
+ * inside a 100-character budget — came back cut to 34–38 characters and marked
+ * `partial`. Enforcing a budget must not mean spending it on sentences about a
+ * truncation that never happened.
+ */
+describe("a document that fits the budget is returned whole", () => {
+  const BODY = "短文档正文".repeat(8);
+  const SHORT = `# Short\n\n${BODY}`;
+
+  /** Everything a bounded read carries: the fragments, the outline, its own sentences. */
+  function readChars(read: { readonly readChars: number; readonly outlineChars: number; readonly note: string }): number {
+    return read.readChars + read.outlineChars + read.note.length;
+  }
+
+  /** The one short document, and the session it lives in. */
+  function shortDocument(): { readonly app: ResearchService; readonly sessionId: string; readonly documentId: string } {
+    const app = service();
+    app.createIntent("whole_a", { seedTopic: "短文" });
+    const uploaded = app.uploadDocument({ sessionId: "whole_a", filename: "short.md", content: { text: SHORT } });
+    if (uploaded.ok !== true) throw new Error(JSON.stringify(uploaded));
+    return { app, sessionId: "whole_a", documentId: uploaded.document.documentId };
+  }
+
+  it("returns every character of a short document, in all four strategies", () => {
+    expect(BODY.length).toBe(40);
+    const { app, sessionId, documentId } = shortDocument();
+    const expected = parseDocument(SHORT).text;
+    expect(expected.length).toBe(40);
+
+    for (const [name, request] of [
+      ["spread", {}],
+      ["match", { question: "短文档" }],
+      ["section", { sectionIndex: 0 }],
+      ["paragraph", { paragraphIndex: 0 }],
+    ] as const) {
+      const read = app.readDocument({ sessionId, documentId, request: { ...request, maxChars: 100 } });
+      if (read.ok !== true) throw new Error(`read refused: ${name}`);
+      // Not one character of the body is missing, and the answer says so rather
+      // than hiding behind「部分读取」.
+      expect(read.readChars, name).toBe(expected.length);
+      expect(read.fragments.map((fragment) => fragment.text).join(""), name).toBe(expected);
+      expect(read.fragments.every((fragment) => !fragment.truncated), name).toBe(true);
+      expect(read.scope, name).toBe("full");
+      expect(read.truncated, name).toBe(false);
+      expect(read.note, name).toContain("已读取全文");
+      expect(read.note, name).not.toContain("部分读取");
+      // The whole answer still costs less than the budget it was given.
+      expect(readChars(read), name).toBeLessThanOrEqual(100);
+      for (const fragment of read.fragments) {
+        expect(SHORT.slice(fragment.sourceStart, fragment.sourceEnd), name).toBe(fragment.text);
+      }
+    }
+  });
+
+  it("cuts only when the complete answer really does not fit", () => {
+    const { app, sessionId, documentId } = shortDocument();
+    const complete = app.readDocument({ sessionId, documentId, request: { maxChars: 100 } });
+    if (complete.ok !== true) throw new Error("read refused");
+    expect(complete.scope).toBe("full");
+    // What the complete answer actually costs: the text, the outline, and the
+    // one short sentence that says it is complete.
+    const cost = complete.readChars + complete.outlineChars + complete.note.length;
+    expect(cost).toBeLessThan(100);
+
+    // Exactly the room it needs — and any room above that — is enough.
+    for (const maxChars of [cost, cost + 1, 100]) {
+      const read = app.readDocument({ sessionId, documentId, request: { maxChars } });
+      if (read.ok !== true) throw new Error("read refused");
+      const label = `maxChars=${maxChars} (cost=${cost})`;
+      expect(read.scope, label).toBe("full");
+      expect(read.truncated, label).toBe(false);
+      expect(read.readChars, label).toBe(complete.readChars);
+      expect(read.note, label).toContain("已读取全文");
+      expect(readChars(read), label).toBeLessThanOrEqual(maxChars);
+    }
+
+    // One character short of it: now it really does not fit, so the answer is
+    // partial — and still inside the budget it was given.
+    const cut = app.readDocument({ sessionId, documentId, request: { maxChars: cost - 1 } });
+    if (cut.ok !== true) throw new Error("read refused");
+    expect(cut.scope).toBe("partial");
+    expect(cut.truncated).toBe(true);
+    expect(cut.readChars).toBeLessThan(complete.readChars);
+    expect(cut.note).toContain("部分读取");
+    expect(readChars(cut)).toBeLessThanOrEqual(cost - 1);
+
+    // Far too small: bounded, partial, and the text is never empty-handed while
+    // the budget still has room for it.
+    for (const maxChars of [1, 10, 30]) {
+      const read = app.readDocument({ sessionId, documentId, request: { maxChars } });
+      if (read.ok !== true) throw new Error("read refused");
+      const label = `maxChars=${maxChars}`;
+      expect(read.scope, label).toBe("partial");
+      expect(read.truncated, label).toBe(true);
+      expect(readChars(read), label).toBeLessThanOrEqual(maxChars);
+    }
+
+    // The same boundary through the preview, which is the same rule one layer up.
+    const preview = documentPreview({
+      documentId,
+      filename: "short.md",
+      title: "Short",
+      parsed: parseDocument(SHORT),
+      maxChars: complete.readChars + complete.outlineChars + complete.note.length,
+    });
+    expect(preview.complete).toBe(true);
+    expect(preview.text).toBe(parseDocument(SHORT).text);
+    const tight = documentPreview({
+      documentId,
+      filename: "short.md",
+      title: "Short",
+      parsed: parseDocument(SHORT),
+      maxChars: complete.readChars + complete.outlineChars + complete.note.length - 1,
+    });
+    expect(tight.complete).toBe(false);
+    expect(tight.charsRead + tight.outlineChars + tight.note.length).toBeLessThanOrEqual(cost - 1);
   });
 });
 
