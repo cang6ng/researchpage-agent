@@ -17,6 +17,8 @@ import { useMemo, useState } from "react";
 
 import { ROLE_LABELS, SCOPE_LABELS, type SourceView, type TaskBundle } from "../api.js";
 import { DockSlot } from "../components/dock.js";
+import { DocumentLibrary } from "../components/document-library.js";
+import { DocumentUpload } from "../components/document-upload.js";
 import { useApp } from "../store.js";
 import { navigate, projectHash } from "../router.js";
 
@@ -77,7 +79,30 @@ function evidenceCount(bundle: TaskBundle, sourceId: string): { readonly total: 
 }
 
 export function SourcesView() {
-  const { bundle, selection, setSelection, openDock } = useApp();
+  const {
+    bundle,
+    selection,
+    setSelection,
+    openDock,
+    library,
+    libraryBusy,
+    savingUsage,
+    jobs,
+    jobGone,
+    mineru,
+    mineruChecked,
+    checkMineru,
+    uploading,
+    converting,
+    retryingConversion,
+    refreshLibrary,
+    uploadMarkdown,
+    submitConversion,
+    retryConversion,
+    setDocumentUsage,
+    promoteDocument,
+    promotingDocument,
+  } = useApp();
   const [filter, setFilter] = useState<FilterKey>("all");
   const [query, setQuery] = useState("");
 
@@ -112,6 +137,57 @@ export function SourcesView() {
             共 {sources.length} 个来源，其中 {readCount} 个真正读取过；{roles.userMessage}
             只有读取过的来源才会产生可引用证据；角色只用于判断结论能说多硬，不构成可信度评分。
           </p>
+
+          {/*
+            Your own files come before the sources, because they are a different
+            kind of thing: a document is material you handed over, and it becomes
+            a source only when you say so. Nothing here reads it, cites it or
+            changes the report.
+          */}
+          <div id="document-library" style={{ scrollMarginTop: 80 }}>
+            <DocumentUpload
+              jobs={jobs}
+              gone={jobGone}
+              mineru={mineru}
+              mineruChecked={mineruChecked}
+              onCheckMineru={() => {
+                void checkMineru();
+              }}
+              uploading={uploading}
+              converting={converting}
+              retrying={retryingConversion}
+              canUpload
+              onUploadMarkdown={(file) => {
+                void uploadMarkdown(file);
+              }}
+              onSubmitConversion={(file) => {
+                void submitConversion(file);
+              }}
+              onRetry={(jobId, accepted) => {
+                void retryConversion(jobId, accepted);
+              }}
+            />
+            <DocumentLibrary
+              documents={library}
+              busy={libraryBusy}
+              saving={savingUsage}
+              taskId={bundle.task.id}
+              promoting={promotingDocument}
+              onRefresh={() => {
+                void refreshLibrary();
+              }}
+              onSetUsage={(documentId, usage, revision) => {
+                void setDocumentUsage(documentId, usage, revision);
+              }}
+              onPromote={(documentId) => {
+                void promoteDocument(documentId);
+              }}
+              onOpenSource={(sourceId) => {
+                setSelection({ kind: "source", sourceId });
+                openDock({ kind: "source", sourceId });
+              }}
+            />
+          </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "22px 0 10px", flexWrap: "wrap" }}>
             <div className="rp-seg" role="group" aria-label="来源筛选">

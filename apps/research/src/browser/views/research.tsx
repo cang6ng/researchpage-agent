@@ -20,6 +20,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { STATUS_LABELS, STATUS_MARKS, TOOL_LABELS, type TaskBundle } from "../api.js";
 import { scopeSummary } from "../status.js";
 import { DockSlot } from "../components/dock.js";
+import { ResearchProgress } from "../components/research-progress.js";
 import { useApp } from "../store.js";
 import { api } from "../api.js";
 import { navigate, projectHash } from "../router.js";
@@ -344,8 +345,9 @@ function GapList({ bundle }: { readonly bundle: TaskBundle }) {
 }
 
 export function ResearchView() {
-  const { bundle, refresh } = useApp();
-  const running = bundle === null ? null : runningSummary(bundle);
+  const { bundle, refresh, act, busy } = useApp();
+  const [retrying, setRetrying] = useState(false);
+  const [retryMessage, setRetryMessage] = useState<string | null>(null);
 
   // A cell that changed state gets one quiet flash: the matrix updated, and the
   // reader should be able to see where without watching the network.
@@ -369,9 +371,39 @@ export function ResearchView() {
     previous.current = next;
   }, [bundle]);
 
-  const live = useMemo(() => running, [running]);
-
   if (bundle === null) return null;
+
+  /**
+   * One bounded research attempt on a project that stopped.
+   *
+   * The route is the authority on whether it may run at all — it refuses a
+   * project that is running, unconfirmed or not stopped — so the button is
+   * offered only when the bundle says the project really is stopped, and the
+   * answer's own `message` and `preserved` counts are what the page reports
+   * afterwards. Nothing here clears the page's material: a retry preserves it,
+   * and a page that emptied the matrix to look busy would be lying about what
+   * the server did.
+   */
+  const onRetry = (): void => {
+    const id = bundle.task.id;
+    setRetrying(true);
+    setRetryMessage(null);
+    void act(
+      async () => {
+        const result = await api.retryResearch(id);
+        setRetryMessage(
+          `${result.message}（保留：来源 ${String(result.preserved.sources)} · 证据 ${String(result.preserved.evidence)} · 评估 ${String(result.preserved.assessments)} · 报告 ${String(result.preserved.reports)}${result.preserved.reportKept ? " · 现有报告未改动" : ""}）`,
+        );
+      },
+      "重开研究",
+    ).finally(() => {
+      setRetrying(false);
+      // Reading the bundle again is how the page learns the new attempt's
+      // number: the retry response carries the attempt it started, but the
+      // progress and the activity log only appear on the project.
+      void refresh();
+    });
+  };
 
   return (
     <div className="rp-split">
@@ -379,28 +411,23 @@ export function ResearchView() {
         <div className="rp-research">
           <ProjectHeadline bundle={bundle} />
 
-          {live !== null && (
-        <div className="rp-runstate" aria-live="polite" data-testid="running-state">
-          <span className="rp-runstate__icon" aria-hidden="true">
-            <Loader size={14} color="ink" />
-          </span>
-          <div>
-            <div className="rp-runstate__doing">{live.doing}</div>
-            <div className="rp-runstate__why">{live.why}</div>
-            <div className="rp-runstate__next">下一步：{live.next}内容以当前版本为准。</div>
-          </div>
-          <Button
-            variant="subtle"
-            size="xs"
-            leftSection={<MessageSquare size={13} />}
-            onClick={() => {
-              void refresh();
-            }}
-          >
-            刷新状态
-          </Button>
-        </div>
-      )}
+          {bundle.task.confirmed && (
+            <ResearchProgress
+              progress={bundle.progress}
+              attempt={bundle.attempt}
+              discovery={bundle.discovery}
+              activityLog={bundle.activityLog}
+              sources={bundle.sources}
+              usage={bundle.usage}
+              status={bundle.task.status}
+              confirmed={bundle.task.confirmed}
+              error={bundle.task.error}
+              busy={busy}
+              retrying={retrying}
+              retryMessage={retryMessage}
+              onRetry={onRetry}
+            />
+          )}
 
           <Matrix bundle={bundle} />
           <GapList bundle={bundle} />

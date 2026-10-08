@@ -15,6 +15,15 @@ export type Route =
   | { readonly kind: "start" }
   | { readonly kind: "settings" }
   /**
+   * An exploration: the conversation that decides what the research is about.
+   *
+   * It is its own address because it is its own thing — not a view of a
+   * project, since there is no project yet, and not a transient state of the
+   * front page, since it survives a reload and a link to it means the same
+   * thing to two people.
+   */
+  | { readonly kind: "intent"; readonly intentId: string }
+  /**
    * A project, and the view of it the address names.
    *
    * `view` is null when the address names none — `#/p/<task>` — which is not the
@@ -51,6 +60,7 @@ export function parseRoute(hash: string): Route {
   const parts = path.split("/").filter((part) => part.length > 0);
   if (parts.length === 0) return { kind: "start" };
   if (parts[0] === "settings") return { kind: "settings" };
+  if (parts[0] === "i" && parts[1] !== undefined) return { kind: "intent", intentId: parts[1] };
   if (parts[0] === "p" && parts[1] !== undefined) {
     const view = VIEWS.find((candidate) => candidate === parts[2]) ?? null;
     return { kind: "project", taskId: parts[1], view };
@@ -60,6 +70,11 @@ export function parseRoute(hash: string): Route {
 
 export function projectHash(taskId: string, view: View): string {
   return `#/p/${taskId}/${view}`;
+}
+
+/** The address of an exploration, which is what a reload of it reopens. */
+export function intentHash(intentId: string): string {
+  return `#/i/${intentId}`;
 }
 
 /**

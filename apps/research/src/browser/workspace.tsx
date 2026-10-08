@@ -7,7 +7,6 @@
  * so "look at this" and "check this" are the same gesture everywhere.
  */
 
-import { Loader } from "@mantine/core";
 import { X } from "lucide-react";
 import { useEffect, useRef } from "react";
 
@@ -17,6 +16,7 @@ import type { TaskBundle } from "./api.js";
 import { navigate, projectHash, resolveView, useRoute, VIEW_LABELS, type Route, type View } from "./router.js";
 import { BriefView } from "./views/brief.js";
 import { GalleryView } from "./views/gallery.js";
+import { IntentRouteView } from "./views/intent.js";
 import { ResearchView } from "./views/research.js";
 import { SettingsView } from "./views/settings.js";
 import { SourcesView } from "./views/sources.js";
@@ -79,22 +79,6 @@ function NoticeBar() {
   );
 }
 
-function PendingCard() {
-  return (
-    <div className="rp-loading" aria-live="polite">
-      <div className="rp-kicker">正在建立任务卡</div>
-      <h1 className="rp-title">助手正在确定比较对象与研究维度</h1>
-      <p className="rp-lede">
-        这一步会给出任务卡：研究对象、研究维度，以及报告将回答的问题。任务卡确认之前不会开始检索。
-      </p>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, color: "var(--rp-ink-3)" }}>
-        <Loader size="xs" color="ink" />
-        <span style={{ fontSize: 13 }}>通常需要十几秒</span>
-      </div>
-    </div>
-  );
-}
-
 function ViewBody({ view }: { readonly view: View }) {
   switch (view) {
     case "brief":
@@ -119,14 +103,19 @@ function viewOf(route: Route, bundle: TaskBundle | null): View | null {
 
 export function Workspace() {
   const route = useRoute();
-  const { bundle, pendingSessionId, loading, taskId, openTask } = useApp();
+  const { bundle, loading, taskId, openTask, openIntent, scope } = useApp();
   const view = viewOf(route, bundle);
 
   // The address is the page's own state: opening a project URL loads that
-  // project, which is what makes a link to a report a link to a report.
+  // project, which is what makes a link to a report a link to a report. An
+  // exploration's address is the same kind of statement, and it is why a reload
+  // of a conversation comes back to the conversation.
   useEffect(() => {
     if (route.kind === "project" && route.taskId !== taskId) openTask(route.taskId);
-  }, [route, taskId, openTask]);
+    if (route.kind === "intent" && (scope.kind !== "intent" || scope.intentId !== route.intentId)) {
+      openIntent(route.intentId);
+    }
+  }, [route, taskId, scope, openTask, openIntent]);
 
   // An address that names no view lands on the one the project is actually on
   // (its brief while that is undecided, its report once there is one) and then
@@ -149,8 +138,20 @@ export function Workspace() {
     );
   }
 
+  if (route.kind === "intent") {
+    return (
+      <div className="rp-shell">
+        <GlobalBar route={route} />
+        <NoticeBar />
+        <main className="rp-main">
+          <IntentRouteView />
+        </main>
+      </div>
+    );
+  }
+
   if (route.kind === "start") {
-    if (loading && bundle === null && pendingSessionId === null) {
+    if (loading && bundle === null) {
       return (
         <div className="rp-shell">
           <GlobalBar route={route} />
@@ -180,14 +181,10 @@ export function Workspace() {
         <GlobalBar route={route} />
         <NoticeBar />
         <main className="rp-main">
-          {pendingSessionId === null ? (
-            <div className="rp-loading" aria-live="polite">
-              <div className="rp-kicker">正在打开项目</div>
-              <h1 className="rp-title">读取这份研究的材料与报告…</h1>
-            </div>
-          ) : (
-            <PendingCard />
-          )}
+          <div className="rp-loading" aria-live="polite">
+            <div className="rp-kicker">正在打开项目</div>
+            <h1 className="rp-title">读取这份研究的材料与报告…</h1>
+          </div>
         </main>
       </div>
     );

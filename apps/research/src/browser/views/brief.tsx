@@ -120,7 +120,7 @@ const LENGTH_SUGGESTIONS: readonly string[] = ["约 3 页", "4–6 页", "8 页�
 const SAVED_NOTE_MS = 2200;
 
 export function BriefView() {
-  const { bundle, busy, say, openStart, startTopic, refresh } = useApp();
+  const { bundle, busy, say, startIntent, refresh } = useApp();
   const [mode, setMode] = useState<Mode>("structured");
   const [drafts, setDrafts] = useState<Drafts>({});
   const [saveStates, setSaveStates] = useState<Readonly<Partial<Record<BriefFieldName, SaveState>>>>({});
@@ -366,9 +366,12 @@ export function BriefView() {
     if (value.length < 2) return;
     setRegenerating(false);
     setRevisedTopic("");
-    openStart();
-    await startTopic(value);
-    say("info", "已用新主题重新建立任务卡；原项目仍保留在起始页的列表里。");
+    // A different topic is a different *question*, so it starts where every
+    // question starts now: an exploration the user confirms. Building a card
+    // straight from this box would be the one remaining path that skips the
+    // decision the product is built around.
+    const started = await startIntent(value, {});
+    if (started) say("info", "已用新主题开始一段新的方向澄清；当前项目保持不动，仍留在起始页的列表里。");
   };
 
   const staleField =
@@ -385,6 +388,19 @@ export function BriefView() {
           {readonly
             ? "这份简报已经确认：它决定了检索的方向、证据矩阵的坐标，以及报告必须回答的问题。之后的变化都发生在报告上，并由你逐次接受。"
             : "助手先给出一个完整的研究方案，你在此基础上直接修改，也可以让它一次只问一个关键决策。两种方式改的是同一份简报，确认之前不会开始检索。"}
+        </p>
+        <p className="rp-meta" style={{ marginTop: 6 }} data-testid="brief-library-entry">
+          这项研究的方向来自你确认过的探索；之后加入的材料都放在来源工作区的文档库里。
+          <button
+            type="button"
+            className="rp-nav__item"
+            style={{ padding: "0 4px", fontSize: 12.5 }}
+            onClick={() => {
+              navigate(projectHash(bundle.task.id, "sources"));
+            }}
+          >
+            打开文档库与来源
+          </button>
         </p>
       </header>
 
@@ -830,7 +846,7 @@ function ConfirmBar({
                 setRegenerating(!regenerating);
               }}
             >
-              换一个主题重新建立任务卡
+              换一个主题，重新澄清方向
             </Menu.Item>
           </Menu.Dropdown>
         </Menu>
@@ -857,7 +873,7 @@ function ConfirmBar({
       {regenerating && (
         <div className="rp-confirmbar__regen">
           <span className="rp-muted">
-            用新的说法重新建立任务卡会产生一个新项目；当前这份简报保持不动，仍留在起始页的列表里。
+            换一个主题会重新开始一次方向澄清（先确认方向，再建立任务卡）；当前这个项目保持不动，仍留在起始页的列表里。
           </span>
           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
             <input
@@ -869,7 +885,7 @@ function ConfirmBar({
               }}
             />
             <Button size="compact-sm" variant="light" disabled={revisedTopic.trim().length < 2} onClick={onRegenerate}>
-              用新主题建立新的任务卡
+              用新主题开始澄清
             </Button>
           </div>
         </div>

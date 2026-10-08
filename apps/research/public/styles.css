@@ -3491,3 +3491,95 @@ body {
     display: none;
   }
 }
+
+/* ---------------------------------------------------------- 文档库与转换 -- */
+/* The library is a list rather than a card wall for the same reason the
+   project list is: the useful facts about a file are its name, where it came
+   from, what it is for and when it landed — four things a row says better than
+   a tile. The rows are the same surface the rest of the product uses. */
+
+.rp-files {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.rp-file {
+  display: flex;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--rp-surface);
+  border: 1px solid var(--rp-hairline);
+  border-radius: var(--rp-r-surface);
+  box-shadow: var(--rp-sh-surface);
+  min-width: 0;
+}
+
+.rp-file__title {
+  font-size: 13.5px;
+  font-weight: 550;
+  color: var(--rp-ink);
+  overflow-wrap: anywhere;
+}
+
+.rp-file__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 5px;
+  font-size: 11.5px;
+  color: var(--rp-ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-file__fact {
+  font-size: 11.5px;
+  color: var(--rp-ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-file__warn {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--rp-danger);
+  line-height: 1.6;
+}
+
+/* The progress facts sit in one row of their own rather than inside a card:
+   they are readings of one project's state, not separate objects. */
+.rp-facts {
+  border-top: 1px solid var(--rp-hairline);
+  border-bottom: 1px solid var(--rp-hairline);
+  padding: 12px 0;
+}
+
+/* The exploration page is a column of prose with one panel in it. */
+.rp-fields {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 12px 2px;
+  background: var(--rp-surface-2);
+  border: 1px solid var(--rp-hairline);
+  border-radius: var(--rp-r-surface);
+}
+
+/* A direction field is a label above its own control: the four fields are
+   sentences a reader edits, not rows of a table, and a two-column grid would
+   make the longest of them the narrowest box on the page. */
+.rp-field {
+  display: grid;
+  gap: 4px;
+  padding: 10px 0;
+  border-top: 1px solid var(--rp-hairline);
+}
+
+.rp-field:first-child {
+  border-top: 0;
+}
+
+.rp-field__label {
+  font-size: 11.5px;
+  letter-spacing: 0.03em;
+  color: var(--rp-ink-3);
+}

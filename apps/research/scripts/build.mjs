@@ -49,6 +49,14 @@ export async function buildResearchApp(options = {}) {
     format: "esm",
     platform: "node",
     target: ["node22"],
+    // The server is one ES module carrying a dependency that still calls
+    // `require("child_process")` while it is being imported. An ES module has
+    // no `require` binding, so without this banner the bundle builds cleanly
+    // and then throws `Dynamic require of "child_process" is not supported`
+    // before it ever listens on a port.
+    banner: {
+      js: "import { createRequire as __researchCreateRequire } from 'node:module';\nconst require = __researchCreateRequire(import.meta.url);",
+    },
     metafile: true,
     logLevel: quiet ? "silent" : "info",
   });
