@@ -7,6 +7,10 @@
  * pass. When they do run, they are the evidence that the product's discovery
  * and read paths are real: an arXiv query with real candidates, a real HTML
  * full text, and a real excerpt that is provably a substring of the saved read.
+ *
+ * The last block checks the other half of the body-scope rule on the open web:
+ * a subscription landing page must not be read as the paper's body, and a real
+ * open-access article must still be.
  */
 
 import { describe, expect, it } from "vitest";
@@ -283,5 +287,59 @@ describe.skipIf(!enabled)("real fallback discovery (network)", () => {
       now: new Date().toISOString(),
     });
     expect(verifyEvidenceText(evidence, read.text).ok).toBe(true);
+  });
+});
+
+/**
+ * Body scope on real publisher pages.
+ *
+ * These two documents are addressed by URL so the test reads the pages it
+ * means: one is a subscription article whose landing page renders its abstract,
+ * its reference list and the site navigation, and one is an open-access article
+ * whose full text really is on the page. A block page, a paywall or a network
+ * refusal is a state of the world and is reported as one — what is never
+ * acceptable is calling the first one's text the paper's body.
+ */
+describe.skipIf(!enabled)("body scope on real publisher pages (network)", () => {
+  it("never reads a subscription landing page as the paper's body", { timeout: 90_000 }, async () => {
+    const outcome = await readSource({ url: "https://www.nature.com/articles/nature14539" }, { timeoutMs: 35_000 });
+    console.log(`[landing] status=${outcome.status} scope=${outcome.scope ?? "—"} chars=${outcome.text.length}`);
+    console.log(`[landing] note: ${outcome.note}`);
+    expect(["full_text", "body_excerpt"]).not.toContain(outcome.scope);
+    if (outcome.status === "ok") {
+      // The abstract is what the page really states, so that is what is saved.
+      expect(outcome.scope).toBe("abstract");
+      expect(outcome.paragraphs.length).toBe(1);
+      expect(outcome.text).toContain("multiple processing layers");
+    }
+  });
+
+  it("keeps the body of a real open-access article", { timeout: 90_000 }, async () => {
+    const outcome = await readSource(
+      { url: "https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0061217" },
+      { timeoutMs: 35_000 },
+    );
+    console.log(
+      `[oa] status=${outcome.status} scope=${outcome.scope ?? "—"} paragraphs=${outcome.paragraphs.length} chars=${outcome.text.length}`,
+    );
+    console.log(`[oa] note: ${outcome.note}`);
+    expect(outcome.status, outcome.failure ?? "").toBe("ok");
+    expect(outcome.scope).toBe("full_text");
+    expect(outcome.paragraphs.length).toBeGreaterThan(50);
+
+    const picks = pickParagraphs(outcome.paragraphs, tokenize("microbiome census data analysis methods"), 2);
+    expect(picks.length).toBeGreaterThan(0);
+    for (const pick of picks) {
+      const evidence = draftEvidence({
+        taskId: "task_0000000000000000",
+        sourceId: "src_0000000000000000",
+        readId: "read_0000000000000000",
+        readScope: outcome.scope ?? "full_text",
+        draft: { paragraph: pick.paragraph, cells: [], pickedBecause: pick.because },
+        now: new Date().toISOString(),
+      });
+      expect(verifyEvidenceText(evidence, outcome.text).ok).toBe(true);
+      console.log(`[oa] evidence :: ${evidence.locator.headingPath.join(" > ")} :: ${evidence.excerpt.slice(0, 90)}…`);
+    }
   });
 });

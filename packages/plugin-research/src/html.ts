@@ -89,6 +89,29 @@ function normalizeInline(text: string): string {
   return decodeEntities(text).replace(/[\t\r\n\f\v\u00a0]+/g, " ").replace(/ {2,}/g, " ").trim();
 }
 
+/**
+ * The first declared value among a set of `<meta>` names, decoded.
+ *
+ * Publishers state a work's own abstract in a meta tag — the arXiv abstract
+ * page and most journal platforms do — and that statement is the page's own,
+ * so it can be read as an *abstract-level* document even when the page's body
+ * is not available. Names are tried in the order given, because a platform can
+ * carry both a citation-format abstract and a generic description and only the
+ * caller knows which it trusts. Both attribute orders are accepted.
+ */
+export function metaContent(html: string, names: readonly string[]): string | undefined {
+  const wanted = new Set(names.map((name) => name.toLowerCase()));
+  for (const raw of html.match(/<meta\b[^>]*>/gi) ?? []) {
+    const token = parseTag(raw);
+    if (token === undefined) continue;
+    const name = (token.attrs["name"] ?? token.attrs["property"] ?? "").toLowerCase();
+    if (!wanted.has(name)) continue;
+    const value = normalizeInline(token.attrs["content"] ?? "");
+    if (value.length > 0) return value;
+  }
+  return undefined;
+}
+
 const DROP_ELEMENTS = ["script", "style", "noscript", "template", "svg", "iframe", "head"] as const;
 
 function dropElement(html: string, tag: string): string {

@@ -10,7 +10,7 @@
 
 ## Current Status（2026-10-08）
 
-- **Step 3.7A（Research Runtime Reliability）已完成**：真实用户测试发现的「arXiv 429 → 研究彻底停下、模型反复无效检索、界面说可以重试却没有 Retry API、失败请求统计不到、用户不知道在等什么」按有界重试 / 备用 Provider / 熔断 / 请求台账 / 活动日志 / 进度 DTO / Retry API 全部修完，并用真实网络 smoke 验证「arXiv 失败 → 备用检索（OpenAlex）→ 真实读取 → 快照与证据」。没有重写 Agent Core / Host / Protocol / Client，没有新增通用搜索框架、Web Search、MinerU、MCP、文件上传、Intent Discovery，没有改 Brief / Guide / Proposal / Evidence / Claim 语义，没有重做前端（正式进度页与 Activity Log UI 属于下一轮）。
+- **Step 3.7A（Research Runtime Reliability）已完成**：真实用户测试发现的「arXiv 429 → 研究彻底停下、模型反复无效检索、界面说可以重试却没有 Retry API、失败请求统计不到、用户不知道在等什么」按有界重试 / 备用 Provider / 熔断 / 请求台账 / 活动日志 / 进度 DTO / Retry API 全部修完，并用真实网络 smoke 验证「arXiv 失败 → 备用检索（OpenAlex）→ 真实读取 → 快照与证据」。没有重写 Agent Core / Host / Protocol / Client，没有新增通用搜索框架、Web Search、MinerU、MCP、文件上传、Intent Discovery，没有改 Brief / Guide / Proposal / Evidence / Claim 语义，没有重做前端（正式进度页与 Activity Log UI 属于下一轮）。随后的独立复核只报出 1 条 MAJOR——**订阅出版方的 landing page 被记成 `full_text`**——已在 2026-10-08 定向修复：非 arXiv 的正文必须被识别出来（正文章节 + 段数 + 字数 + 与摘要的比值），否则如实降级到 abstract 级或失败（见下「Step 3.7A MAJOR Repair」）。
 
 - **Step 3.6B（Navigation, Status & Trust UX）已完成**：3.6A 已经正确的业务语义接上了界面——项目只剩三个一级工作空间（报告 → 研究 → 来源），研究范围退到项目标题旁（未确认的项目自动以它为主流程），样式退到报告工具栏（不再叫「模板」），顶栏不再常驻检索/读取额度、只回答「这个项目现在发生什么」并可展开六条并列事实；补查结果第一句回答「问题解决了吗」（已解决 / 部分解决 / 未解决），工具次数折叠在结果之后，「查看本轮证据」只打开这一轮新增的来源 / 证据 / 支持评估与仍未解决的缺口，并能回到刚才那一轮对话；提案在待确认时完整展开、决定后折叠成一行、没形成提案时不出现任何「接受」按钮；未知角色、旧报告的空白单元格、质量核验详情、动作提示跨页残留与内部术语全部按读者语言收口。未做 PDF / Mermaid / Upload / MCP / 第二 Blueprint / Tauri，未改任何后端语义（本轮没有一处 server / plugin 改动）。
 
@@ -114,6 +114,64 @@
 - `apps/research/tests/retry-api.test.ts`（5 例，K/L/M/N/O，HTTP → runner → host → tools → DB 全链路，脚本化模型 + 固定 fixture）：失败项目经 Retry API 恢复且失败原因写明 HTTP 429（不出现「主题不合适」）、运行中/未确认/未失败三种拒绝与 404、旧 `startedAt` 不再挡住 Retry、材料与报告与冻结版本全部保留且正文不被改写、Retry 不签发 user grant 且两本账分账正确。
 - `apps/research/tests/research-progress.test.ts`（7 例）：阶段判定（含阶段内部移动、旧事件不污染当前阶段）、等待态与 `waitingUntil`、请求/候选/读取计数来自真实记录、已完成阶段列表、失败态使用项目自己记录的原因、**产物里没有百分比**。
 - 真实网络 smoke（`RESEARCHPAGE_REAL_NETWORK=1`，9 例）：arXiv 当前状态如实记录（不猜）、OpenAlex 真实候选与元数据、备用候选真实读取为 full_text 快照并产生可校验片段、「arXiv 不可用（模拟）→ 真实 OpenAlex → 真实读取 → 验证 excerpt」的完整链路。
+
+## Step 3.7A MAJOR Repair 新增（本次工作产物）
+
+独立复核（只读）对 `dc0e7bc` 得出的唯一 MAJOR：**非 arXiv 的出版方 landing page 会被记成 `full_text`**。真实复现是 `https://www.nature.com/articles/nature14539`（订阅文章）：HTTP 200、抽取约 400 段 → `full_text`，而页面上根本没有正文，只有 Abstract、References、作者块与站点导航。后果是 `Source → Snapshot → Evidence → Assessment → Claim` 可能把参考文献条目当成正文级证据，让矩阵到「已核对」、让 Claim 到 `adequate`。本轮只修这一条 MAJOR 及其直接测试：没有改 Evidence / Claim / Artifact Validator 的任何充分性规则，没有重做 Search Fallback / Retry / Budget / Activity / Progress，没有动前端，没有修其余 7 条 MINOR。
+
+### 根因（`read.ts`）
+
+非 arXiv 的 HTML 分支只有一条判据——**段数 ≥ 4**（`MIN_FULL_TEXT_PARAGRAPHS`）：HTTP 200 且段数够就记 `full_text`，而「摘要兜底」只在**所有 fetch 都失败**时才走。landing page 恰好是最容易满足这条判据的页面（参考文献本身就是几百段），于是「页面上有段落」被当成了「页面上是论文」。
+
+### 修复：正文必须被识别出来（新 `packages/plugin-research/src/article.ts`）
+
+对**非 arXiv** 的 HTML 不再按段数判定，而是先识别「论文正文章节」：
+
+- 正文段落 = 标题路径里至少有一个正文章节名，且**没有任何**「绝不可能是正文」的名字。章节名来自一份**允许清单**（Introduction / Background / Related work / Methods / Materials and methods / Approach / Model / System / Implementation / Evaluation / Experiments / Results / Discussion / Conclusion / Limitations / Case study / Data collection / Study design / Participants / Analysis / Ablation 等，编号与「Section 3」这类前缀在匹配前归一化），而不是去猜哪些是 chrome——没人见过的页面不能自己声明自己哪里不是正文。
+- 非正文清单管两类东西：一类是**含正文词的后置内容**（Data availability 含 data、Author contributions 含 contributions、Supplementary materials 含 materials、Availability of data and materials…），一类是页面 chrome（Access options / Metrics / Cite this article / Peer review / Similar content / Search…）。Abstract / Summary / References / Bibliography 一律不算正文。检查跑在**整条标题路径**上，所以 "References" 下的子标题也进不了正文。
+- **识别门槛（四道同时满足）**：至少 2 个**真正承载正文的章节**（章节自己的标题就是这些段落的最深标题，因此「页面标题里带正文词」不能冒充章节）、至少 4 段、至少 1500 字、且正文必须**至少是页面自身摘要的 2 倍**（这一条专门挡「只预览第一节」的付费墙页面）。
+- 识别出的正文**只保留正文段落**：摘要、参考文献、作者块与导航都不进这段文本（`text` 与 `paragraphs` 重新定位，excerpt 是保存文本 substring 的不变量照旧）。
+- 识别不出来时按顺序退：**页面自身渲染的 Abstract 段落 → 页面声明的 citation/dc 摘要元数据 → 检索 Provider 记录里的真实摘要**，一律记 `abstract` 级并在 note 里写明来源与「摘要不是正文」；三者都没有就**读取失败**，不产生任何文本或证据。摘要块只取**开头的散文段**，遇到 "Anthology ID:" / "Volume:" 这类短字段就停下，因此书目卡片不会被当成摘要。
+- **arXiv HTML 完全不变**：`arxiv.org/html/<id>` 是已知的全文文档，仍按原判据（≥4 段）记 `full_text`，即使它的章节名不在允许清单里；arXiv 摘要页、纯文本、PDF 失败、metadata 兜底的行为都没有变。
+- **Source 的 URL / Provider / provenance 不变**：`readUrl` 仍是真正抓到的地址（含 redirect 之后的），`Source.discovery` 的 provider / providerId / requestUrl 一字未动。
+
+### 这次修复保证的边界（对照本轮验收项）
+
+| 项 | 结果的证据 |
+| --- | --- |
+| A. 订阅 landing page 不得为 `full_text` | 真实页 `nature14539`：`scope=abstract`、879 字（就是那篇的摘要）；确定性 fixture（60 条参考文献、>60 段）同样是 `abstract` |
+| B. 只有 Abstract 的页面返回 `abstract` | 页面渲染的 Abstract 段落、`citation_abstract` / `dc.*` 元数据两条路各自有 case；ACL 形状（Abstract 卡片后跟书目字段）只取摘要那一段 |
+| C. arXiv HTML 正文不回归 | 章节名是 "The Question" / "Our Proposal" / "What We Found"（不在允许清单里）也仍然是 `full_text`；真实 `arxiv.org/html/2404.16130` 仍是 1265 段 / 92717 字的 `full_text` |
+| D. 非 arXiv 的真实开放全文 | 真实 PLOS（121 段 / 37254 字 / 识别到 implementation、analysis functions、results and discussion 等章节，excerpt 可校验）、真实 Frontiers 均 `full_text`；fixture 全文只保留正文，摘要与参考文献都不在正文里 |
+| E. 摘要级证据到不了「已核对」/`adequate` | 单元反事实 + service 全链路各一条，见下 |
+| F. 无可读内容不产生伪证据 | 既无正文也无摘要 → `failed`、`text=""`、`paragraphs=[]`；service 侧不建 snapshot、不产生证据 |
+| G. OpenAlex fallback → Read → Snapshot → Evidence 仍可用 | 既有 `discovery-resilience.test.ts` 的 E 例与真实网络 smoke 的「arXiv 不可用 → 真实 OpenAlex → 真实读取」都仍通过（备用候选指向 arXiv 时走 arXiv HTML 通道，指出版方时如实记 `abstract`） |
+
+### 充分性规则没有被放宽——被修正的是输入
+
+`deriveCellCoverage` 与 `deriveClaimAdequacy` 一个字都没改：它们本来就把摘要级挡在 `reviewed` / `adequate` 之外。`article-body.test.ts` 里有一条**反事实断言**把这个缺陷钉住：同一批材料标成 `abstract` 时 coverage 是 `limited`、claim 是 `limited`；**如果**它仍带着 `full_text` 标签，同一批材料就会变成 `reviewed` / `adequate`。所以关掉这个缺陷的是读取边界，不是阈值。
+
+### 改动清单
+
+| 位置 | 改动 |
+| --- | --- |
+| `packages/plugin-research/src/article.ts`（新） | 章节归一化与三态判定（正文 / 非正文 / 摘要）、`recogniseArticleBody`（四道门槛 + 只保留正文段落）、`pageAbstractOf`（页面摘要段落 → 声明元数据）、`ABSTRACT_META_NAMES` |
+| `packages/plugin-research/src/read.ts` | 非 arXiv HTML 走 `recogniseArticleBody`；`Attempt` 增加 `structure: "arxiv-html" \| "generic"`（arXiv 通道保持原判据）；三条摘要路径统一成一个 `abstractRead`；失败时给出可读原因 |
+| `packages/plugin-research/src/html.ts` | 新增 `metaContent(html, names)`：按声明顺序读 `<meta>` 摘要，属性顺序无关 |
+| `packages/plugin-research/src/tools.ts` | `read_source` 描述补一句：非 arXiv 页面只有真的呈现正文章节才记正文；订阅 landing page 会被判为没有正文、记为 abstract 级，不要反复重读同一个订阅页 |
+| `packages/plugin-research/src/index.ts` | 导出 `article.ts` 的判定与阈值（`recogniseArticleBody` / `pageAbstractOf` / `isArticleBodyHeading` / `isNonArticleHeading` / `isAbstractHeading` / `normaliseHeading` / `metaContent` / 五个阈值常量） |
+
+### 测试
+
+- `packages/plugin-research/tests/article-body.test.ts`（18 例，全部确定性，只替换 fetch）：A（60 段 landing → `abstract`；标题带正文词也只算 1 个章节 → 失败；无页面摘要时用 Provider 摘要并写明来源）、B（页面摘要段落 / 声明元数据 / 摘要块在短字段处停下）、C（arXiv HTML 的非常规章节名不回归）、D（开放全文保留正文且不含摘要与参考文献；太短的预览、与摘要同量级的预览都被拒）、F（无可读内容 → 失败，不产生文本）、章节判定表，以及 E 的反事实。
+- `packages/plugin-research/tests/discovery-resilience.test.ts`：新增 1 例——真实 service 链路读一个 HTTP 200 的 landing page，`readScope=abstract`、snapshot 只有摘要、evidence 全部是「仅摘要」，即使保存了直接支持评估，单元格也到不了「已核对」。
+- `packages/plugin-research/tests/real-network.test.ts`：新增 2 例（`RESEARCHPAGE_REAL_NETWORK=1`）——订阅 landing page 不得是正文、真实开放全文仍是 `full_text` 且 excerpt 可校验。
+
+### 本次实测（2026-10-08）
+
+- `pnpm typecheck`（三个 project）通过；`pnpm build:research` 通过。
+- 离线全量 `1951 passed / 14 skipped / 1 failed`：唯一失败是既有 flake `apps/web/tests/shell-m5-sessions.browser.test.ts`（"the browser never came up"，整仓并行时的 CDP 超时），单独重跑 23/23 通过，与本次改动无关。
+- 真实网络（有界，`RESEARCHPAGE_REAL_NETWORK=1`）：real-network 11/11。landing page 侧另外用一次性探针核过真实页面结构（Nature / AAAI / ACL 三种 landing 形状 → 都记为 abstract；Frontiers、PLOS 的开放全文 → `full_text`；MDPI 的 2KB 机器人拦截页 → 失败；arXiv 不回归），探针跑完已删除，工作区没有留下临时文件。
 
 ## Step 3.6B 新增（本次工作产物）
 
@@ -522,7 +580,7 @@ bundle 新增 `presentation`，六个字段各自回答一个问题，都由真�
   - **界面未接**：`progress` / `activityLog` / `retryResearch` 只有 API 与 DTO，没有画出来（属于 STEP 3.7B）。用户现在读到的失败原因是可行动的，但「重新研究」这个动作只能从 API 发起。
   - **备用 Provider 只有一个**（OpenAlex），没有 Provider Marketplace，也没有任意 Web Search：这是有意的范围裁剪，不是待补的能力。
   - **熔断状态活在进程内存里**（每个 service 实例一份）：重启即清空，与既有 Action Grant 的存活语义一致；没有做跨进程/跨机器的限流协调。
-  - **非 arXiv 来源的可读性仍然取决于出版方**：能读到 HTML 正文就记 `full_text/body_excerpt`，只有 PDF 或付费墙时按 `abstract` 级保存 Provider 记录里的真实摘要（chapter 里已说明），**仍然不解析 PDF 正文**。摘要级材料按既有覆盖规则到不了「已核对」。
+  - **非 arXiv 来源的可读性仍然取决于出版方**：页面必须真的呈现论文正文章节（Introduction / Methods / Results 这类，且至少 2 个章节、4 段、1500 字、长于摘要 2 倍）才会记 `full_text/body_excerpt`；订阅 landing page、只给摘要的页面、书目/检索页会被如实记为 `abstract` 级或失败，**仍然不解析 PDF 正文**。摘要级材料按既有覆盖规则到不了「已核对」。章节名不在允许清单里的开放页面（少见的自定义标题）会保守地降级为 abstract 级——这是有意的取舍：宁可少读一段正文，也不把不知道是什么的页面当正文。已知残余边界：一个「预览了很长一节 Introduction/Methods、且页面自身没有摘要、Provider 也没有摘要」的页面仍可能被认作正文（此时保存的确实是论文的正文散文，但没有「只是局部」的证据）；同类页面若带摘要则会被比值门槛挡住。
   - **一次 search_sources 的总上限是 60s**（arXiv 自身 2 次尝试 + 退避 + 备用 Provider 都算在里面）。预算用完时旧记录如实报告失败原因，不会为了凑够备用 Provider 的机会无限延长。
   - **重试是手动的**：Retry API 由用户/前台发起；产品没有「等一会儿自动重试」的机制（冷却由熔断在 Provider 级别处理，不改变这一点）。
   - **重复的失败调用是有界的，但不是由预算拦住的**：一次 `search_sources` 最多 4 次物理请求（两个 Provider 各 2 次）且总耗时 60s 封顶；被测熔断的 Provider 在下一次调用里会被直接跳过（快速失败）；工具结果明确要求「不要反复重复调用」；剩下的边界由 host 的单 run 步数上限与 stage 超时兜住。`usage.searches` 不因失败增长，所以「失败」永远不会伪装成「已用完预算」。
@@ -588,6 +646,8 @@ bundle 新增 `presentation`，六个字段各自回答一个问题，都由真�
 
 ## Next Action
 
+独立复核的 MAJOR（订阅 landing page 被记成 `full_text`）已经关闭，证据真实性不再依赖调用方的自觉：`STEP 3.7B` 可以在此基础上开始——它要画的进度页与 Activity Log 现在读到的读取范围本身就是可信的。
+
 **STEP 3.7B — Intent Discovery & Unified Markdown Documents**（下一步）：
 
 - **活动日志与进度的正式界面**：3.7A 的 `progress` / `activityLog` 已经在 bundle 里（真实阶段、等待与冷却、请求与候选计数、每条活动的时间/阶段/级别/句子），本轮的 UI 缺口是它们还没被画出来；`api.retryResearch()` 也还没有按钮。界面上「失败 → 可以重试」目前仍只有文案，正式的进度页、Activity Log 与 Retry 入口属于 3.7B。
@@ -604,11 +664,13 @@ bundle 新增 `presentation`，六个字段各自回答一个问题，都由真�
 ## Step 3.7A 的验证入口
 
 - 发现层韧性（A–J，确定性、无网络）：`npx vitest run packages/plugin-research/tests/discovery-resilience.test.ts`。
+- **正文识别边界（MAJOR Repair，A–F + 反事实）**：`npx vitest run packages/plugin-research/tests/article-body.test.ts`。
 - Retry API 全链路（K–O）：`npx vitest run apps/research/tests/retry-api.test.ts`。
 - 进度 DTO：`npx vitest run apps/research/tests/research-progress.test.ts`。
-- 真实网络 smoke（有界，会真的访问 arXiv / OpenAlex）：`RESEARCHPAGE_REAL_NETWORK=1 npx vitest run packages/plugin-research/tests/real-network.test.ts`；其中「arXiv 不可用 → 真实 OpenAlex → 真实读取」一条把 arXiv 侧模拟为 429（这是唯一无法按需复现的一件事），其余全部真实。
+- 真实网络 smoke（有界，会真的访问 arXiv / OpenAlex，并读一次真实订阅页与一次真实开放全文）：`RESEARCHPAGE_REAL_NETWORK=1 npx vitest run packages/plugin-research/tests/real-network.test.ts`；其中「arXiv 不可用 → 真实 OpenAlex → 真实读取」一条把 arXiv 侧模拟为 429（这是唯一无法按需复现的一件事），其余全部真实。
 - 离线全量、类型检查与构建：`pnpm typecheck`、`pnpm build:research`、`EVERY_DAGENT_NO_BROWSER=1 npx vitest run --exclude "**/real-provider.e2e.test.ts" --exclude "**/real-network.test.ts" --exclude "**/render-pdf.test.ts" --exclude "**/research-plugin.real.test.ts" --exclude "**/real-demo.e2e.test.ts"`。
 - **本次实测**（2026-10-08）：`pnpm typecheck` 三个 project 全过；`pnpm build:research` 通过；离线全量 `1869 passed / 62 skipped / 0 failed`；真实网络 smoke 9/9（arXiv 当天实测可用，OpenAlex 免密钥可用，备用候选读取为 full_text 且 excerpt 可校验）。没有跑浏览器 gate（本轮未改视觉，前端未接线）。
+- **MAJOR Repair 后的复测**（2026-10-08）：`pnpm typecheck`、`pnpm build:research` 通过；离线全量 `1951 passed / 14 skipped / 1 failed`（唯一失败是既有 flake `apps/web/tests/shell-m5-sessions.browser.test.ts` 的 CDP 超时，单独重跑 23/23 通过）；`RESEARCHPAGE_REAL_NETWORK=1` 的 real-network 11/11（含新增的两例）；`article-body.test.ts` 18/18。
 
 ## Step 3.6B 的验证入口
 

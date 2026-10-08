@@ -324,6 +324,8 @@ export function createResearchTools(service: ResearchService): ResearchTools {
     description:
       "真实读取一个候选来源并保存读取快照：arXiv 论文优先取 HTML 正文（full_text / body_excerpt），没有正文时退回论文摘要（abstract）；" +
       "OpenAlex 找到的非 arXiv 论文走同一套 HTML 读取，取不到正文时按检索服务返回的真实摘要记为 abstract 级（不是正文，不能当正文证据）。" +
+      "非 arXiv 页面只有在真的呈现论文正文章节（Introduction / Methods / Results 这类）时才会被记为正文；订阅出版方的 landing page 只渲染摘要、参考文献与导航，" +
+      "会被判为没有正文并按页面自身的摘要记录为 abstract 级，不要反复重读同一个订阅页面去凑正文级证据。" +
       "工具会从保存的文本中切出与 question/terms 最相关的 1–5 条证据片段（excerpt 为原文原样字符，带位置）。" +
       "只有这里产生的 evidenceId 才能被报告引用；搜索摘要不能当证据。读取失败会如实记录失败状态。\n" +
       "role：你读完材料后判断这条来源是什么——primary（原始方法/原始研究）、official（官方文档/实现说明）、independent-evaluation（第三方评估）、" +

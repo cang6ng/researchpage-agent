@@ -397,8 +397,29 @@ const HTML_PAGE = `<!doctype html><html><head><title>Fallback Paper</title></hea
 <p>Retrieval over a knowledge graph improves recall on corpus-wide questions by summarising communities.</p>
 <p>Community detection partitions the entity graph, and each community is summarised once at index time.</p>
 <p>The reported evaluation compares community summaries against source-text summarisation with a judge.</p>
-<p>Costs are dominated by the indexing pass, which visits the whole corpus before any question is asked.</p>
-</body></html>`;
+<p>Costs are dominated by the indexing pass, which visits the whole corpus before any question is asked.</p></body></html>`;
+
+/**
+ * A subscription publisher's landing page: HTTP 200, no body at all.
+ *
+ * Its text is the abstract, the reference list and the site chrome — the shape
+ * a real Nature landing page extracts into, and the reason a generic page has
+ * to earn `full_text` before anything in it may be quoted as body evidence.
+ */
+const LANDING_PAGE = `<!doctype html><html><head><title>Landing Paper | Nature</title></head><body><article>
+<h1>Landing Paper</h1><p>B. Author and colleagues</p>
+<h2>Abstract</h2><p>This review surveys graph-based retrieval, the index construction it depends on and the questions it answers well, and reports where its summaries help corpus-level questions rather than entity lookups.</p>
+<h2>Access options</h2><p>Subscribe to this journal and receive 51 print issues and online access, or rent or buy this article.</p>
+<h2>References</h2><ol>${Array.from(
+  { length: 40 },
+  (_whole, index) =>
+    `<li>Author${index + 1}, A. A study of graph retrieval, study ${index + 1}. Journal of Retrieval Research ${index + 1}(2): 1${index}–${index + 30}, 20${10 + (index % 10)}.</li>`,
+).join("")}</ol>
+<h2>Acknowledgements</h2><p>We thank the colleagues who discussed this review with us over the years, and the library staff.</p>
+<h2>Author information</h2><p>Affiliations, correspondence and the full author list are listed on this page for reference.</p>
+<h2>Rights and permissions</h2><p>Reprints and permissions information is available from the publisher together with the licence.</p>
+<h2>About this article</h2><p>Cite this article in the journal's own format, or export the citation to a reference manager.</p>
+</article></body></html>`;
 
 describe("discovery through the service: ledger, fallback, honest reads (C, D, E, I, J)", () => {
   it("C/I. a successful fallback search is counted as a search, and every request is counted", async () => {
@@ -533,6 +554,51 @@ describe("discovery through the service: ledger, fallback, honest reads (C, D, E
       const verdict = harness.service.cellsOf(harness.taskId).find((entry) => entry.subjectId === cell.subjectId);
       expect(verdict?.status).not.toBe("reviewed");
     }
+    harness.close();
+  });
+
+  it("D. a publisher landing page that answers HTTP 200 is recorded as its abstract, not its body", async () => {
+    const harness = openHarness({
+      arxiv: [new Response("", { status: 429 })],
+      openalex: [json(openAlexBody("W8", "10.9999/landing", "Landing Paper"))],
+      readFetch: () => Promise.resolve(new Response(LANDING_PAGE, { status: 200, headers: { "content-type": "text/html" } })),
+    });
+    const search = await harness.service.search(harness.taskId, { query: "graph retrieval review" });
+    expect(search.ok).toBe(true);
+    if (!search.ok) return;
+    const sourceId = search.sources[0]?.sourceId as string;
+
+    const read = await harness.service.read(harness.taskId, { sourceId, question: "what does the review report?" });
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.readScope).toBe("abstract");
+    expect(read.note).toContain("仅摘要");
+    // What was saved is the page's abstract, not the reference list it renders.
+    const source = harness.service.sourcesOf(harness.taskId)[0];
+    expect(source?.readStatus).toBe("ok");
+    expect(source?.readScope).toBe("abstract");
+    const snapshot = harness.repo.getSnapshot(source?.snapshotId ?? "");
+    expect(snapshot?.scope).toBe("abstract");
+    expect(snapshot?.text).toContain("surveys graph-based retrieval");
+    expect(snapshot?.text).not.toContain("Journal of Retrieval Research");
+    expect(read.evidence.length).toBeGreaterThan(0);
+    for (const item of read.evidence) expect(item.scope).toBe("仅摘要");
+
+    // Even when the agent judges the excerpt a direct support, an abstract-level
+    // read cannot move the cell to「已核对」.
+    const cell = harness.service.cellsOf(harness.taskId)[0];
+    expect(cell).toBeDefined();
+    if (cell === undefined) return;
+    harness.service.recordAssessment(harness.taskId, {
+      target: { sectionId: cell.sectionId, subjectId: cell.subjectId, dimensionId: cell.dimensionId },
+      evidenceIds: [read.evidence[0]?.evidenceId as string],
+      relationship: "supports",
+      directness: "direct",
+      rationale: "supports",
+      assessor: "agent",
+    });
+    const verdict = harness.service.cellsOf(harness.taskId).find((entry) => entry.subjectId === cell.subjectId);
+    expect(verdict?.status).not.toBe("reviewed");
     harness.close();
   });
 

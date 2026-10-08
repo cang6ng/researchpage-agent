@@ -2,31 +2,44 @@
  * The read layer: what a source actually returned, and how much of it.
  *
  * The rule this module carries is the product's truth boundary: a source is
- * `read` only after a real response was fetched and its text extracted here.
- * For an arXiv paper the reader first asks for the HTML full text and, when the
- * publisher does not offer one, falls back to the paper's own abstract page —
- * and it *says which of the two happened*, because the coverage rules treat an
- * abstract-only read as partial. A PDF that cannot be parsed is a reported
- * failure, never a silent success.
+ * `read` only after a real response was fetched and its text extracted here,
+ * and the *scope* it reports is the claim the rest of the product trusts. For
+ * an arXiv paper the reader asks for the HTML full text first and falls back to
+ * the paper's own abstract page — and it says which of the two happened,
+ * because the coverage rules treat an abstract-only read as partial. A PDF that
+ * cannot be parsed is a reported failure, never a silent success.
  *
- * The third route exists because a fallback provider can locate papers this
- * reader cannot fetch (a paywalled publisher page, a PDF-only record, an arXiv
- * outage). When discovery already holds the paper's own abstract, that abstract
- * is read as an `abstract`-scope document with its provenance in the note —
- * partial, honest, and never body-level evidence. When there is no such
- * abstract either, the read fails and says why.
+ * For every other page the scope has to be earned, because the same HTTP 200
+ * carries two very different things: a paper's full text, and a subscription
+ * landing page that renders the abstract, the reference list and the site
+ * navigation as ordinary paragraphs. Only the first may be recorded as body
+ * text — a reference entry or an abstract quoted as body evidence would let a
+ * matrix cell reach「已核对」on material that never contained the claim. So a
+ * generic page is passed through `recogniseArticleBody`, and what it does not
+ * recognise is not called the body: the page's own abstract, when it states
+ * one, is recorded as an `abstract`-scope read with its provenance in the note,
+ * and otherwise the read fails and says why.
+ *
+ * Discovery's own abstract does not change that. When nothing can be fetched at
+ * all, the abstract the provider holds is still a real — and partial — read of
+ * the work, and it is recorded as one: `abstract`, with the provider named,
+ * never as the body.
  */
 
+import {
+  ABSTRACT_META_NAMES,
+  MIN_ABSTRACT_CHARS,
+  pageAbstractOf,
+  recogniseArticleBody,
+} from "./article.js";
 import type { Paragraph, ReadScope } from "./domain.js";
-import { extractHtmlDocument, extractPlainText, MAX_DOCUMENT_CHARS } from "./html.js";
+import { extractHtmlDocument, extractPlainText, MAX_DOCUMENT_CHARS, metaContent } from "./html.js";
 import { arxivIdOf, PROVIDER_NAMES, type FetchLike, type ResearchProvider } from "./search.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 4_000_000;
 const USER_AGENT = "researchpage-agent/0.1 (competition demo; contact: local run)";
 const MIN_FULL_TEXT_PARAGRAPHS = 4;
-/** The shortest abstract this reader will accept as a real one. */
-const MIN_ABSTRACT_CHARS = 120;
 
 /**
  * What discovery already knows about the work being read.
@@ -130,49 +143,67 @@ async function fetchText(
   };
 }
 
-function abstractFromAbsPage(html: string): string | undefined {
-  const match = /<meta\s+name="citation_abstract"\s+content="([\s\S]*?)"\s*\/?>/i.exec(html);
-  if (match === null) return undefined;
-  const decoded = (match[1] ?? "")
-    .replace(/&#x([0-9a-fA-F]+);/g, (_whole, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_whole, dec: string) => String.fromCodePoint(Number.parseInt(dec, 10)))
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, "&")
-    .replace(/\s+/g, " ")
-    .trim();
-  return decoded.length === 0 ? undefined : decoded;
-}
-
 interface Attempt {
   readonly url: string;
   readonly kind: "full-text" | "abstract";
+  /**
+   * Which reading rule applies to the HTML that comes back.
+   *
+   * `arxiv-html` is a known full-text document: the whole page really is the
+   * paper, so its paragraphs stand on their own. `generic` is every other host:
+   * nothing there is taken on trust.
+   */
+  readonly structure: "arxiv-html" | "generic";
 }
 
 function attemptsFor(request: ReadRequest): Attempt[] {
   const id = arxivIdOf(request.url);
   if (id !== undefined) {
     return [
-      { url: `https://arxiv.org/html/${id}`, kind: "full-text" },
-      { url: `https://arxiv.org/abs/${id}`, kind: "abstract" },
+      { url: `https://arxiv.org/html/${id}`, kind: "full-text", structure: "arxiv-html" },
+      { url: `https://arxiv.org/abs/${id}`, kind: "abstract", structure: "generic" },
     ];
   }
-  return [{ url: request.url, kind: "full-text" }];
-}
-
-function paragraphsToText(paragraphs: readonly Paragraph[]): string {
-  return paragraphs.map((paragraph) => paragraph.text).join("\n\n");
+  return [{ url: request.url, kind: "full-text", structure: "generic" }];
 }
 
 /**
- * Reads one source: HTML full text first, the paper's own abstract page second,
- * and an explicit failure when neither produced text.
+ * Reads one source: the paper's own HTML full text first, its abstract page
+ * second, an abstract the page or discovery states third, and an explicit
+ * failure when none of those produced text.
  */
 export async function readSource(request: ReadRequest, options: ReaderOptions = {}): Promise<ReadOutcome> {
   const now = options.now ?? (() => new Date());
   const notes: string[] = [];
+
+  /** An abstract-level outcome: one paragraph, and a note that says so. */
+  const abstractRead = (input: {
+    readonly text: string;
+    readonly readUrl: string;
+    readonly title: string;
+    readonly contentType: string;
+    readonly note: string;
+  }): ReadOutcome => {
+    const paragraph: Paragraph = {
+      index: 0,
+      headingPath: ["Abstract"],
+      text: input.text,
+      charStart: 0,
+      charEnd: input.text.length,
+    };
+    return {
+      status: "ok",
+      readUrl: input.readUrl,
+      fetchedAt: now().toISOString(),
+      title: input.title,
+      scope: "abstract",
+      text: input.text,
+      paragraphs: [paragraph],
+      contentType: input.contentType,
+      note: `${notes.length > 0 ? `${notes.join("；")}；` : ""}${input.note}`,
+      failure: null,
+    };
+  };
 
   for (const attempt of attemptsFor(request)) {
     const answer = await fetchText(attempt.url, options);
@@ -187,52 +218,82 @@ export async function readSource(request: ReadRequest, options: ReaderOptions = 
       answer.contentType === "";
 
     if (isHtml) {
+      const document = extractHtmlDocument(answer.text);
+
       if (attempt.kind === "abstract") {
-        const abstract = abstractFromAbsPage(answer.text);
+        const abstract = metaContent(answer.text, ABSTRACT_META_NAMES);
         if (abstract === undefined || abstract.length < 80) {
           notes.push(`${attempt.url}：未取得可用的摘要文本`);
           continue;
         }
-        const paragraph: Paragraph = {
-          index: 0,
-          headingPath: ["Abstract"],
+        return abstractRead({
           text: abstract,
-          charStart: 0,
-          charEnd: abstract.length,
-        };
+          readUrl: answer.finalUrl,
+          title: document.title,
+          contentType: answer.contentType,
+          note: "取得论文摘要页真实摘要（abstract 级读取）",
+        });
+      }
+
+      if (attempt.structure === "arxiv-html") {
+        if (document.paragraphs.length < MIN_FULL_TEXT_PARAGRAPHS) {
+          notes.push(`${attempt.url}：正文段落过少（${document.paragraphs.length}），可能不是可读正文`);
+          continue;
+        }
         return {
           status: "ok",
           readUrl: answer.finalUrl,
           fetchedAt: now().toISOString(),
-          title: extractHtmlDocument(answer.text).title,
-          scope: "abstract",
-          text: abstract,
-          paragraphs: [paragraph],
+          title: document.title,
+          scope: document.truncated || document.text.length >= MAX_DOCUMENT_CHARS ? "body_excerpt" : "full_text",
+          text: document.text,
+          paragraphs: document.paragraphs,
           contentType: answer.contentType,
-          note: `${notes.length > 0 ? `${notes.join("；")}；` : ""}取得论文摘要页真实摘要（abstract 级读取）`,
+          note: document.truncated
+            ? "取得正文但超过长度上限，按 body_excerpt 记录（已截断）"
+            : "取得公开 HTML 正文并以 full_text 记录",
           failure: null,
         };
       }
 
-      const document = extractHtmlDocument(answer.text);
-      if (document.paragraphs.length < MIN_FULL_TEXT_PARAGRAPHS) {
-        notes.push(`${attempt.url}：正文段落过少（${document.paragraphs.length}），可能不是可读正文`);
-        continue;
+      // Any other host has to *show* the paper's body before the read may be
+      // recorded as body-level. A publisher's landing page renders its abstract,
+      // its reference list and its navigation as ordinary paragraphs; counting
+      // those as full text is how a reference entry becomes body evidence.
+      const declared = pageAbstractOf(document, metaContent(answer.text, ABSTRACT_META_NAMES));
+      const held = (request.metadata?.abstract ?? "").replace(/\s+/g, " ").trim();
+      const abstract =
+        declared ??
+        (request.metadata !== undefined && held.length >= MIN_ABSTRACT_CHARS
+          ? { text: held, source: `${PROVIDER_NAMES[request.metadata.provider]} 返回的论文摘要` }
+          : undefined);
+      const body = recogniseArticleBody(document, { abstractChars: abstract?.text.length ?? 0 });
+      if (body.recognised) {
+        return {
+          status: "ok",
+          readUrl: answer.finalUrl,
+          fetchedAt: now().toISOString(),
+          title: document.title,
+          scope: body.truncated ? "body_excerpt" : "full_text",
+          text: body.text,
+          paragraphs: body.paragraphs,
+          contentType: answer.contentType,
+          note: `按 ${body.truncated ? "body_excerpt" : "full_text"} 记录：${body.reason}`,
+          failure: null,
+        };
       }
-      return {
-        status: "ok",
-        readUrl: answer.finalUrl,
-        fetchedAt: now().toISOString(),
-        title: document.title,
-        scope: document.truncated || document.text.length >= MAX_DOCUMENT_CHARS ? "body_excerpt" : "full_text",
-        text: document.text,
-        paragraphs: document.paragraphs,
-        contentType: answer.contentType,
-        note: document.truncated
-          ? "取得正文但超过长度上限，按 body_excerpt 记录（已截断）"
-          : "取得公开 HTML 正文并以 full_text 记录",
-        failure: null,
-      };
+
+      if (abstract !== undefined) {
+        return abstractRead({
+          text: abstract.text,
+          readUrl: answer.finalUrl,
+          title: document.title,
+          contentType: answer.contentType,
+          note: `该页面没有可读正文（${body.reason}），改用${abstract.source}并记录为 abstract 级读取（摘要不是正文，不能当作正文证据）`,
+        });
+      }
+      notes.push(`${attempt.url}：${body.reason}`);
+      continue;
     }
 
     if (answer.contentType.includes("application/pdf")) {
@@ -269,26 +330,13 @@ export async function readSource(request: ReadRequest, options: ReaderOptions = 
   const metadata = request.metadata;
   const abstract = (metadata?.abstract ?? "").replace(/\s+/g, " ").trim();
   if (metadata !== undefined && abstract.length >= MIN_ABSTRACT_CHARS) {
-    const paragraph: Paragraph = {
-      index: 0,
-      headingPath: ["Abstract"],
+    return abstractRead({
       text: abstract,
-      charStart: 0,
-      charEnd: abstract.length,
-    };
-    const title = (metadata.title ?? "").trim();
-    return {
-      status: "ok",
       readUrl: (metadata.workUrl ?? "").trim().length > 0 ? (metadata.workUrl as string) : request.url,
-      fetchedAt: now().toISOString(),
-      title,
-      scope: "abstract",
-      text: abstract,
-      paragraphs: [paragraph],
+      title: (metadata.title ?? "").trim(),
       contentType: "application/json",
-      note: `${notes.length > 0 ? `${notes.join("；")}；` : ""}未能取得可读正文，改用 ${PROVIDER_NAMES[metadata.provider]} 返回的论文摘要（abstract 级读取：不是正文，不能当作正文证据）`,
-      failure: null,
-    };
+      note: `未能取得可读正文，改用 ${PROVIDER_NAMES[metadata.provider]} 返回的论文摘要（abstract 级读取：不是正文，不能当作正文证据）`,
+    });
   }
 
   return {

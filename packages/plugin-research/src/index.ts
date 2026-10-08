@@ -288,7 +288,24 @@ export {
 } from "./discovery.js";
 
 export { readSource, type ReadMetadata, type ReadOutcome, type ReadRequest, type ReaderOptions } from "./read.js";
-export { decodeEntities, extractHtmlDocument, extractPlainText, MAX_DOCUMENT_CHARS } from "./html.js";
+export { decodeEntities, extractHtmlDocument, extractPlainText, MAX_DOCUMENT_CHARS, metaContent } from "./html.js";
+export {
+  ABSTRACT_META_NAMES,
+  isAbstractHeading,
+  isArticleBodyHeading,
+  isNonArticleHeading,
+  MIN_ABSTRACT_CHARS,
+  MIN_BODY_CHARS,
+  MIN_BODY_OVER_ABSTRACT,
+  MIN_BODY_PARAGRAPHS,
+  MIN_BODY_SECTIONS,
+  normaliseHeading,
+  pageAbstractOf,
+  recogniseArticleBody,
+  type ArticleBody,
+  type BodyRecognitionOptions,
+  type PageAbstract,
+} from "./article.js";
 
 export {
   draftEvidence,
