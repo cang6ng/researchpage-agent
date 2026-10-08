@@ -356,8 +356,18 @@ function documentPromptLines(documents: readonly DocumentContext[]): readonly st
     ...documents.flatMap((document) => [
       `- ${document.documentId}｜${document.filename}｜${
         document.usage.includes("research_source") ? "已被用户标为研究材料" : "仅用于帮助理解意图"
-      }｜共 ${document.chars} 字｜${document.complete ? "片段已含全文" : `本次片段为开头 ${document.previewChars} 字（部分读取）`}`,
-      ...(document.outline.length === 0 ? [] : [`  目录：${document.outline.join(" / ")}`]),
+      }｜共 ${document.chars} 字｜${document.complete ? "片段已含全文" : `本次片段为开头 ${document.previewChars} 字（部分读取）`}${
+        document.origin === "converted"
+          ? `｜转换来源：${document.conversionProvider ?? "未知"}（${
+              document.conversionTrust === "server_verified" ? "服务端转换" : "随文件自报，未经服务端核验"
+            }）`
+          : ""
+      }`,
+      // The outline is part of the same budget, so when it was cut short the
+      // line says how many headings it left out instead of reading as complete.
+      ...(document.outline.length === 0
+        ? []
+        : [`  目录${document.outlineTruncated ? `（共 ${document.outlineTotal} 个标题，只列出前 ${document.outline.length} 个）` : ""}：${document.outline.join(" / ")}`]),
     ]),
     UNTRUSTED_DOCUMENT_NOTE,
     "文档不会自动成为来源或证据：只有 read_source 真正读取后才会产生可引用片段，支持评估与其它来源同一套规则。",
@@ -474,7 +484,15 @@ export function stageInstruction(input: {
             "用户随主题提交的文档（下面是本次能看到的有界片段；需要更多内容时用 read_document 按问题读取）：",
             ...documents.flatMap((document) => [
               `- ${document.documentId}｜${document.filename}｜共 ${document.chars} 字｜${document.complete ? "本次片段已包含全文" : `本次只看到 ${document.previewChars} 字（部分读取，不要当成读完了全文）`}`,
-              ...(document.outline.length === 0 ? [] : [`  目录：${document.outline.join(" / ")}`]),
+              // A truncated outline says how much it left out: 「目录」is not the
+              // document's table of contents, it is the part of it that fitted.
+              ...(document.outline.length === 0
+                ? []
+                : [
+                    `  目录${
+                      document.outlineTruncated ? `（共 ${document.outlineTotal} 个标题，只列出前 ${document.outline.length} 个）` : ""
+                    }：${document.outline.join(" / ")}`,
+                  ]),
               `  内容片段："""${document.preview}"""`,
             ]),
             UNTRUSTED_DOCUMENT_NOTE,

@@ -56,6 +56,28 @@ export const MAX_DOCUMENT_FRAGMENTS = 12;
  */
 export const MAX_PARSED_CHARS = 600_000;
 
+/**
+ * The longest heading text kept.
+ *
+ * A heading is a label, and a file may contain a line that starts with `#` and
+ * runs for a hundred thousand characters. Clipping it at the parse keeps one
+ * absurd line from dominating every outline, prompt and panel the document ever
+ * appears in — and an outline entry is never the evidence, so a clipped label
+ * costs nothing that mattered.
+ */
+export const MAX_DOCUMENT_HEADING_CHARS = 200;
+
+/**
+ * The most characters an outline may occupy wherever one leaves this library.
+ *
+ * An outline is not free: a document with two thousand headings has an outline
+ * the size of a book chapter, and a prompt that carries it whole has spent its
+ * budget on labels instead of text. This is the bound every outline is read
+ * through — the workspace view, the read result and a prompt preview alike —
+ * and a truncated outline says how many headings it left out.
+ */
+export const MAX_DOCUMENT_OUTLINE_CHARS = 1_200;
+
 /** The only extensions this round accepts; anything else is converted first. */
 export const DOCUMENT_EXTENSIONS: readonly string[] = Object.freeze([".md", ".markdown"]);
 
@@ -96,12 +118,34 @@ export interface DocumentPageSpan {
 }
 
 /**
+ * How much the server can vouch for a conversion record.
+ *
+ * `client_claimed` is everything that arrived over HTTP: a caller may describe
+ * a conversion in any detail it likes, and the library stores that description
+ * as a *claim* — never as a fact about what produced the text. `server_verified`
+ * is only written by the server's own conversion path, when this process itself
+ * ran the converter and holds its result; the next round's MinerU adapter is the
+ * caller that will use it.
+ *
+ * The level is decided by which function was called, never by a field in the
+ * payload: a request that says `trusted: true` or `converter: "mineru"` is still
+ * a claim, because a client cannot promote its own word.
+ */
+export type ConversionTrust = "client_claimed" | "server_verified";
+
+/**
  * What produced this Markdown, when it was not uploaded as Markdown.
  *
  * The page map is optional on purpose, and its absence is meaningful: an
  * unmapped conversion cannot answer「这是原文第几页」, and a fabricated page
  * number would be a citation a reader could not check. When there is no map,
  * every page lookup answers `null`.
+ *
+ * `pageMap` offsets are character offsets into the *stored Markdown* — the text
+ * this library serves and every excerpt is verified against — which is the one
+ * coordinate system a page number can be checked in. A converter that hands over
+ * a map in another space (PDF byte offsets, its own block ids) has to translate
+ * it, or hand over no map at all.
  */
 export interface DocumentConversion {
   readonly provider: string;
@@ -111,11 +155,14 @@ export interface DocumentConversion {
   /** Its format, in the converter's words (pdf / docx / html …). */
   readonly originalFormat: string;
   readonly status: "succeeded" | "partial";
-  readonly convertedAt: string;
+  /** When the converter says it ran; null when it did not say. */
+  readonly convertedAt: string | null;
   /** Where the converter says each original page landed, when it says so. */
   readonly pageMap: readonly DocumentPageSpan[];
   /** The converter's own handle for the source file, when it has one. */
   readonly sourceRef: string | null;
+  /** Whether this server ran the conversion, or was merely told about it. */
+  readonly trust: ConversionTrust;
 }
 
 /**
@@ -151,11 +198,15 @@ function isFence(line: string): { readonly marker: string } | undefined {
   return match === null ? undefined : { marker: match[1] as string };
 }
 
-function headingOf(line: string): { readonly level: number; readonly text: string } | undefined {
+function headingOf(line: string): { readonly level: number; readonly text: string; readonly sourceChars: number } | undefined {
   const match = /^(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line);
   if (match === null) return undefined;
-  const text = (match[2] ?? "").trim();
-  return text.length === 0 ? undefined : { level: (match[1] as string).length, text };
+  const raw = (match[2] ?? "").trim();
+  if (raw.length === 0) return undefined;
+  // The label is clipped; the range it came from is not. `sourceChars` keeps the
+  // heading's own length in the Markdown, so where its text sits stays exact.
+  const text = raw.length > MAX_DOCUMENT_HEADING_CHARS ? `${raw.slice(0, MAX_DOCUMENT_HEADING_CHARS)}…` : raw;
+  return { level: (match[1] as string).length, text, sourceChars: raw.length };
 }
 
 /**
@@ -170,11 +221,13 @@ function headingOf(line: string): { readonly level: number; readonly text: strin
 export function parseDocument(markdown: string): ParsedDocument {
   const lines = markdown.split("\n");
   const headingStack: (string | undefined)[] = [];
-  const blocks: { headingPath: readonly string[]; text: string }[] = [];
+  /** A paragraph, and the range of the Markdown it was cut out of. */
+  const blocks: { headingPath: readonly string[]; text: string; sourceStart: number; sourceEnd: number }[] = [];
   /** A heading, and the paragraph index its own body starts at. */
   const headings: { level: number; text: string; titleStart: number; titleEnd: number; bodyFrom: number }[] = [];
 
   let buffer: string[] = [];
+  let bufferStart = 0;
   let offset = 0;
   let fence: string | undefined;
 
@@ -186,11 +239,33 @@ export function parseDocument(markdown: string): ParsedDocument {
     return path;
   };
 
+  const push = (line: string, lineStart: number): void => {
+    if (buffer.length === 0) bufferStart = lineStart;
+    buffer.push(line);
+  };
+
+  /**
+   * Ends the current paragraph, keeping where it sits in the Markdown.
+   *
+   * The block's own text is the block's lines trimmed; because the lines are
+   * joined with `\n`, the trimmed text is still a contiguous run of the source,
+   * and its offset is the first line's offset plus whatever was trimmed off the
+   * front. That is the offset a page map is read in — the coordinates the user's
+   * own file is written in — while `charStart`/`charEnd` stay the coordinates of
+   * the joined text an excerpt is verified against.
+   */
   const flush = (): void => {
-    const text = buffer.join("\n").trim();
+    const raw = buffer.join("\n");
     buffer = [];
-    if (text.length === 0) return;
-    blocks.push({ headingPath: headingPath(), text });
+    if (raw.trim().length === 0) return;
+    const lead = raw.length - raw.trimStart().length;
+    const text = raw.trim();
+    blocks.push({
+      headingPath: headingPath(),
+      text,
+      sourceStart: bufferStart + lead,
+      sourceEnd: bufferStart + lead + text.length,
+    });
   };
 
   for (const line of lines) {
@@ -198,13 +273,13 @@ export function parseDocument(markdown: string): ParsedDocument {
     offset += line.length + 1;
 
     if (fence !== undefined) {
-      buffer.push(line);
+      push(line, lineStart);
       if (line.trim().startsWith(fence)) fence = undefined;
       continue;
     }
     const opened = isFence(line);
     if (opened !== undefined) {
-      buffer.push(line);
+      push(line, lineStart);
       fence = opened.marker;
       continue;
     }
@@ -223,13 +298,13 @@ export function parseDocument(markdown: string): ParsedDocument {
         level: heading.level,
         text: heading.text,
         titleStart,
-        titleEnd: titleStart + heading.text.length,
+        titleEnd: titleStart + heading.sourceChars,
         // The section's body starts at the next paragraph that is written.
         bodyFrom: blocks.length,
       });
       continue;
     }
-    buffer.push(line);
+    push(line, lineStart);
   }
   flush();
 
@@ -248,6 +323,8 @@ export function parseDocument(markdown: string): ParsedDocument {
       text: block.text,
       charStart,
       charEnd: text.length,
+      sourceStart: block.sourceStart,
+      sourceEnd: block.sourceEnd,
     });
     if (text.length > MAX_PARSED_CHARS) {
       truncated = true;
@@ -338,6 +415,14 @@ export interface DocumentContentReading {
   readonly sizeBytes: number;
   readonly contentHash: string;
   readonly problems: readonly string[];
+  /**
+   * True when the refusal above is「这份文件太大」and not something else.
+   *
+   * The transport has to be able to answer an oversized file with its own
+   * status, and it may not guess that from the sentence: the size limit is the
+   * library's rule, so the library says which rule was hit.
+   */
+  readonly tooLarge: boolean;
 }
 
 /**
@@ -355,11 +440,11 @@ export function readDocumentContent(input: {
   readonly maxBytes?: number;
 }): DocumentContentReading {
   const maxBytes = input.maxBytes ?? MAX_DOCUMENT_BYTES;
-  const empty: DocumentContentReading = { ok: false, markdown: "", sizeBytes: 0, contentHash: "", problems: [] };
+  const empty: DocumentContentReading = { ok: false, markdown: "", sizeBytes: 0, contentHash: "", problems: [], tooLarge: false };
   if (input.bytes !== undefined) {
     const bytes = input.bytes;
     if (bytes.byteLength > maxBytes) {
-      return { ...empty, sizeBytes: bytes.byteLength, problems: [`文件过大（${bytes.byteLength} 字节 > 上限 ${maxBytes} 字节）`] };
+      return { ...empty, sizeBytes: bytes.byteLength, tooLarge: true, problems: [`文件过大（${bytes.byteLength} 字节 > 上限 ${maxBytes} 字节）`] };
     }
     if (bytes.includes(0)) return { ...empty, sizeBytes: bytes.byteLength, problems: ["文件包含空字节，不是文本文件"] };
     let decoded: string;
@@ -374,7 +459,7 @@ export function readDocumentContent(input: {
     const text = input.text;
     if (!isUtf8Clean(text)) return { ...empty, problems: ["内容不是合法的 UTF-8 文本"] };
     if (Buffer.byteLength(text, "utf8") > maxBytes) {
-      return { ...empty, sizeBytes: Buffer.byteLength(text, "utf8"), problems: [`文件过大（上限 ${maxBytes} 字节）`] };
+      return { ...empty, sizeBytes: Buffer.byteLength(text, "utf8"), tooLarge: true, problems: [`文件过大（上限 ${maxBytes} 字节）`] };
     }
     if (text.includes("\u0000")) return { ...empty, problems: ["内容包含空字节，不是文本文件"] };
     return finish(text, maxBytes);
@@ -386,15 +471,57 @@ function finish(decoded: string, maxBytes: number): DocumentContentReading {
   const markdown = normalizeText(decoded);
   const sizeBytes = Buffer.byteLength(markdown, "utf8");
   if (sizeBytes > maxBytes) {
-    return { ok: false, markdown: "", sizeBytes, contentHash: "", problems: [`文件过大（${sizeBytes} 字节 > 上限 ${maxBytes} 字节）`] };
+    return { ok: false, markdown: "", sizeBytes, contentHash: "", tooLarge: true, problems: [`文件过大（${sizeBytes} 字节 > 上限 ${maxBytes} 字节）`] };
   }
   if (markdown.trim().length === 0) {
-    return { ok: false, markdown: "", sizeBytes, contentHash: "", problems: ["文件是空的（没有任何可见文本）"] };
+    return { ok: false, markdown: "", sizeBytes, contentHash: "", tooLarge: false, problems: ["文件是空的（没有任何可见文本）"] };
   }
-  return { ok: true, markdown, sizeBytes, contentHash: hashOf(markdown), problems: [] };
+  return { ok: true, markdown, sizeBytes, contentHash: hashOf(markdown), problems: [], tooLarge: false };
 }
 
-/** How much of a document a bounded read returned, in the product's words. */
+/** The characters one outline entry costs when it is written as a line. */
+export function outlineEntryChars(heading: DocumentHeading): number {
+  return heading.level + 1 + heading.text.length;
+}
+
+/** An outline as a bounded list, with an honest account of what it left out. */
+export interface DocumentOutlineReading {
+  readonly headings: readonly DocumentHeading[];
+  /** The characters these headings cost as lines, which a budget has to cover. */
+  readonly chars: number;
+  /** How many headings the document has in total. */
+  readonly total: number;
+  readonly truncated: boolean;
+}
+
+/**
+ * Bounds an outline by the characters it costs.
+ *
+ * The first heading is always kept, so a document whose single label is longer
+ * than the whole budget still answers「它有什么章节」with its first one; after
+ * that, an entry is only added when it fits. `total` travels with the list
+ * because「共 2 个标题」and「共 2000 个标题（只列出前 12 个）」are different
+ * statements, and a reader may only make the true one.
+ */
+export function boundedOutline(outline: readonly DocumentHeading[], maxChars: number): DocumentOutlineReading {
+  const headings: DocumentHeading[] = [];
+  let chars = 0;
+  for (const heading of outline) {
+    const cost = outlineEntryChars(heading);
+    if (headings.length > 0 && chars + cost > maxChars) break;
+    headings.push(heading);
+    chars += cost;
+  }
+  return { headings, chars, total: outline.length, truncated: headings.length < outline.length };
+}
+
+/** The sentence that keeps a truncated outline from reading as the whole one. */
+export function outlineNote(outline: DocumentOutlineReading): string {
+  if (!outline.truncated) return `目录共 ${outline.total} 个标题`;
+  return `目录过长：共 ${outline.total} 个标题，这里只列出前 ${outline.headings.length} 个（其余未列出）`;
+}
+
+/** How much of a document a bounded preview returned, in the product's words. */
 export interface DocumentPreview {
   readonly documentId: string;
   readonly title: string;
@@ -405,11 +532,21 @@ export interface DocumentPreview {
   readonly complete: boolean;
   readonly text: string;
   readonly outline: readonly DocumentHeading[];
+  /** What the outline above cost and left out; it is part of the same budget. */
+  readonly outlineChars: number;
+  readonly outlineTotal: number;
+  readonly outlineTruncated: boolean;
   readonly note: string;
 }
 
 /**
  * A bounded preview: the opening of the document, its outline, and a count.
+ *
+ * `maxChars` is the budget for the whole answer — the opening *and* the outline
+ * together, exactly as a read's budget is. The outline takes at most a third of
+ * it, and what the outline costs is what the text gets less of, so a caller that
+ * asks for a small preview gets a small preview however many headings the
+ * document has.
  *
  * `complete` is the field the rest of the product reads, and it is true only
  * when every character of the stored text is in `text`. A preview that was cut
@@ -422,10 +559,18 @@ export function documentPreview(input: {
   readonly title: string;
   readonly parsed: ParsedDocument;
   readonly maxChars?: number;
+  /** The characters the outline may cost at most; it is part of the same budget. */
+  readonly outlineChars?: number;
 }): DocumentPreview {
   const maxChars = input.maxChars ?? MAX_DOCUMENT_PREVIEW_CHARS;
+  // A preview is for the opening of the text: a document whose labels are longer
+  // than its prose must not be「read」as a table of contents.
+  const outlineBudget = Math.max(0, Math.min(input.outlineChars ?? MAX_DOCUMENT_OUTLINE_CHARS, Math.floor(maxChars / 3)));
+  const outline = boundedOutline(input.parsed.outline, outlineBudget);
+  // What the outline cost is what the text no longer has: one budget, two parts.
+  const textBudget = Math.max(0, maxChars - outline.chars);
   const text = input.parsed.text;
-  const slice = text.length <= maxChars ? text : text.slice(0, maxChars);
+  const slice = text.length <= textBudget ? text : text.slice(0, textBudget);
   const complete = slice.length === text.length;
   return {
     documentId: input.documentId,
@@ -435,10 +580,16 @@ export function documentPreview(input: {
     totalChars: text.length,
     complete,
     text: slice,
-    outline: input.parsed.outline,
-    note: complete
-      ? `已读取全文（${text.length} 字）`
-      : `只读取了开头的 ${slice.length} 字，共 ${text.length} 字（部分读取，未读完整篇）`,
+    outline: outline.headings,
+    outlineChars: outline.chars,
+    outlineTotal: outline.total,
+    outlineTruncated: outline.truncated,
+    note: [
+      complete
+        ? `已读取全文（${text.length} 字）`
+        : `只读取了开头的 ${slice.length} 字，共 ${text.length} 字（部分读取，未读完整篇）`,
+      ...(outline.truncated ? [outlineNote(outline)] : []),
+    ].join("；"),
   };
 }
 
@@ -456,9 +607,16 @@ export interface DocumentReadRequest {
 export interface DocumentFragment {
   readonly paragraphIndex: number;
   readonly headingPath: readonly string[];
+  /** The text returned; a run of the paragraph, never more than the budget. */
   readonly text: string;
+  /** Where this text sits in the joined text excerpts are verified against. */
   readonly charStart: number;
   readonly charEnd: number;
+  /** Where it sits in the stored Markdown, the coordinates a page map uses. */
+  readonly sourceStart: number;
+  readonly sourceEnd: number;
+  /** True when the paragraph was longer than the budget and was cut short. */
+  readonly truncated: boolean;
   /** Which page of the original file this text sits on, when that is known. */
   readonly page: number | null;
 }
@@ -474,11 +632,35 @@ export interface DocumentReadResult {
   readonly totalChars: number;
   readonly fragments: readonly DocumentFragment[];
   readonly outline: readonly DocumentHeading[];
+  /** What the outline above cost and left out; it is part of the same budget. */
+  readonly outlineChars: number;
+  readonly outlineTotal: number;
+  readonly outlineTruncated: boolean;
+  /**
+   * True unless this answer really is the whole stored text.
+   *
+   * A partial read is partial because of the budget or because the request named
+   * one part, and either way the caller must not read it as「已读完整篇」. It
+   * carries the same truth as `scope`.
+   */
+  readonly truncated: boolean;
   readonly note: string;
   readonly conversion: DocumentConversion | null;
 }
 
-/** Which page of the original file a character belongs to, when it is known. */
+/** Where a paragraph begins in the stored Markdown. */
+function sourceOffsetOf(paragraph: Paragraph): number {
+  return paragraph.sourceStart ?? paragraph.charStart;
+}
+
+/**
+ * Which page of the original file a character belongs to, when it is known.
+ *
+ * `charIndex` is an offset into the *stored Markdown* — the same text the page
+ * map was recorded in — so a quote can only be given a page number when the
+ * converter mapped that part of that text. Anything else, including a paragraph
+ * quoted from the joined text without a Markdown offset, answers `null`.
+ */
 export function pageOfChar(conversion: DocumentConversion | null, charIndex: number): number | null {
   if (conversion === null) return null;
   const span = conversion.pageMap.find((entry) => charIndex >= entry.charStart && charIndex < entry.charEnd);
@@ -503,6 +685,13 @@ function sectionOwner(outline: readonly DocumentHeading[], charIndex: number): D
  * rather than the first N. Every result carries the character range it came
  * from, so a quote can be traced back into the user's own file, and the `scope`
  * field says whether the whole document was returned or only a part of it.
+ *
+ * The bound is on the *answer*, not on the paragraphs it quotes: `maxChars`
+ * covers the fragments and the outline together, and a paragraph longer than
+ * what is left is cut at a real position in the user's text (never padded, never
+ * merged) and marked `truncated`. That is the whole reason this function exists
+ * in the library rather than in the caller: a 100,000-character paragraph must
+ * not be able to answer a 400-character request with all of itself.
  */
 export function readDocument(input: {
   readonly documentId: string;
@@ -514,56 +703,127 @@ export function readDocument(input: {
 }): DocumentReadResult {
   const conversion = input.conversion ?? null;
   const maxChars = Math.max(200, input.request.maxChars ?? MAX_DOCUMENT_EXCERPT_CHARS);
+  const outline = boundedOutline(input.parsed.outline, Math.max(0, Math.min(MAX_DOCUMENT_OUTLINE_CHARS, Math.floor(maxChars / 3))));
+  // What is left for the text, once the outline has taken its share of the same
+  // budget. Both are part of the answer the caller asked to be bounded.
+  const textBudget = Math.max(0, maxChars - outline.chars);
   const paragraphs = input.parsed.paragraphs;
   const base = {
     documentId: input.documentId,
     title: input.title,
     filename: input.filename,
     totalChars: input.parsed.text.length,
-    outline: input.parsed.outline,
+    outline: outline.headings,
+    outlineChars: outline.chars,
+    outlineTotal: outline.total,
+    outlineTruncated: outline.truncated,
     conversion,
   };
 
-  const fragmentOf = (paragraph: Paragraph): DocumentFragment => ({
-    paragraphIndex: paragraph.index,
-    headingPath: paragraph.headingPath,
-    text: paragraph.text,
-    charStart: paragraph.charStart,
-    charEnd: paragraph.charEnd,
-    page: pageOfChar(conversion, paragraph.charStart),
-  });
+  /**
+   * One paragraph, read as a run of at most `max` characters from `from`.
+   *
+   * The text is always a contiguous slice of the user's own paragraph, and the
+   * two ranges it reports agree by construction: `charStart`/`charEnd` in the
+   * joined text an excerpt is verified against, `sourceStart`/`sourceEnd` in the
+   * stored Markdown a page map is written in.
+   */
+  const fragmentOf = (paragraph: Paragraph, from = 0, max = Number.MAX_SAFE_INTEGER): DocumentFragment => {
+    const available = Math.max(0, paragraph.text.length - from);
+    const length = Math.min(available, Math.max(0, max));
+    const text = paragraph.text.slice(from, from + length);
+    const charStart = paragraph.charStart + from;
+    const sourceStart = sourceOffsetOf(paragraph) + from;
+    return {
+      paragraphIndex: paragraph.index,
+      headingPath: paragraph.headingPath,
+      text,
+      charStart,
+      charEnd: charStart + text.length,
+      sourceStart,
+      sourceEnd: sourceStart + text.length,
+      truncated: from > 0 || length < paragraph.text.length,
+      page: pageOfChar(conversion, sourceStart),
+    };
+  };
 
   const settle = (
     strategy: DocumentReadResult["strategy"],
     fragments: readonly DocumentFragment[],
+    note: string,
   ): DocumentReadResult => {
     const readChars = fragments.reduce((sum, fragment) => sum + fragment.text.length, 0);
-    const full = fragments.length === paragraphs.length && readChars === input.parsed.text.length;
+    const clipped = fragments.some((fragment) => fragment.truncated);
+    const whole =
+      fragments.length === paragraphs.length && readChars === input.parsed.text.length && !clipped && !input.parsed.truncated;
     return {
       ...base,
-      scope: full ? "full" : "partial",
+      scope: whole ? "full" : "partial",
       strategy,
       readChars,
       fragments,
-      note: full
-        ? `已读取全文（${input.parsed.text.length} 字）`
-        : `只读取了 ${readChars} 字，共 ${input.parsed.text.length} 字（部分读取，未读完整篇）`,
+      truncated: !whole,
+      note: [
+        whole
+          ? `已读取全文（${input.parsed.text.length} 字）`
+          : `只读取了 ${readChars} 字，共 ${input.parsed.text.length} 字（部分读取，未读完整篇）`,
+        ...(note.length === 0 ? [] : [note]),
+        ...(outline.truncated ? [outlineNote(outline)] : []),
+      ].join("；"),
     };
+  };
+
+  /** Paragraphs are added while they fit whole; the first one may be clipped. */
+  const fit = (candidates: readonly Paragraph[], windowOf: (paragraph: Paragraph) => number): readonly DocumentFragment[] => {
+    const kept: DocumentFragment[] = [];
+    let used = 0;
+    for (const paragraph of candidates) {
+      const remaining = textBudget - used;
+      if (remaining <= 0) break;
+      if (paragraph.text.length > remaining) {
+        // A paragraph that does not fit is only ever the *first* fragment: it is
+        // what the caller asked for by index, or the best match for the terms,
+        // and answering with nothing because it is long would be worse than
+        // answering with its beginning and saying so.
+        if (kept.length > 0) continue;
+        kept.push(fragmentOf(paragraph, Math.min(windowOf(paragraph), Math.max(0, paragraph.text.length - 1)), remaining));
+        break;
+      }
+      kept.push(fragmentOf(paragraph));
+      used += paragraph.text.length;
+      if (used >= textBudget) break;
+    }
+    return kept;
   };
 
   if (input.request.paragraphIndex !== undefined) {
     const paragraph = paragraphs.find((candidate) => candidate.index === input.request.paragraphIndex);
-    if (paragraph === undefined) return settle("paragraph", []);
-    return settle("paragraph", [fragmentOf(paragraph)]);
+    if (paragraph === undefined) return settle("paragraph", [], "");
+    const fragments = fit([paragraph], () => 0);
+    const first = fragments[0];
+    return settle(
+      "paragraph",
+      fragments,
+      first !== undefined && first.truncated
+        ? `这个段落较长（${paragraph.text.length} 字），只返回了它在原文 ${first.sourceStart}–${first.sourceEnd} 位置的 ${first.text.length} 字`
+        : "",
+    );
   }
 
   if (input.request.sectionIndex !== undefined) {
     const heading = input.parsed.outline[input.request.sectionIndex];
-    if (heading === undefined) return settle("section", []);
+    if (heading === undefined) return settle("section", [], "");
     const inside = paragraphs.filter(
       (paragraph) => paragraph.charStart >= heading.charStart && paragraph.charEnd <= Math.max(heading.charEnd, heading.charStart),
     );
-    return settle("section", inside.slice(0, MAX_DOCUMENT_FRAGMENTS).map(fragmentOf));
+    const fragments = fit(inside.slice(0, MAX_DOCUMENT_FRAGMENTS), () => 0);
+    return settle(
+      "section",
+      fragments,
+      fragments.length < inside.slice(0, MAX_DOCUMENT_FRAGMENTS).length
+        ? `这一节有 ${inside.length} 段，本次只返回了前 ${fragments.length} 段（受字符上限限制）`
+        : "",
+    );
   }
 
   const terms = [...(input.request.terms ?? []), ...tokenize(input.request.question ?? "")];
@@ -593,32 +853,46 @@ export function readDocument(input: {
     }
   }
 
+  /** Where a clipped window should start, so it still contains what was asked. */
+  const matchWindow = (paragraph: Paragraph): number => {
+    const body = paragraph.text.toLowerCase();
+    let best = -1;
+    for (const term of terms) {
+      const needle = term.toLowerCase();
+      if (needle.length === 0) continue;
+      const at = body.indexOf(needle);
+      if (at === -1) continue;
+      if (best === -1 || at < best) best = at;
+    }
+    return best <= 0 ? 0 : best;
+  };
+
   if (picked.length === 0) {
     // Nothing matched: an opening per section, so the reader gets the shape of
     // the document rather than an arbitrary tail of it.
     const seen = new Set<string>();
+    const spread: Paragraph[] = [];
     for (const paragraph of paragraphs) {
       const key = (sectionOwner(input.parsed.outline, paragraph.charStart)?.text ?? paragraph.headingPath.join(">")) || "(document)";
       if (seen.has(key)) continue;
       seen.add(key);
-      picked.push(paragraph);
-      if (picked.length >= MAX_DOCUMENT_FRAGMENTS) break;
+      spread.push(paragraph);
+      if (spread.length >= MAX_DOCUMENT_FRAGMENTS) break;
     }
-    return settle("spread", picked.map(fragmentOf));
+    const fragments = fit(spread, () => 0);
+    return settle(
+      "spread",
+      fragments,
+      fragments.length < spread.length ? `本次只返回了 ${fragments.length} 段（共 ${paragraphs.length} 段，受字符上限限制）` : "",
+    );
   }
 
-  // Bounded output: fragments are added while they fit, and the first one is
-  // always kept so a small budget still returns something locatable.
-  const kept: DocumentFragment[] = [];
-  let used = 0;
-  for (const paragraph of picked) {
-    const fragment = fragmentOf(paragraph);
-    if (kept.length > 0 && used + fragment.text.length > maxChars) continue;
-    kept.push(fragment);
-    used += fragment.text.length;
-    if (used >= maxChars) break;
-  }
-  return settle("match", kept);
+  const fragments = fit(picked, matchWindow);
+  return settle(
+    "match",
+    fragments,
+    fragments.length < picked.length ? `匹配到 ${picked.length} 段，本次只返回了前 ${fragments.length} 段（受字符上限限制）` : "",
+  );
 }
 
 /** Terms a question is read into; the product's own tokenizer, kept local. */
@@ -630,6 +904,121 @@ function tokenize(text: string): readonly string[] {
     if (run.length >= 3) terms.push(run);
   }
   return terms;
+}
+
+/** The longest original-file description a conversion record keeps. */
+const MAX_CONVERTER_FILENAME_CHARS = 300;
+const MAX_CONVERTER_PROVIDER_CHARS = 40;
+const MAX_CONVERTER_VERSION_CHARS = 60;
+const MAX_CONVERTER_FORMAT_CHARS = 20;
+const MAX_CONVERTER_REF_CHARS = 200;
+
+/** A converter's own record, as it arrives: every field is untrusted. */
+export interface DocumentConversionInput {
+  readonly provider?: unknown;
+  readonly version?: unknown;
+  readonly originalFilename?: unknown;
+  readonly originalFormat?: unknown;
+  readonly status?: unknown;
+  readonly pageMap?: unknown;
+  readonly sourceRef?: unknown;
+  readonly convertedAt?: unknown;
+}
+
+export interface DocumentConversionReading {
+  readonly conversion: DocumentConversion | null;
+  readonly problems: readonly string[];
+}
+
+/** A label a converter supplies: kept as a description, never as a path. */
+function converterLabel(value: unknown, maxChars: number): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (text.length === 0 || text.length > maxChars) return "";
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(text)) return "";
+  return text;
+}
+
+/**
+ * Reads what a caller says produced this Markdown.
+ *
+ * The record is only ever as good as the call path that supplied it: `trust` is
+ * a parameter, not a field, because a payload that declares `trusted: true` or
+ * `verified: true` is exactly the claim this function is meant to keep from
+ * being believed. Everything else here is legality — a timestamp that parses, a
+ * format that is a format, and a page map whose ranges are inside the Markdown
+ * this document actually stores, in order and not overlapping. A map that fails
+ * any of those is refused rather than trimmed: a page number that came from
+ * arithmetic nobody can reproduce is worse than no page number at all.
+ */
+export function readConversionRecord(
+  input: DocumentConversionInput | undefined,
+  options: { readonly trust: ConversionTrust; readonly markdownLength: number },
+): DocumentConversionReading {
+  if (input === undefined) return { conversion: null, problems: [] };
+  const provider = converterLabel(input.provider, MAX_CONVERTER_PROVIDER_CHARS);
+  if (provider.length === 0) return { conversion: null, problems: ["转换来源必须写清 provider（例如 mineru）"] };
+  const status = input.status === "partial" ? "partial" : input.status === "succeeded" || input.status === undefined ? "succeeded" : null;
+  if (status === null) {
+    return {
+      conversion: null,
+      problems: ["转换状态只接受 succeeded 或 partial；转换失败的文件不会进入文档库（请转换成功后重传）"],
+    };
+  }
+  const originalFilename = converterLabel(input.originalFilename, MAX_CONVERTER_FILENAME_CHARS);
+  const originalFormat = converterLabel(input.originalFormat, MAX_CONVERTER_FORMAT_CHARS).toLowerCase();
+  if (originalFilename.length === 0) {
+    return { conversion: null, problems: [`转换来源必须写明原始文件名（originalFilename，1–${MAX_CONVERTER_FILENAME_CHARS} 字符，不含控制字符）`] };
+  }
+  if (!/^[a-z0-9][a-z0-9+.-]{0,19}$/.test(originalFormat)) {
+    return { conversion: null, problems: ["原始格式（originalFormat）必须是一个格式名，例如 pdf / docx / html"] };
+  }
+  const convertedAt = typeof input.convertedAt === "string" ? input.convertedAt.trim() : "";
+  if (convertedAt.length > 0 && Number.isNaN(Date.parse(convertedAt))) {
+    return { conversion: null, problems: ["转换时间（convertedAt）必须是可解析的时间戳，例如 2026-10-08T09:00:00Z"] };
+  }
+  const pageMap: DocumentPageSpan[] = [];
+  if (input.pageMap !== undefined) {
+    if (!Array.isArray(input.pageMap)) return { conversion: null, problems: ["pageMap 必须是数组，每一项是 { page, charStart, charEnd }"] };
+    let previousEnd = 0;
+    for (const entry of input.pageMap) {
+      if (typeof entry !== "object" || entry === null) return { conversion: null, problems: ["pageMap 的每一项必须是 { page, charStart, charEnd }"] };
+      const record = entry as Record<string, unknown>;
+      const page = typeof record["page"] === "number" && Number.isInteger(record["page"]) && record["page"] > 0 ? record["page"] : null;
+      const charStart = typeof record["charStart"] === "number" && Number.isInteger(record["charStart"]) && record["charStart"] >= 0 ? record["charStart"] : null;
+      const charEnd = typeof record["charEnd"] === "number" && Number.isInteger(record["charEnd"]) && record["charEnd"] > 0 ? record["charEnd"] : null;
+      if (page === null || charStart === null || charEnd === null || charEnd <= charStart) {
+        return { conversion: null, problems: ["pageMap 的每一项必须是 { page, charStart, charEnd }，且 charEnd > charStart（没有页码映射就不要提供 pageMap）"] };
+      }
+      if (charEnd > options.markdownLength) {
+        return {
+          conversion: null,
+          problems: [`pageMap 的第 ${String(page)} 页超出这份 Markdown 的长度（charEnd ${String(charEnd)} > ${String(options.markdownLength)}）`],
+        };
+      }
+      if (charStart < previousEnd) {
+        return { conversion: null, problems: ["pageMap 的区间必须按页码顺序排列、互不重叠"] };
+      }
+      previousEnd = charEnd;
+      pageMap.push({ page, charStart, charEnd });
+    }
+  }
+  return {
+    conversion: {
+      provider,
+      version: converterLabel(input.version, MAX_CONVERTER_VERSION_CHARS) || null,
+      originalFilename,
+      originalFormat,
+      status,
+      // No converter time means no converter time: the library records that it
+      // does not know rather than stamping the conversion with its own clock.
+      convertedAt: convertedAt.length > 0 ? new Date(Date.parse(convertedAt)).toISOString() : null,
+      pageMap,
+      sourceRef: converterLabel(input.sourceRef, MAX_CONVERTER_REF_CHARS) || null,
+      trust: options.trust,
+    },
+    problems: [],
+  };
 }
 
 /** The filename a converted document is stored under: a Markdown name. */
@@ -649,7 +1038,15 @@ export function documentSummaryLine(input: {
 }): string {
   const size = input.sizeBytes < 1024 ? `${input.sizeBytes} 字节` : `${Math.round(input.sizeBytes / 1024)} KB`;
   if (input.origin === "converted" && input.conversion !== null) {
-    return `${input.filename}（${size}，由 ${input.conversion.provider} 从 ${input.conversion.originalFormat} 转换${input.conversion.status === "partial" ? "，转换不完整" : ""}）`;
+    const conversion = input.conversion;
+    // Who ran the conversion is part of what this sentence claims. A description
+    // the server was handed says so; only a conversion this process performed
+    // may be stated as a fact about where the Markdown came from.
+    const provenance =
+      conversion.trust === "server_verified"
+        ? `由服务端调用 ${conversion.provider} 从 ${conversion.originalFormat} 转换`
+        : `随文件自报由 ${conversion.provider} 从 ${conversion.originalFormat} 转换（未经过服务端核验）`;
+    return `${input.filename}（${size}，${provenance}${conversion.status === "partial" ? "，转换不完整" : ""}）`;
   }
   return `${input.filename}（${size}，用户直接上传的 Markdown）`;
 }
@@ -674,6 +1071,16 @@ export interface StoredDocument {
   readonly contentHash: string;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /**
+   * How many times this document has been written, counted from 1.
+   *
+   * A timestamp is not a version: two writes in the same millisecond would share
+   * one, and a caller that read the document before the first of them could
+   * still be told its write was current. The counter is what makes「你读的那一
+   * 版已经过去了」a fact rather than a guess. Documents stored before this
+   * field existed answer 1.
+   */
+  readonly revision?: number | undefined;
   readonly origin: DocumentOrigin;
   readonly conversionProvider: string | null;
   readonly conversion: DocumentConversion | null;
@@ -687,6 +1094,11 @@ export interface StoredDocument {
   readonly promotedAt: string | null;
   /** The normalized Markdown: the text this library serves, quotes and reads. */
   readonly markdown: string;
+}
+
+/** The revision a document is at, for a caller that has to name one. */
+export function documentRevision(document: StoredDocument): number {
+  return document.revision ?? 1;
 }
 
 /** The document as the workspace reads it: no full text, and an honest count. */
@@ -705,6 +1117,11 @@ export interface DocumentView {
   readonly status: "ready" | "failed";
   readonly usage: readonly DocumentUsage[];
   readonly outline: readonly DocumentHeading[];
+  /** The headings the outline above left out, if any; it is bounded like all of them. */
+  readonly outlineTotal: number;
+  readonly outlineTruncated: boolean;
+  /** The revision a caller names when it updates this document. */
+  readonly revision: number;
   readonly note: string;
   readonly failure: string | null;
   readonly linkedSourceId: string | null;
@@ -715,6 +1132,7 @@ export interface DocumentView {
 
 export function documentViewOf(document: StoredDocument): DocumentView {
   const parsed = parseDocument(document.markdown);
+  const outline = boundedOutline(parsed.outline, MAX_DOCUMENT_OUTLINE_CHARS);
   return {
     documentId: document.id,
     sessionId: document.sessionId,
@@ -729,7 +1147,10 @@ export function documentViewOf(document: StoredDocument): DocumentView {
     conversion: document.conversion,
     status: document.status,
     usage: document.usage,
-    outline: document.outline,
+    outline: outline.headings,
+    outlineTotal: outline.total,
+    outlineTruncated: outline.truncated,
+    revision: documentRevision(document),
     note: document.note,
     failure: document.failure,
     linkedSourceId: document.linkedSourceId,

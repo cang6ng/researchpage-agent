@@ -10,6 +10,8 @@
 
 ## Current Status（2026-10-08）
 
+- **Step 3.7B Repair（独立复核的六项修复）已完成**：复核证实 3.7B 的文档库有两个 BLOCKER（任意 sessionId 即可读写删别人的文档；`role` 参数可把用户文档标成 official / primary）、三个 MAJOR（客户端可自报 MinerU 转换并获得看似可信的来源记录；单段 10 万字可绕过 `maxChars`、2 000 标题的目录可塞进 Context；JSON 上传被 32 KiB 限制挡住、非法 UTF-8 被静默替换）、一个 MINOR（pageMap 与读取用了两套字符坐标，页码错位），全部按服务层统一作用域校验 / 来源身份锁定 / 转换可信等级与内部可信写入路径 / 读取与目录硬上限 / 统一内容限制与 fatal UTF-8 / Markdown 坐标契约修完，并用 26 个反例测试（Service + 真实工具 + 真实 HTTP + runner）与既有 3.7B 测试一起验证。未改语义、未进 MinerU 开发、未动前端。见下「Step 3.7B Repair」。
+
 - **Step 3.7B（Intent Discovery & Unified Markdown Documents）已完成**：修掉了「用户输入 Transformer → 模型自己指定完整研究题目 → 再让用户补信息」这个错误流程——正式研究主题现在必须由用户在意图探索里确认（`IntentDraft` 是独立持久化的事实来源，`confirmedDirection` 只能由用户动作写入，模型没有任何工具能替用户确认），并且用户在研究全流程都能上传 Markdown（同一套文档库、有界读取、明确区分 Intent Context 与 Research Source，后者走既有 Source → Snapshot → Evidence 通道并保留 `user-provided` 身份）。没有重写 Agent Core / Host / Protocol / Client，没有装 MinerU / MCP，没有解析 PDF / DOCX，没有重做前端（首页与上传按钮属于 GLM 的下一轮；旧 `POST /api/research/tasks` 作为兼容入口保留并自我声明）。见下「Step 3.7B」。
 
 - **Step 3.7A（Research Runtime Reliability）已完成**：真实用户测试发现的「arXiv 429 → 研究彻底停下、模型反复无效检索、界面说可以重试却没有 Retry API、失败请求统计不到、用户不知道在等什么」按有界重试 / 备用 Provider / 熔断 / 请求台账 / 活动日志 / 进度 DTO / Retry API 全部修完，并用真实网络 smoke 验证「arXiv 失败 → 备用检索（OpenAlex）→ 真实读取 → 快照与证据」。没有重写 Agent Core / Host / Protocol / Client，没有新增通用搜索框架、Web Search、MinerU、MCP、文件上传、Intent Discovery，没有改 Brief / Guide / Proposal / Evidence / Claim 语义，没有重做前端（正式进度页与 Activity Log UI 属于下一轮）。随后的独立复核只报出 1 条 MAJOR——**订阅出版方的 landing page 被记成 `full_text`**——已在 2026-10-08 定向修复：非 arXiv 的正文必须被识别出来（正文章节 + 段数 + 字数 + 与摘要的比值），否则如实降级到 abstract 级或失败（见下「Step 3.7A MAJOR Repair」）。
@@ -35,6 +37,74 @@
 - **Vertical Product 可真实演示**：Topic → Task Card → 确认 → 真实检索/读取 → Evidence Matrix → 缺口定向补查（≤2 轮）→ 结构化报告 → HTML 预览 → PDF 下载 → 刷新重开。
 - **Step 1（Research Editing Semantics）已完成**：Ask / Research / Edit 三种正式意图由应用签发 Action Grant 约束；Edit 产出待接受 Proposal；报告版本可冻结、导出只读冻结依赖包；矩阵状态不再由「有正文片段」直接升级为充分。
 - 真实 Demo 两个主题此前均通过（真实模型 + 真实 arXiv + 真实 Chrome PDF）；Step 2 后又用新版各重跑一次（见「Current Status」与「Step 2 的验证入口」）。
+
+## Step 3.7B Repair（独立复核的六项修复）
+
+一次独立复核（Codex）证实 3.7B 的文档库有 6 个缺陷：两个 BLOCKER（任何持有任意 sessionId 的请求都能读到、改到、删到别人的文档；模型可以用 `role` 参数把用户上传的文档标成 official / primary），三个 MAJOR（普通客户端能自报 MinerU 转换并获得看起来可信的来源记录；单段 10 万字可以绕过 `maxChars`，2 000 个标题的目录可以塞进 Context；JSON 上传被 32 KiB 请求体上限挡住、非法 UTF-8 会被静默替换成 U+FFFD），一个 MINOR（pageMap 用 Markdown 坐标，读取却用「删掉标题后重新拼接」的段落坐标，页码因此错位）。本轮只修这六项，不改语义、不加功能、不重写 Intent Discovery、不进入 MinerU 开发。
+
+### 1. 文档操作统一会话作用域（BLOCKER）
+
+- **根因**：路由从**目标文档**反查 `sessionId` 并把它当作调用者身份（`POST /documents/:id/read` 传的是 `existing.sessionId`），于是这个比较是在和自己比；`GET /documents/:id`、`/content`、`PATCH`、`DELETE` 则完全没有会话校验（`DELETE` 连参数都不取）。
+- **修复**：新增唯一的检查点 `requireDocumentAccess(documentId, ref)`（`service.ts`）。调用方必须自己声明 `sessionId | intentId | taskId`（服务端解析这些 id 并交叉核对），然后与文档所属会话比较；**没有任何一处再从文档反推调用者身份**。上传、列表、内容、读取、改用途、删除、关联、导入、转来源全部走它；`documentViewOf` / `documentTextOf` / `documentsOf` / `readDocument` / `setDocumentUsage` / `deleteDocument` / `linkDocumentToTask` / `promoteDocumentToSource` 都要求调用方作用域，路由只负责把请求里声明的 id 传下去。
+- **状态码**：缺会话 `400 document_scope_missing`（不泄漏「有没有这份文档」）、文档不存在 `404 document_not_found`、属于别的会话 `403 document_cross_session`（调用方持有有效会话 id 时如实告知被拒原因，而不是伪装成不存在）、内容超限 `413 document_too_large`。列表在没给作用域时**拒绝**而不是回答空数组（空数组会被读成「这个会话没有文档」）。
+- **过期写**：文档新增 `revision`（从 1 开始，每次写 +1）。原来的时间戳在同一毫秒内的两次写入里是同一个值，「你读到的那一版已经过去了」因此无法成立；现在 `PATCH`/`DELETE` 可带 `expectedRevision`，过期返回 `409 + conflict: true`。旧行没有该字段时按 1 读。
+- **安全边界（如实说明）**：本产品**没有登录**，`sessionId` / `intentId` / `taskId` 就是 bearer capability——知道 id 就等于持有该会话的能力。本轮保证的是**作用域一致**（一个会话的文档只能被声明为该会话的调用者操作，服务层与 HTTP 层同一套判断，路由无法绕过），不是身份认证。要跨用户隔离，需要先有真正的认证层。
+
+### 2. 用户文档的来源身份由服务端锁定（BLOCKER）
+
+- **根因**：`read_source` 的 `role` 参数被无条件写入（`const role = input.role ?? source.role ?? null`），一次 `role: "official"` 就能把用户上传的文档变成 Claim Contract 眼里的官方来源。
+- **修复**：用户文档构成的来源（`source.document != null` 或 `url` 以 `document://` 开头）身份**恒为 `user-provided`**：服务端忽略任何其它取值，并在结果里回 `roleIgnored: true` 与一句说明；首次读取、快照复用、失败写入、以及「记录里已经被写错」的情况都会写回正确身份。判断在 service 层，不依赖提示词；Claim Contract 与支持评估规则未做任何改动。工具的 `role` 说明也写明了这一点。
+
+### 3. 转换来源的可信等级（MAJOR）
+
+- **根因**：`/documents/import` 接受的 `converter / conversionStatus / jobId / pageMap` 等字段直接成为 `conversion` 记录，与「服务端自己跑过转换」不可区分。
+- **修复**：`DocumentConversion.trust = "client_claimed" | "server_verified"`，由**调用路径**决定，不由 payload 决定：
+  - HTTP 上传与 `/documents/import` 一律写 `client_claimed`；请求里写 `trusted: true` / `verified: true` / `converter: "mineru"` / `conversion.provider` 都只是**描述**，不影响等级（响应回 `conversionTrust` 并在 note 里说明「未经过服务端核验」）。
+  - **可信写入路径**：`service.importConvertedDocument(input)`（实现 `importConvertedDocumentImpl`，与普通上传共用全部限制、去重、读取、权限）——只有进程内的转换适配器能调用，它在 HTTP 上不可达。3.7C 的 MinerU adapter 走这一条。
+  - **合法性校验**（两条路径都做，`readConversionRecord`）：provider / originalFilename / originalFormat 必填且形状合法；`convertedAt` 必须可解析（缺省存 `null`，**不伪造**时间）；`pageMap` 每项必须 `charEnd > charStart`、区间落在该文档 Markdown 长度以内、按页码顺序且互不重叠。
+- **`jobId`**：契约里对应 `conversion.sourceRef`（转换器自己的句柄），同样是 claim 字段；服务端不据此认定任何事。
+
+### 4. 读取与上下文的硬上限（MAJOR）
+
+- **根因**：`maxChars` 只用来决定「再塞一段会不会超」，单段本身直接整段返回（10 万字段落 → 10 万字返回）；目录/标题完全不计入预算（2 000 标题 → 26 万字目录进 Context）。
+- **修复**：预算统一为**整份回答**——正文 + 目录 + 章节条目都在 `maxChars` 之内：
+  - 所有策略（默认 / 按段落 / 按章节 / 按关键词 / 展开）共用同一套 `fit()`：段落放得下就整段、放不下就按**原文位置**取窗口（关键词匹配时窗口从命中处开始），并标 `fragment.truncated`；`scope` 只有在真的返回全文且没有被截断时才是 `full`。
+  - 目录按字符上限 `MAX_DOCUMENT_OUTLINE_CHARS = 1200`（并占预算的三分之一以内）截断；被截断时明说「目录过长：共 N 个标题，这里只列出前 M 个（其余未列出）」——视图、读取结果、Context 块、runner 指令三处口径一致。标题本身也按 200 字符裁剪（一条超长标题不能霸占提示词）。
+  - `DocumentContext` 的 `previewChars + outlineChars ≤ 该文档的预算`，`documentPreview` 的 `maxChars` 同样覆盖两者；`GET /tasks/:id` bundle 的 `documents[].outline` 一并受限并带 `outlineTotal`。
+
+### 5. 上传内容限制与 UTF-8（MAJOR）
+
+- **根因**：JSON 上传走 `readBody` 的默认 32 KiB 上限（更大的请求体被读成 `undefined` → `{}` → 报「缺少文件名」）；raw 允许 512 KiB + 64 KiB，与内容上限不一致；JSON 请求体在 `JSON.parse` 之前用**非 fatal** 解码，非法 UTF-8 先被替换成 U+FFFD，随后任何校验都看不到问题，于是「看起来合法」的乱码被静默保存。
+- **修复**：raw 上限 = 内容上限 512 KiB；JSON 上限 = 2 × 512 KiB + 64 KiB（base64 膨胀与 envelope）；请求体一律 fatal UTF-8 解码，非法编码 400 拒绝；顺序固定为**先内容、后会话**（超大文件不会被误报成缺少会话）；错误彼此可辨——envelope 过大 413「请求体过大」、内容超限 413「文件过大」+ `code: document_too_large`、缺会话 400 `document_scope_missing`、编码非法 400、文件名非法 400。随主题提交的附件（`POST /intents`）与 `/documents/import` 走同一个 JSON reader，不再有「40 KiB 被静默丢掉」的入口。
+
+### 6. pageMap 的字符坐标契约（MINOR）
+
+- **根因**：pageMap 的偏移是**持久化 Markdown** 的字符坐标，而读取用的是解析后「删掉标题、段落重新用空行拼接」文本的坐标；两者数值不同，第二页因此可能被算成第一页。
+- **修复**：解析时为每个段落记录它在原文 Markdown 中的区间（`Paragraph.sourceStart/sourceEnd`），读取结果的片段同时报告两套坐标（`charStart/charEnd` = 用于证据校验的拼接文本坐标，`sourceStart/sourceEnd` = 用于页码的 Markdown 坐标），页码只看后者，映射之外一律 `null`。**契约**：`pageMap` 的 `charStart/charEnd` 是持久化 Markdown 的字符偏移，必须落在文本长度以内、不倒置、按序不重叠——不满足即拒绝入库，绝不按段落序号猜页码。
+
+### 修复轮新增测试（26 例，全部为反例）
+
+- `packages/plugin-research/tests/documents-repair.test.ts`（18 例，Service + 真实工具调用）：另一会话的 id 在 view / content / read / PATCH / delete / link / source 上全部被拒且文档无损；无名会话被拒、列表不匿名、未知文档 404；过期 revision 写被拒（409）且用途未变；`role=official/primary` 在首次读取、快照复用、以及记录已被写错之后都被忽略并回报；HTTP 上传的转换是 `client_claimed`（payload 自报 `trusted/verified` 无效）、服务端导入是 `server_verified`；pageMap 越界 / 倒置 / 重叠 / 时间不可解析全部拒绝；10 万字段落 `maxChars=400` 只返回 400 字以内的原文窗口并标 partial/truncated，关键词窗口包含命中处；2 000 标题的目录在 view / context / read 三处都被限界并说明省略了多少；40 KiB 接受、超限 `document_too_large`、非 UTF-8 与孤立代理项拒绝、缺会话与超大文件报各自的错；文档来源读入证据且 excerpt 与快照精确一致、读取不耗预算。
+- `apps/research/tests/document-isolation.test.ts`（8 例，真实 HTTP + runner）：另一会话的 GET/POST/PATCH/DELETE 全部 403（含 `/content` 与 `/read`），本人仍可读；无名会话 400、未知文档 404、列表拒绝；`expectedRevision` 过期 409；`/documents/import` 自报 `converter: mineru` + `trusted/verified` 仍是 `client_claimed`（并验证服务端路径写 `server_verified`）；40 KiB JSON / base64 通过且同内容去重、GBK 原始字节与 GBK 藏在 JSON 里都被 400 拒绝、路径穿越拒绝；raw / JSON / base64 三种入口对 512 KiB 超限给出一致答案、envelope 过大单独报「请求体过大」；超大文件同时缺会话时报文件过大；随主题提交的 40 KiB 附件真的入库；2 000 标题的文档让意图阶段的第一条真实指令保持在 2 万字以内，并写明「只列出前 N 个」。
+
+### 修复轮的后端改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `packages/plugin-research/src/documents.ts` | `ConversionTrust` / `DocumentConversion.trust`、`documentRevision`、`revision`、`boundedOutline` / `outlineNote` / `outlineEntryChars`、`readConversionRecord`（合法性校验）、`MAX_DOCUMENT_HEADING_CHARS` / `MAX_DOCUMENT_OUTLINE_CHARS`、段落原文区间、读取预算与窗口截取、`tooLarge` |
+| `packages/plugin-research/src/domain.ts` | `Paragraph.sourceStart/sourceEnd`（可选，文档段落才有） |
+| `packages/plugin-research/src/service.ts` | `DocumentAccessRef`、`requireDocumentAccess`、`importConvertedDocument`、`roleIgnored`（user-provided 锁定）、`documentContextImpl` 的目录预算、拒绝码 `document_*` |
+| `apps/research/src/server/routes.ts` | `readBytes` 区分「过大 / 读取失败」、`readJsonBody`（fatal UTF-8 + 各自的错误）、`documentScopeOf` / `sendRefusal`、全部文档路由改为传调用方作用域、`MAX_UPLOAD_BYTES = 512 KiB`、`MAX_UPLOAD_JSON_BYTES` |
+| `apps/research/src/server/runner.ts` | 意图指令里被截断的目录说明（任务阶段指令同理） |
+| `packages/plugin-research/src/tools.ts` | `read_source` 的 role 说明（用户文档固定 user-provided）、`read_document` 的 `maxChars` / `truncated` / 双坐标说明 |
+
+未改动：Agent Core / Host / Protocol / Client、Search Fallback、Retry / Circuit Breaker、Evidence Truth Contract、Claim Validator、PDF Renderer、Artifact Blueprint、Report Proposal 接受机制、Intent Discovery 语义、前端。
+
+### 修复轮的已知边界
+
+- **没有认证**：见上面第 1 节的说明。`sessionId` 是 bearer capability，本轮只统一了作用域校验。
+- **转换可信等级只有两档**：`client_claimed` / `server_verified`；校验「转换结果与原文一致」需要 3.7C 真的接上 MinerU 之后才能做，本轮不做。
+- **`pageMap` 是转换器的责任**：服务端只验证区间合法，无法判断页码是否与 PDF 真实分页一致；没有映射时一律 `null`。
 
 ## Step 3.7B 新增（本次工作产物）
 
@@ -68,28 +138,34 @@
 
 ### MinerU Integration Contract（3.7C 必须按这个接口接入）
 
+> 3.7B Repair 更新了两处：**可信等级**（HTTP 路径只能写 `client_claimed`，3.7C 的适配器必须走服务端内部路径，见下）与 **pageMap 坐标契约**（偏移是持久化 Markdown 的字符偏移）。下面已按修复后的行为重写。
+
 导入接口（已实现、已测试）：
 
 ```
-POST /api/research/documents/import
+POST /api/research/documents/import          // 普通 HTTP 调用：只写 client_claimed
 {
-  "sessionId" | "intentId" | "taskId": "<三选一，文档必须绑定到可信会话>",
+  "sessionId" | "intentId" | "taskId": "<三选一，文档必须绑定到调用方自己的会话>",
   "filename": "paper.md",            // 可选；缺省时由 markdownNameFor(originalFilename) 派生
-  "markdown": "…",                    // 归一化后的 Markdown 文本（或用 "markdownBase64" 传字节，走 UTF-8 校验）
-  "originalFilename": "paper.pdf",    // 必填：转换器收到的原始文件名
-  "originalFormat": "pdf",            // 必填：原始格式（pdf / docx / html …）
+  "markdown": "…",                    // 归一化后的 Markdown 文本（或用 "markdownBase64" 传字节，走 fatal UTF-8 校验）
+  "originalFilename": "paper.pdf",    // 必填：转换器收到的原始文件名（≤300 字符，无控制字符）
+  "originalFormat": "pdf",            // 必填：原始格式名（pdf / docx / html …，1–20 字符）
   "converter": "mineru",              // 必填：provider 名（也可写 "conversion": { "provider": … }）
   "conversionStatus": "succeeded",    // succeeded | partial；failed 会被拒绝（400），转换失败的文件不入库
-  "pageMap": [{ "page": 1, "charStart": 0, "charEnd": 1200 }],  // 可选：页码 → Markdown 字符区间的映射
+  "pageMap": [{ "page": 1, "charStart": 0, "charEnd": 1200 }],  // 可选：页码 → 持久化 Markdown 字符区间
   "usage": ["intent_context", "research_source"]                // 可选，默认 intent_context
 }
-→ 201 { ok, document: { documentId, origin: "converted", conversionProvider, conversion: { provider, version, originalFilename,
-        originalFormat, status, convertedAt, pageMap, sourceRef }, … }, duplicate, sessionId, taskId, note }
-→ 400 { error, problems, guidance }   // provider / originalFilename / originalFormat 缺失、status=failed、pageMap 非法
+→ 201 { ok, document: { documentId, origin: "converted", conversionProvider, conversionTrust: "client_claimed",
+        conversion: { provider, version, originalFilename, originalFormat, status, convertedAt, pageMap, sourceRef,
+                      trust: "client_claimed" }, … }, duplicate, sessionId, taskId, note }
+→ 400 { error, problems, guidance }   // provider / originalFilename / originalFormat 缺失或形状非法、status=failed、
+                                      // convertedAt 不可解析、pageMap 越界/倒置/重叠/无序
+→ 403 { code: "document_cross_session" } / 400 { code: "document_scope_missing" } / 413（内容或请求体超限）
 ```
 
-- **同一套库、同一套逻辑**：转换导入与直接上传共用持久化、去重、读取、关联与权限；区别只有 `origin: "converted"` 与 `conversion` 元信息。
-- **页码不伪造**：`pageMap` 只在转换器真的给出时才存；`pageOfChar()` 在映射之外一律返回 `null`（不猜页码），`Source.document.pageMap` 为 `null` 表示没有任何页码知识。
+- **可信转换必须走服务端内部路径**：`service.importConvertedDocument(input)`（同样的字段，`conversion` 必填）写 `trust: "server_verified"`。它**在 HTTP 上不可达**——3.7C 的 MinerU 适配器（MCP 调用发生在服务端进程内）直接调用这个方法，把 MCP 真实返回的结果交给它；不要新增 HTTP 接口，也不要把「服务端跑过」这件事交给客户端声明。
+- **同一套库、同一套逻辑**：两条路径共用持久化、去重、读取、关联、限制与权限；区别只有 `origin: "converted"`、`conversion` 元信息与 `trust`。
+- **页码不伪造**：`pageMap` 只在转换器真的给出时才存；偏移必须落在该文档的持久化 Markdown 之内、按页码升序且互不重叠；`pageOfChar()` 在映射之外一律返回 `null`（不猜页码），`Source.document.pageMap` 为 `null` 表示没有任何页码知识。`convertedAt` 缺省存 `null`，不拿服务端时钟冒充。
 - **可追踪链**：`Original File → Converter → Markdown → Snapshot`——数据库里分别是 `conversion.originalFilename / originalFormat / provider / version / status / convertedAt / sourceRef`、文档的 `markdown`、以及读取后的 `ReadSnapshot`（其 note 会写明「MinerU 从 pdf 转换得到的 Markdown（原始文件：paper.pdf）」）。**转换后的 Markdown 不是新的原始学术来源**，进入 Source 时身份是 `user-provided`，不会获得 official / primary。
 - **本轮**没有**做的事**：没有安装 MinerU、没有实现 MCP client / tool registry / marketplace、没有解析 PDF / DOCX / HTML。3.7C 只需把 MinerU 的输出按上面的字段 POST 到这一个接口。
 - **验证入口**：`apps/research/tests/document-api.test.ts` 的「imports a converted document through the contract 3.7C will call」（含成功、`failed` 拒绝、缺 provider 拒绝）与 `packages/plugin-research/tests/documents.test.ts` 的 N / O（页码映射、无映射时 page 全为 null、半声明转换被拒）。
@@ -104,15 +180,17 @@ POST /api/research/documents/import
 | `POST /api/research/intents/:id/messages` | 提交一轮回答（可带 `documentIds`；对已确认的方向返回 409） |
 | `POST /api/research/intents/:id/direction` | 用户自己修改建议方向（仍是提案） |
 | `POST /api/research/intents/:id/confirm` | **用户确认研究方向**（唯一写 `confirmedDirection` 的入口），随后排队任务卡阶段 |
-| `POST /api/research/documents` | 上传 Markdown（JSON `{filename, content}` / `{filename, contentBase64}`，或原始请求体 + `?filename=&sessionId=`） |
-| `POST /api/research/documents/import` | 转换器导入（见上） |
-| `GET /api/research/documents?sessionId=\|intentId=\|taskId=` | 文档列表 |
-| `GET /api/research/documents/:id` / `/content` | 元信息 + 目录 / 原始 Markdown |
-| `POST /api/research/documents/:id/read` | 有界读取（question / terms / sectionIndex / paragraphIndex / maxChars） |
-| `PATCH /api/research/documents/:id` | 指定用途（`usage`） |
+| `POST /api/research/documents` | 上传 Markdown（JSON `{filename, content}` / `{filename, contentBase64}`，或原始请求体 + `?filename=&sessionId=`）；上限 512 KiB，超限 413 |
+| `POST /api/research/documents/import` | 转换器导入（见上；HTTP 路径一律 `client_claimed`） |
+| `GET /api/research/documents?sessionId=\|intentId=\|taskId=` | 文档列表（必须点名会话，否则 400） |
+| `GET /api/research/documents/:id` / `/content` | 元信息 + 目录 / 原始 Markdown（须带 `sessionId\|intentId\|taskId`） |
+| `POST /api/research/documents/:id/read` | 有界读取（question / terms / sectionIndex / paragraphIndex / maxChars；预算覆盖正文 + 目录） |
+| `PATCH /api/research/documents/:id` | 指定用途（`usage`，可带 `expectedRevision`；过期 409） |
 | `POST /api/research/documents/:id/link` | 关联到正式 Task |
 | `POST /api/research/documents/:id/source` | 纳入来源系统（要求已标为研究材料） |
 | `DELETE /api/research/documents/:id` | 移出文档库（已保存的读取与证据保留） |
+
+文档路由的权限口径（3.7B Repair 后）：调用方必须声明自己的会话（`sessionId` 或该会话的 `intentId` / `taskId`），服务端据此与文档所属会话比较；缺会话 `400 document_scope_missing`、文档不存在 `404 document_not_found`、跨会话 `403 document_cross_session`。**任何路由都不会从目标文档反查会话 id 当作调用者身份**。
 
 `GET /api/research/tasks/:id` 的 bundle 新增 `documents[]` 与 `intent`（来源方向、`seedTopic`、确认时间）；`runs` 的 stage 联合类型新增 `intent`（意图阶段没有 task，因此不写 run 记录）。
 
@@ -148,7 +226,12 @@ POST /api/research/documents/import
 
 ### Next Action
 
-**STEP 3.7C — MinerU MCP Conversion Integration**。要做的就是把 MinerU（或任何转换器）产出的 Markdown 按上面的 `POST /api/research/documents/import` 契约送进同一个文档库：字段、限制、拒绝规则、页码映射语义、以及 `Original File → Converter → Markdown → Snapshot` 的追踪都已在本轮固定并有测试；3.7C 需要新增的只是 MCP 侧（工具声明、调用、失败处理）与转换器的页码/结构映射，**不要**新建第二套文档存储，也不要让转换结果获得 `official` / `primary` 身份。
+**STEP 3.7C — MinerU MCP Conversion Integration**。要做的就是把 MinerU（或任何转换器）产出的 Markdown 送进同一个文档库：字段、限制、拒绝规则、页码映射语义、以及 `Original File → Converter → Markdown → Snapshot` 的追踪都已固定并有测试；3.7C 需要新增的只是 MCP 侧（工具声明、调用、失败处理）与转换器的页码/结构映射，**不要**新建第二套文档存储，也不要让转换结果获得 `official` / `primary` 身份。
+
+3.7C 接入时的两个硬约束（3.7B Repair 后）：
+
+1. **写 `server_verified` 必须调用进程内的 `service.importConvertedDocument(input)`**（`packages/plugin-research`），而不是 `POST /api/research/documents/import`——HTTP 路径只能写 `client_claimed`，无论 payload 怎么写。适配器拿到 MCP 的真实转换结果后调用它；`conversion` 记录里的 `provider / version / originalFilename / originalFormat / status / convertedAt / pageMap / sourceRef` 按上面的字段给。
+2. **`pageMap` 用持久化 Markdown 的字符偏移**：区间必须落在该 Markdown 长度以内、按页码升序、互不重叠，否则拒绝入库。适配器不能给「按段落序号推算」的页码，也不要在没有把握时给 pageMap——没有映射时读取一律回 `page: null`，这比错页码安全。验证入口：`packages/plugin-research/tests/documents-repair.test.ts` 的 C / G 两组与 `apps/research/tests/document-isolation.test.ts` 的转换用例。
 
 ## Step 3.7A 新增（本次工作产物）
 

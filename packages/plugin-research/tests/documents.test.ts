@@ -230,11 +230,14 @@ describe("the library is persistent and located", () => {
 
     const second = openResearchRepository({ location });
     const appB = createResearchService({ repo: second });
-    const restored = appB.documentViewOf(documentId);
-    expect(restored?.originalFilename).toBe("notes.md");
-    expect(restored?.contentHash).toBe(uploaded.document.contentHash);
-    expect(restored?.title).toBe("长上下文推理成本速览");
-    expect(appB.documentTextOf(documentId)?.markdown).toBe(PAPER);
+    const restored = appB.documentViewOf(documentId, { sessionId: "d_5" });
+    if (restored === undefined || "ok" in restored) throw new Error("document lost");
+    expect(restored.originalFilename).toBe("notes.md");
+    expect(restored.contentHash).toBe(uploaded.document.contentHash);
+    expect(restored.title).toBe("长上下文推理成本速览");
+    const stored = appB.documentTextOf(documentId, { sessionId: "d_5" });
+    if (stored === undefined || "ok" in stored) throw new Error("document text lost");
+    expect(stored.markdown).toBe(PAPER);
     // And it is still attached to the exploration that was open when it arrived.
     expect(appB.intentForSession("d_5")?.documents.map((document) => document.documentId)).toEqual([documentId]);
     second.close();
@@ -288,9 +291,9 @@ describe("the library is persistent and located", () => {
     expect(matched.fragments.length).toBeGreaterThan(0);
     expect(matched.fragments.map((fragment) => fragment.text).join("\n")).toContain("Mamba");
     const first = matched.fragments[0];
-    const document = app.documentTextOf(documentId);
-    expect(document).toBeDefined();
-    expect(document?.markdown.length).toBeGreaterThan(first?.charStart ?? 0);
+    const document = app.documentTextOf(documentId, { sessionId: "d_6" });
+    if (document === undefined || "ok" in document) throw new Error("document text lost");
+    expect(document.markdown.length).toBeGreaterThan(first?.charStart ?? 0);
 
     // Reading a whole small document may say it read the whole thing.
     const small = app.uploadDocument({ sessionId: "d_6", filename: "small.md", content: { text: "# t\n\n一" } });
@@ -336,7 +339,7 @@ describe("intent context is not research material", () => {
     expect(early.problems.join("")).toContain("研究材料");
     expect(app.sourcesOf(taskId)).toHaveLength(0);
 
-    const marked = app.setDocumentUsage(documentId, ["intent_context", "research_source"]);
+    const marked = app.setDocumentUsage(documentId, ["intent_context", "research_source"], { sessionId: "d_8" });
     expect(marked.ok).toBe(true);
     const promoted = app.promoteDocumentToSource(documentId, { taskId });
     expect(promoted.ok).toBe(true);
@@ -371,8 +374,13 @@ ${"补充说明段落。".repeat(200)}`;
     expect(context).toHaveLength(1);
     expect(context[0]?.note).toContain(UNTRUSTED_DOCUMENT_NOTE);
     expect(context[0]?.complete).toBe(false);
-    expect(context[0]?.previewChars).toBe(400);
-    expect(context[0]?.chars).toBeGreaterThan(1_000);
+    // The budget covers the whole block: the opening and the outline together.
+    const block = context[0];
+    if (block === undefined) return;
+    const outlineChars = block.outline.reduce((sum, line) => sum + line.length, 0);
+    expect(block.previewChars + outlineChars).toBeLessThanOrEqual(400);
+    expect(block.previewChars).toBeGreaterThan(300);
+    expect(block.chars).toBeGreaterThan(1_000);
   });
 
   it("L. reading a document source spends no discovery budget and produces verifiable evidence", async () => {
@@ -439,11 +447,11 @@ ${"补充说明段落。".repeat(200)}`;
     });
     expect(read.ok).toBe(true);
 
-    const removed = app.deleteDocument(uploaded.document.documentId);
+    const removed = app.deleteDocument(uploaded.document.documentId, { sessionId: "d_11" });
     expect(removed.ok).toBe(true);
     if (removed.ok !== true) return;
     expect(removed.note).toContain("保留");
-    expect(app.documentViewOf(uploaded.document.documentId)).toBeUndefined();
+    expect("ok" in (app.documentViewOf(uploaded.document.documentId, { sessionId: "d_11" }) ?? {})).toBe(true);
     expect(app.sourcesOf(taskId)).toHaveLength(1);
     expect(app.evidenceOf(taskId).length).toBeGreaterThan(0);
 

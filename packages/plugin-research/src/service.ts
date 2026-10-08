@@ -68,6 +68,7 @@ import {
 import { readSource, type ReadOutcome, type ReadRequest } from "./read.js";
 import {
   documentPreview,
+  documentRevision,
   documentSummaryLine,
   documentViewOf as documentViewOfStored,
   markdownNameFor,
@@ -75,10 +76,12 @@ import {
   MAX_DOCUMENT_BYTES,
   MAX_DOCUMENT_PREVIEW_CHARS,
   parseDocument,
+  readConversionRecord,
   readDocument as readDocumentText,
   readDocumentContent,
   readDocumentFilename,
   UNTRUSTED_DOCUMENT_NOTE,
+  type ConversionTrust,
   type DocumentConversion,
   type DocumentOrigin,
   type DocumentReadRequest,
@@ -227,7 +230,21 @@ export interface Refusal {
    * `proposal_not_created` means that chance was already spent and the action
    * ends without a proposal.
    */
-  readonly code?: "proposal_invalid" | "proposal_not_created";
+  readonly code?:
+    | "proposal_invalid"
+    | "proposal_not_created"
+    /**
+     * The document refusals, so an API answers each with the right status.
+     * `document_scope_missing` never names whose document it is (there is no
+     * caller to compare against), `document_not_found` is a 404,
+     * `document_cross_session` is a 403 — the document exists and is not the
+     * caller's — and `document_too_large` is a 413, because「文件太大」and
+     * 「请求不合法」are different answers with different fixes.
+     */
+    | "document_scope_missing"
+    | "document_not_found"
+    | "document_cross_session"
+    | "document_too_large";
   /**
    * What to tell the user, when the reader's sentence differs from the model's.
    *
@@ -278,6 +295,14 @@ export interface ReadResult {
   readonly readUrl: string;
   /** What this source was judged to be; used by the claim contract. */
   readonly role: SourceRole | null;
+  /**
+   * Set when the caller asked for a role this source cannot have.
+   *
+   * Only user-uploaded documents can raise this: their provenance is fixed at
+   * `user-provided`, and the flag says the argument was seen and refused rather
+   * than silently dropped.
+   */
+  readonly roleIgnored?: boolean;
   readonly textChars: number;
   readonly paragraphCount: number;
   readonly reuse: boolean;
@@ -671,6 +696,8 @@ export interface DocumentContext {
   readonly title: string;
   readonly origin: DocumentOrigin;
   readonly conversionProvider: string | null;
+  /** Who the server believes produced the Markdown: a claim, or its own call. */
+  readonly conversionTrust: ConversionTrust | null;
   readonly usage: readonly DocumentUsage[];
   readonly chars: number;
   readonly previewChars: number;
@@ -678,8 +705,28 @@ export interface DocumentContext {
   readonly complete: boolean;
   readonly preview: string;
   readonly outline: readonly string[];
+  readonly outlineTotal: number;
+  readonly outlineTruncated: boolean;
   /** The sentence that has to travel with this text, always. */
   readonly note: string;
+}
+
+/**
+ * Who is asking, for a document operation.
+ *
+ * This is the whole identity model on this path: a caller names the session it
+ * is acting for — directly, or through the exploration or task it owns — and
+ * that name is *resolved and compared*, never copied off the document it is
+ * trying to reach. There is no login in this product yet, so a session id is a
+ * bearer capability: the guarantee this type buys is scope consistency, not
+ * authentication.
+ */
+export interface DocumentAccessRef {
+  readonly sessionId?: string | undefined;
+  readonly intentId?: string | undefined;
+  readonly taskId?: string | undefined;
+  /** Refuses the write when the document moved on since the caller read it. */
+  readonly expectedRevision?: number | undefined;
 }
 
 export interface DocumentUploadInput {
@@ -796,11 +843,30 @@ export interface ResearchService {
   bindIntentToTask(intentId: string, taskId: string): IntentView;
 
   // ------------------------------------------------------------- documents --
-  /** Saves one Markdown document into the library; duplicates are found here. */
+  /**
+   * Saves one Markdown document into the library; duplicates are found here.
+   *
+   * A document always belongs to a session, and the caller has to name one it
+   * is acting for — directly or through the exploration or task it owns. There
+   * is no anonymous upload, and no way to attach a file to a session by naming
+   * a document that already lives there.
+   */
   uploadDocument(input: DocumentUploadInput): DocumentUploadResult | Refusal;
-  documentViewOf(documentId: string): DocumentView | undefined;
-  documentTextOf(documentId: string): StoredDocument | undefined;
-  documentsOf(scope: { readonly sessionId?: string; readonly taskId?: string; readonly documentIds?: readonly string[] }): readonly DocumentView[];
+  /**
+   * The server's own conversion import: the entry point MinerU's adapter uses.
+   *
+   * It writes `server_verified` provenance because the conversion happened in
+   * this process, and it shares every limit and every read path with an
+   * ordinary upload. It is not reachable over HTTP: the public import route
+   * records what a caller *claims*, at `client_claimed`.
+   */
+  importConvertedDocument(input: DocumentUploadInput): DocumentUploadResult | Refusal;
+  /** One document, as its own session reads it. */
+  documentViewOf(documentId: string, ref: DocumentAccessRef): DocumentView | Refusal;
+  /** The stored Markdown itself, for its own session only. */
+  documentTextOf(documentId: string, ref: DocumentAccessRef): StoredDocument | Refusal;
+  /** The library of one session the caller named. */
+  documentsOf(scope: DocumentAccessRef): readonly DocumentView[] | Refusal;
   /**
    * The bounded context of documents, for a prompt or a panel.
    *
@@ -811,13 +877,13 @@ export interface ResearchService {
    */
   documentContextOf(scope: { readonly sessionId?: string; readonly taskId?: string; readonly documentIds?: readonly string[] }, maxChars?: number): readonly DocumentContext[];
   /** A bounded, located read of one document — the agent's way into the full text. */
-  readDocument(input: { readonly sessionId: string; readonly documentId: string; readonly request: DocumentReadRequest }): DocumentReadOutcome;
+  readDocument(input: DocumentAccessRef & { readonly documentId: string; readonly request: DocumentReadRequest }): DocumentReadOutcome;
   /** Removes a document from the library; saved reads and evidence stay. */
-  deleteDocument(documentId: string, input?: { readonly sessionId?: string }): { readonly ok: true; readonly documentId: string; readonly note: string } | Refusal;
+  deleteDocument(documentId: string, ref: DocumentAccessRef): { readonly ok: true; readonly documentId: string; readonly note: string } | Refusal;
   /** Declares what a document is for: understanding intent, material, or both. */
-  setDocumentUsage(documentId: string, usage: unknown): DocumentUploadResult | Refusal;
+  setDocumentUsage(documentId: string, usage: unknown, ref: DocumentAccessRef): DocumentUploadResult | Refusal;
   /** Attaches a document to the task it belongs to. */
-  linkDocumentToTask(documentId: string, taskId: string, input?: { readonly sessionId?: string }): DocumentUploadResult | Refusal;
+  linkDocumentToTask(documentId: string, taskId: string, ref: DocumentAccessRef): DocumentUploadResult | Refusal;
   /**
    * Turns a document the user marked as material into a real research source.
    *
@@ -826,7 +892,10 @@ export interface ResearchService {
    * the same excerpt check and the same support assessment as anything found on
    * the network. Nothing about it is allowed to look like a publication.
    */
-  promoteDocumentToSource(documentId: string, input: { readonly taskId: string; readonly sessionId?: string }): { readonly ok: true; readonly source: Source; readonly created: boolean; readonly note: string } | Refusal;
+  promoteDocumentToSource(
+    documentId: string,
+    input: { readonly taskId: string; readonly sessionId?: string },
+  ): { readonly ok: true; readonly source: Source; readonly created: boolean; readonly note: string } | Refusal;
 
   // ------------------------------------------------------------------ brief --
   /** The Research Brief: the editable draft, or the frozen record once confirmed. */
@@ -2205,6 +2274,53 @@ export function createResearchService(options: ResearchServiceOptions): Research
     return { ok: true, sessionId, taskId, intent };
   }
 
+  /**
+   * The one check every operation on an existing document goes through.
+   *
+   * A document belongs to exactly one session, and an operation on it is only
+   * ever performed *as* a caller bound to that session. The caller's session is
+   * therefore resolved from the ids the request carried and compared with the
+   * document's; it is never read off the document and treated as the caller's
+   * identity, which would make this function answer「是它自己」to every
+   * question and let any request holding any session id reach any document.
+   *
+   * Four refusals, each distinguishable by code because a caller has to answer
+   * them differently: no scope at all, no such document, someone else's
+   * document, and a document that moved on since it was read.
+   */
+  function requireDocumentAccess(
+    documentId: string,
+    ref: DocumentAccessRef,
+  ): { readonly ok: true; readonly document: StoredDocument } | Refusal {
+    const scope = resolveDocumentScope(ref);
+    if (scope.ok !== true) {
+      const missing = scope.problems.some((problem) => problem.includes("缺少会话信息"));
+      return { ...scope, ...(missing ? { code: "document_scope_missing" as const } : {}) };
+    }
+    const document = repo.getDocument(documentId);
+    if (document === undefined) {
+      return { ok: false, problems: [`没有找到文档：${documentId}`], guidance: "它可能已经被删除。", code: "document_not_found" };
+    }
+    if (document.sessionId !== scope.sessionId) {
+      return {
+        ok: false,
+        problems: [`文档 ${documentId} 不属于这个会话`],
+        guidance: "文档只在它所属的会话里可读、可改、可删：请带上上传它的 sessionId（或该会话的 intentId / taskId），不要用别的会话 id 访问。",
+        code: "document_cross_session",
+      };
+    }
+    const expected = ref.expectedRevision;
+    if (expected !== undefined && expected !== documentRevision(document)) {
+      return {
+        ok: false,
+        problems: [`这份文档已经更新到第 ${documentRevision(document)} 版，不是你读到的第 ${expected} 版`],
+        guidance: "请重新读取文档后再提交，避免覆盖刚刚发生的修改。",
+        conflict: true,
+      };
+    }
+    return { ok: true, document };
+  }
+
   function readDocumentUsage(value: unknown, fallback: readonly DocumentUsage[]): { readonly usage: readonly DocumentUsage[]; readonly problem: string } {
     if (value === undefined) return { usage: fallback, problem: "" };
     if (!Array.isArray(value)) return { usage: fallback, problem: "usage 必须是数组（intent_context / research_source）" };
@@ -2219,50 +2335,22 @@ export function createResearchService(options: ResearchServiceOptions): Research
     return { usage, problem: "" };
   }
 
-  /** Reads a converter's own record, keeping only what it can be held to. */
-  function readConversion(input: DocumentUploadInput["conversion"]): { readonly conversion: DocumentConversion | null; readonly problems: readonly string[] } {
-    if (input === undefined) return { conversion: null, problems: [] };
-    const provider = typeof input.provider === "string" ? input.provider.trim() : "";
-    if (provider.length === 0) return { conversion: null, problems: ["转换来源必须写清 provider（例如 mineru）"] };
-    const status = input.status === "partial" ? "partial" : input.status === "succeeded" || input.status === undefined ? "succeeded" : null;
-    if (status === null) {
-      return {
-        conversion: null,
-        problems: ["转换状态只接受 succeeded 或 partial；转换失败的文件不会进入文档库（请转换成功后重传）"],
-      };
-    }
-    const originalFilename = typeof input.originalFilename === "string" ? input.originalFilename.trim() : "";
-    const originalFormat = typeof input.originalFormat === "string" ? input.originalFormat.trim().toLowerCase() : "";
-    if (originalFilename.length === 0 || originalFormat.length === 0) {
-      return { conversion: null, problems: ["转换来源必须写明原始文件名（originalFilename）与原始格式（originalFormat）"] };
-    }
-    const pageMap: { page: number; charStart: number; charEnd: number }[] = [];
-    if (Array.isArray(input.pageMap)) {
-      for (const entry of input.pageMap) {
-        if (typeof entry !== "object" || entry === null) continue;
-        const record = entry as Record<string, unknown>;
-        const page = typeof record["page"] === "number" && Number.isInteger(record["page"]) && record["page"] > 0 ? record["page"] : null;
-        const charStart = typeof record["charStart"] === "number" && Number.isInteger(record["charStart"]) && record["charStart"] >= 0 ? record["charStart"] : null;
-        const charEnd = typeof record["charEnd"] === "number" && Number.isInteger(record["charEnd"]) && record["charEnd"] > 0 ? record["charEnd"] : null;
-        if (page === null || charStart === null || charEnd === null || charEnd <= charStart) {
-          return { conversion: null, problems: ["pageMap 的每一项必须是 { page, charStart, charEnd }，且 charEnd > charStart（没有页码映射就不要提供 pageMap）"] };
-        }
-        pageMap.push({ page, charStart, charEnd });
-      }
-    }
-    return {
-      conversion: {
-        provider,
-        version: typeof input.version === "string" && input.version.trim().length > 0 ? input.version.trim() : null,
-        originalFilename,
-        originalFormat,
-        status,
-        convertedAt: typeof input.convertedAt === "string" && input.convertedAt.trim().length > 0 ? input.convertedAt.trim() : isoNow(),
-        pageMap,
-        sourceRef: typeof input.sourceRef === "string" && input.sourceRef.trim().length > 0 ? input.sourceRef.trim() : null,
-      },
-      problems: [],
-    };
+  /**
+   * Reads a converter's own record, at the trust level of the path that called.
+   *
+   * `trust` is a parameter and never a field of the payload: everything that
+   * arrives over HTTP is `client_claimed`, and only `importConvertedDocument` —
+   * the entry point this process's own converter adapter uses — writes a
+   * `server_verified` record. A caller that sends `trusted: true`, `verified:
+   * true` or `converter: "mineru"` is describing a conversion, not performing
+   * one, and the record it gets says exactly that.
+   */
+  function readConversion(
+    input: DocumentUploadInput["conversion"],
+    trust: ConversionTrust,
+    markdownLength: number,
+  ): { readonly conversion: DocumentConversion | null; readonly problems: readonly string[] } {
+    return readConversionRecord(input, { trust, markdownLength });
   }
 
   function documentUsageLine(usage: readonly DocumentUsage[]): string {
@@ -2271,10 +2359,11 @@ export function createResearchService(options: ResearchServiceOptions): Research
       .join("、");
   }
 
-  function uploadDocumentImpl(input: DocumentUploadInput): DocumentUploadResult | Refusal {
-    const scope = resolveDocumentScope(input);
-    if (scope.ok !== true) return scope;
-
+  function uploadDocumentImpl(input: DocumentUploadInput, options: { readonly trust: ConversionTrust }): DocumentUploadResult | Refusal {
+    // What the file *is* is checked before whose file it is, and deliberately:
+    // a caller who sent a 600 KiB body and no session has to be told the file is
+    // too large, not that a field is missing. The order of these checks is the
+    // product's answer to「为什么我的大文件被说成缺少会话」.
     const filename = readDocumentFilename(input.filename);
     if (!filename.ok) {
       return {
@@ -2289,15 +2378,21 @@ export function createResearchService(options: ResearchServiceOptions): Research
         ok: false,
         problems: content.problems,
         guidance: `本轮只接受 UTF-8 的 Markdown 文本，单文件上限 ${MAX_DOCUMENT_BYTES} 字节；PDF / DOCX / HTML 需要先转换成 Markdown 再导入。`,
+        ...(content.tooLarge ? { code: "document_too_large" as const } : {}),
       };
     }
-    const conversion = readConversion(input.conversion);
+    const conversion = readConversion(input.conversion, options.trust, content.markdown.length);
     if (conversion.problems.length > 0) {
       return { ok: false, problems: conversion.problems, guidance: "转换来源的元信息必须完整，否则这份文档无法追踪到原始文件。" };
     }
     const usageReading = readDocumentUsage(input.usage, ["intent_context"]);
     if (usageReading.problem.length > 0) {
       return { ok: false, problems: [usageReading.problem], guidance: "用途只能是 intent_context / research_source，至少一个。" };
+    }
+    const scope = resolveDocumentScope(input);
+    if (scope.ok !== true) {
+      const missing = scope.problems.some((problem) => problem.includes("缺少会话信息"));
+      return { ...scope, ...(missing ? { code: "document_scope_missing" as const } : {}) };
     }
 
     // The same bytes in the same session are the same document: the library
@@ -2338,6 +2433,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
       contentHash: content.contentHash,
       createdAt: at,
       updatedAt: at,
+      revision: 1,
       origin: converted === null ? "direct_upload" : "converted",
       conversionProvider: converted === null ? null : converted.provider,
       conversion: converted,
@@ -2361,8 +2457,24 @@ export function createResearchService(options: ResearchServiceOptions): Research
       note:
         converted === null
           ? `已保存 ${filename.value}（${content.sizeBytes} 字节，${parsed.paragraphs.length} 段）。它是用户提供的材料，不会自动成为研究来源。`
-          : `已保存 ${filename.value}（由 ${converted.provider} 从 ${converted.originalFormat} 转换${converted.status === "partial" ? "，转换不完整" : ""}；${converted.pageMap.length === 0 ? "没有页码映射，读取时不会给出页码" : `带 ${converted.pageMap.length} 段页码映射`}）。`,
+          : `已保存 ${filename.value}（${
+              converted.trust === "server_verified" ? `由服务端调用 ${converted.provider} 从 ${converted.originalFormat} 转换` : `随文件自报由 ${converted.provider} 从 ${converted.originalFormat} 转换（未经服务端核验）`
+            }${converted.status === "partial" ? "，转换不完整" : ""}；${converted.pageMap.length === 0 ? "没有页码映射，读取时不会给出页码" : `带 ${converted.pageMap.length} 段页码映射`}）。`,
     };
+  }
+
+  /**
+   * The server's own conversion import: MinerU's adapter calls this.
+   *
+   * It is the one path that can write `server_verified` provenance, and it is
+   * deliberately not reachable over HTTP: the caller has to be code running in
+   * this process, holding the converter's actual result. Everything else about
+   * the document — its limits, its reading, its place in the library — is the
+   * same code as an ordinary upload, because a converted file is not a different
+   * kind of document.
+   */
+  function importConvertedDocumentImpl(input: DocumentUploadInput): DocumentUploadResult | Refusal {
+    return uploadDocumentImpl(input, { trust: "server_verified" });
   }
 
   /** Records a document on the exploration it was uploaded to. */
@@ -2473,8 +2585,11 @@ export function createResearchService(options: ResearchServiceOptions): Research
    * Bounded twice over — a preview per document, and a total the caller
    * chooses — because the one thing this product must never do is paste whole
    * uploads into a model's context and then behave as if the model had read
-   * them. Each block says how much of its document it really contains, and
-   * carries the sentence that marks the text as data rather than instruction.
+   * them. The budget covers everything a block carries, the outline included: a
+   * document with two thousand headings must not be able to spend the whole
+   * context on its table of contents. Each block says how much of its document
+   * it really contains, and carries the sentence that marks the text as data
+   * rather than instruction.
    */
   function documentContextImpl(
     scope: { readonly sessionId?: string; readonly taskId?: string; readonly documentIds?: readonly string[] },
@@ -2493,19 +2608,25 @@ export function createResearchService(options: ResearchServiceOptions): Research
         parsed,
         maxChars: Math.min(maxChars, budget),
       });
-      budget -= preview.charsRead;
+      const outline = preview.outline.map((heading) => `${"#".repeat(heading.level)} ${heading.text}`);
+      // The outline was counted by the preview against its own share; what the
+      // block costs the *total* is both halves of what it carries.
+      budget -= preview.charsRead + preview.outlineChars;
       contexts.push({
         documentId: document.id,
         filename: document.originalFilename,
         title: document.title,
         origin: document.origin,
         conversionProvider: document.conversionProvider,
+        conversionTrust: document.conversion?.trust ?? null,
         usage: document.usage,
         chars: document.markdown.length,
         previewChars: preview.charsRead,
         complete: preview.complete,
         preview: preview.text,
-        outline: parsed.outline.map((heading) => `${"#".repeat(heading.level)} ${heading.text}`),
+        outline,
+        outlineTotal: preview.outlineTotal,
+        outlineTruncated: preview.outlineTruncated,
         note: `${UNTRUSTED_DOCUMENT_NOTE} ${preview.note}`,
       });
     }
@@ -2519,7 +2640,11 @@ export function createResearchService(options: ResearchServiceOptions): Research
     const provenance =
       converted === null
         ? `用户上传的 Markdown 文档（${document.originalFilename}）`
-        : `${converted.provider} 从 ${converted.originalFormat} 转换得到的 Markdown（原始文件：${converted.originalFilename}${converted.status === "partial" ? "；转换不完整" : ""}）`;
+        : `${
+            converted.trust === "server_verified" ? `服务端调用 ${converted.provider}` : `随文件自报由 ${converted.provider}`
+          } 从 ${converted.originalFormat} 转换得到的 Markdown（原始文件：${converted.originalFilename}${converted.status === "partial" ? "；转换不完整" : ""}${
+            converted.trust === "server_verified" ? "" : "；转换来源未经服务端核验"
+          }）`;
     return {
       status: "ok",
       readUrl: `document://${document.id}`,
@@ -2538,10 +2663,12 @@ export function createResearchService(options: ResearchServiceOptions): Research
     documentId: string,
     input: { readonly taskId: string; readonly sessionId?: string },
   ): { readonly ok: true; readonly source: Source; readonly created: boolean; readonly note: string } | Refusal {
-    const document = repo.getDocument(documentId);
-    if (document === undefined) {
-      return { ok: false, problems: [`没有找到文档：${documentId}`], guidance: "请确认 documentId。" };
-    }
+    // Both the document and the target task are checked against the caller's own
+    // scope, so a material cannot be slipped into another project by naming an
+    // id that happens to be valid somewhere else.
+    const access = requireDocumentAccess(documentId, { ...input, taskId: input.taskId, ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }) });
+    if (access.ok !== true) return access;
+    const document = access.document;
     const task = repo.getTask(input.taskId);
     if (task === undefined) {
       return { ok: false, problems: [`没有找到研究任务：${input.taskId}`], guidance: "请确认 taskId。" };
@@ -2552,9 +2679,6 @@ export function createResearchService(options: ResearchServiceOptions): Research
         problems: ["这份文档与目标任务不属于同一个会话"],
         guidance: "文档只能成为所属会话的研究来源，避免把一份材料悄悄放进别的项目。",
       };
-    }
-    if (input.sessionId !== undefined && input.sessionId.trim().length > 0 && input.sessionId.trim() !== document.sessionId) {
-      return { ok: false, problems: ["这份文档不属于该会话"], guidance: "请从上传它的那个会话里操作。" };
     }
     if (!document.usage.includes("research_source")) {
       return {
@@ -2621,6 +2745,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
       linkedSourceId: source.id,
       promotedAt: at,
       updatedAt: at,
+      revision: documentRevision(document) + 1,
     });
     return {
       ok: true,
@@ -2709,7 +2834,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         for (const documentId of intent.documentIds) {
           const document = repo.getDocument(documentId);
           if (document === undefined || document.taskId === task.id) continue;
-          repo.updateDocument({ ...document, taskId: task.id, updatedAt: at });
+          repo.updateDocument({ ...document, taskId: task.id, updatedAt: at, revision: documentRevision(document) + 1 });
         }
       }
       return { ok: true, created: true, task };
@@ -2799,7 +2924,10 @@ export function createResearchService(options: ResearchServiceOptions): Research
       // about files that are still on their way.
       const attached: string[] = [];
       for (const document of input.documents ?? []) {
-        const uploaded = uploadDocumentImpl({ ...document, sessionId, intentId: intent.id });
+        // A file that arrives with the seed topic is still a caller's claim
+        // about its provenance: the session it is saved into was created by
+        // this request, and nothing about it was converted by this server.
+        const uploaded = uploadDocumentImpl({ ...document, sessionId, intentId: intent.id }, { trust: "client_claimed" });
         if (uploaded.ok !== true) {
           // Nothing half-made is left behind: a request that carried a file the
           // library refused creates neither the documents nor the exploration,
@@ -3106,28 +3234,41 @@ export function createResearchService(options: ResearchServiceOptions): Research
 
     // ------------------------------------------------------------ documents --
 
-    uploadDocument: (input) => uploadDocumentImpl(input),
+    // HTTP uploads are always a caller's own claim about where the Markdown came
+    // from; only `importConvertedDocument` below can say the server performed it.
+    uploadDocument: (input) => uploadDocumentImpl(input, { trust: "client_claimed" }),
 
-    documentViewOf: (documentId) => {
-      const document = repo.getDocument(documentId);
-      return document === undefined ? undefined : documentViewOfStored(document);
+    importConvertedDocument: (input) => importConvertedDocumentImpl(input),
+
+    documentViewOf(documentId, ref) {
+      const access = requireDocumentAccess(documentId, ref);
+      return access.ok === true ? documentViewOfStored(access.document) : access;
     },
 
-    documentTextOf: (documentId) => repo.getDocument(documentId),
+    documentTextOf(documentId, ref) {
+      const access = requireDocumentAccess(documentId, ref);
+      return access.ok === true ? access.document : access;
+    },
 
-    documentsOf: (scope) => documentsFor(scope).map(documentViewOfStored),
+    documentsOf(scope) {
+      // A list is answered for a session the caller named and the ids agree on:
+      // an unnamed list is refused rather than answered with「什么都没有」, which
+      // would read as「这个会话没有文档」.
+      const resolved = resolveDocumentScope(scope);
+      if (resolved.ok !== true) {
+        const missing = resolved.problems.some((problem) => problem.includes("缺少会话信息"));
+        return { ...resolved, ...(missing ? { code: "document_scope_missing" as const } : {}) };
+      }
+      return documentsFor(scope).map(documentViewOfStored);
+    },
 
     documentContextOf: (scope, maxChars) =>
       documentContextImpl(scope, maxChars ?? MAX_DOCUMENT_PREVIEW_CHARS, (maxChars ?? MAX_DOCUMENT_PREVIEW_CHARS) * 4),
 
     readDocument(input) {
-      const document = repo.getDocument(input.documentId);
-      if (document === undefined) {
-        return { ok: false, problems: [`没有找到文档：${input.documentId}`], guidance: "请使用上传或列表返回的 documentId。" };
-      }
-      if (document.sessionId !== input.sessionId) {
-        return { ok: false, problems: ["这份文档不属于当前会话"], guidance: "只能读取上传到本会话的文档。" };
-      }
+      const access = requireDocumentAccess(input.documentId, input);
+      if (access.ok !== true) return access;
+      const document = access.document;
       const parsed = parseDocument(document.markdown);
       return {
         ...readDocumentText({
@@ -3142,14 +3283,10 @@ export function createResearchService(options: ResearchServiceOptions): Research
       };
     },
 
-    deleteDocument(documentId, input) {
-      const document = repo.getDocument(documentId);
-      if (document === undefined) {
-        return { ok: false, problems: [`没有找到文档：${documentId}`], guidance: "它可能已经被删除。" };
-      }
-      if (input?.sessionId !== undefined && input.sessionId.trim().length > 0 && input.sessionId.trim() !== document.sessionId) {
-        return { ok: false, problems: ["这份文档不属于该会话"], guidance: "请从上传它的那个会话里操作。" };
-      }
+    deleteDocument(documentId, ref) {
+      const access = requireDocumentAccess(documentId, ref);
+      if (access.ok !== true) return access;
+      const document = access.document;
       repo.deleteDocument(documentId);
       // Saved reads, evidence and reports are not touched: the document was the
       // source of a *read*, and a read is a record of what was really obtained.
@@ -3163,11 +3300,10 @@ export function createResearchService(options: ResearchServiceOptions): Research
       };
     },
 
-    setDocumentUsage(documentId, usage) {
-      const document = repo.getDocument(documentId);
-      if (document === undefined) {
-        return { ok: false, problems: [`没有找到文档：${documentId}`], guidance: "它可能已经被删除。" };
-      }
+    setDocumentUsage(documentId, usage, ref) {
+      const access = requireDocumentAccess(documentId, ref);
+      if (access.ok !== true) return access;
+      const document = access.document;
       const reading = readDocumentUsage(usage, document.usage);
       if (reading.problem.length > 0) {
         return { ok: false, problems: [reading.problem], guidance: "用途只能是 intent_context / research_source，至少一个。" };
@@ -3176,6 +3312,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         ...document,
         usage: reading.usage,
         updatedAt: isoNow(),
+        revision: documentRevision(document) + 1,
         note: `${documentSummaryLine({ filename: document.originalFilename, sizeBytes: document.sizeBytes, origin: document.origin, conversion: document.conversion })}；用途：${documentUsageLine(reading.usage)}`,
       };
       repo.updateDocument(next);
@@ -3189,22 +3326,18 @@ export function createResearchService(options: ResearchServiceOptions): Research
       };
     },
 
-    linkDocumentToTask(documentId, taskId, input) {
-      const document = repo.getDocument(documentId);
-      if (document === undefined) {
-        return { ok: false, problems: [`没有找到文档：${documentId}`], guidance: "它可能已经被删除。" };
-      }
+    linkDocumentToTask(documentId, taskId, ref) {
+      // The target task is part of the caller's scope as well as the operation's
+      // argument: naming it — and any session the caller named beside it — has
+      // to resolve to the session the document belongs to.
+      const access = requireDocumentAccess(documentId, { ...ref, taskId });
+      if (access.ok !== true) return access;
+      const document = access.document;
       const task = repo.getTask(taskId);
       if (task === undefined) {
         return { ok: false, problems: [`没有找到研究任务：${taskId}`], guidance: "请确认 taskId。" };
       }
-      if (task.sessionId !== document.sessionId) {
-        return { ok: false, problems: ["这份文档与目标任务不属于同一个会话"], guidance: "文档只能关联到所属会话的研究任务。" };
-      }
-      if (input?.sessionId !== undefined && input.sessionId.trim().length > 0 && input.sessionId.trim() !== document.sessionId) {
-        return { ok: false, problems: ["这份文档不属于该会话"], guidance: "请从上传它的那个会话里操作。" };
-      }
-      const next: StoredDocument = { ...document, taskId: task.id, updatedAt: isoNow() };
+      const next: StoredDocument = { ...document, taskId: task.id, updatedAt: isoNow(), revision: documentRevision(document) + 1 };
       repo.updateDocument(next);
       const intent = repo.intentForSession(document.sessionId);
       if (intent !== null && intent !== undefined) saveIntent({ ...intent, taskId: task.id });
@@ -3687,9 +3820,19 @@ export function createResearchService(options: ResearchServiceOptions): Research
       // that lived only in that first write would be erased by the read it
       // belongs to — and the workspace would show「未声明」for material the
       // agent had in fact classified.
-      const role: SourceRole | null = input.role ?? source.role ?? null;
-      if (input.role !== undefined && input.role !== source.role) {
-        repo.updateSource({ ...source, role: input.role });
+      //
+      // One source cannot be reclassified at all: a document the user uploaded
+      // is `user-provided`, and that is a fact about where the text came from
+      // rather than a judgement about how good it is. A tool argument that says
+      // otherwise is ignored — not argued with, and not honoured — because the
+      // claim contract reads roles to decide what may support a claim, and a
+      // model must not be able to hand its own upload the authority of a
+      // publication. The refusal is reported so the caller knows why.
+      const isUserDocument = (source.document !== null && source.document !== undefined) || source.url.startsWith("document://");
+      const role: SourceRole | null = isUserDocument ? "user-provided" : (input.role ?? source.role ?? null);
+      const roleIgnored = isUserDocument && input.role !== undefined && input.role !== "user-provided";
+      if (role !== source.role) {
+        repo.updateSource({ ...source, role });
       }
 
       // A source already read is reused, not re-fetched: the saved snapshot is
@@ -3881,7 +4024,13 @@ export function createResearchService(options: ResearchServiceOptions): Research
             ? Math.max(0, refreshed.budget.maxReads - governingUsage(refreshed).reads)
             : Math.max(0, action.budget.maxReads - actionUsage.reads),
         budgetScope: action === undefined ? "project" : "user-action",
-        note: `${note}（读取范围：${scopeLabel(snapshot.scope)}；excerpt 均为保存文本中的原样片段）`,
+        ...(roleIgnored ? { roleIgnored: true } : {}),
+        note: [
+          `${note}（读取范围：${scopeLabel(snapshot.scope)}；excerpt 均为保存文本中的原样片段）`,
+          ...(roleIgnored
+            ? [`这次调用的 role=${String(input.role)} 被忽略：这份来源是用户上传的文档，来源身份固定为 user-provided，不能改成官方或一手来源。`]
+            : []),
+        ].join(""),
       };
     },
 

@@ -19,6 +19,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 import type {
   AssistantIntent,
+  DocumentAccessRef,
+  Refusal,
   Report,
   ReportClaim,
   ReportFrame,
@@ -47,13 +49,26 @@ import type { ResearchRunner } from "./runner.js";
 const MAX_BODY_BYTES = 32 * 1024;
 
 /**
- * The largest body a document upload may carry.
+ * The largest raw body a document upload may carry.
  *
- * It is the library's own file limit plus room for the JSON envelope, so the
- * library — not the transport — is what decides whether a file is too large,
- * and the user gets the reason rather than a dropped connection.
+ * A raw body *is* the file, so this is the library's own limit rather than a
+ * looser one: the same number decides「这份 Markdown 太大」whichever way it was
+ * sent, and the caller gets one sentence about size instead of two different
+ * answers depending on the encoding.
  */
-const MAX_UPLOAD_BYTES = MAX_DOCUMENT_BYTES + 64 * 1024;
+const MAX_UPLOAD_BYTES = MAX_DOCUMENT_BYTES;
+
+/**
+ * The largest JSON body a document upload may carry.
+ *
+ * An envelope is bigger than the file it describes — base64 costs about a third
+ * more, and the ids, filename, usage and conversion claims travel beside it — so
+ * the transport limit has to be larger than the content limit or a legal file
+ * would be refused for the way it was encoded. It is still bounded, and an
+ * envelope over it is refused as a *request* problem, which is a different
+ * sentence from「文件超过上限」.
+ */
+const MAX_UPLOAD_JSON_BYTES = MAX_DOCUMENT_BYTES * 2 + 64 * 1024;
 
 export interface ResearchRoutesOptions {
   readonly service: ResearchService;
@@ -93,15 +108,15 @@ function sendText(response: ServerResponse, status: number, value: string, type:
   response.end(value);
 }
 
-function readBody(request: IncomingMessage): Promise<unknown> {
+function readBody(request: IncomingMessage, limit: number = MAX_BODY_BYTES): Promise<unknown> {
   return new Promise((resolve) => {
-    readBytes(request, MAX_BODY_BYTES)
-      .then((bytes) => {
-        if (bytes === undefined) {
+    readBytes(request, limit)
+      .then((reading) => {
+        if (reading.ok !== true) {
           resolve(undefined);
           return;
         }
-        const text = bytes.toString("utf8");
+        const text = reading.bytes.toString("utf8");
         if (text.trim().length === 0) {
           resolve({});
           return;
@@ -117,19 +132,65 @@ function readBody(request: IncomingMessage): Promise<unknown> {
 }
 
 /**
+ * Reads a JSON body that may carry documents, and says which problem it was.
+ *
+ * The reason matters as much as the bytes: an envelope over the limit is a
+ * different answer from a malformed one, and neither may be reported as
+ * 「缺少文件名」— which is what happens when a body that was refused is handed on
+ * as an empty object.
+ */
+async function readJsonBody(
+  request: IncomingMessage,
+  limit: number,
+): Promise<{ readonly ok: true; readonly body: Record<string, unknown> } | { readonly ok: false; readonly status: number; readonly problem: string }> {
+  const reading = await readBytes(request, limit);
+  if (reading.ok !== true) {
+    return reading.reason === "too_large"
+      ? { ok: false, status: 413, problem: `请求体过大（JSON 上限 ${limit} 字节，单份 Markdown 上限 ${MAX_DOCUMENT_BYTES} 字节）` }
+      : { ok: false, status: 400, problem: "请求体读取失败，请重新发起这次请求" };
+  }
+  // Fatal decoding, not `toString("utf8")`: a body that is not UTF-8 has to be
+  // refused as itself. Decoding it leniently turns the invalid bytes into U+FFFD
+  // *before* anything validates them, and the library then stores a document
+  // full of replacement characters that no one will ever notice.
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(reading.bytes);
+  } catch {
+    return { ok: false, status: 400, problem: "请求体不是合法的 UTF-8 文本（本轮只接受 UTF-8 Markdown）" };
+  }
+  if (text.trim().length === 0) return { ok: true, body: {} };
+  try {
+    return { ok: true, body: asRecord(JSON.parse(text) as unknown) };
+  } catch {
+    return { ok: false, status: 400, problem: "请求体不是合法的 JSON" };
+  }
+}
+
+/** What reading a body produced: the bytes, or why they are not available. */
+type BodyReading =
+  | { readonly ok: true; readonly bytes: Buffer }
+  | { readonly ok: false; readonly reason: "too_large" | "unreadable" };
+
+/**
  * Reads a request body up to a limit, as bytes.
  *
  * Bytes rather than text, because an upload has to be checked for being UTF-8
  * at all: decoding first and validating afterwards can only ever see the
  * replacement characters, never the fact that the file was not text.
+ *
+ * The two failures are kept apart on purpose. A body over the limit and a body
+ * that could not be read are different answers for the caller, and collapsing
+ * them into one `undefined` is what makes an oversized upload come back as
+ * 「缺少文件名」.
  */
-function readBytes(request: IncomingMessage, limit: number): Promise<Buffer | undefined> {
+function readBytes(request: IncomingMessage, limit: number): Promise<BodyReading> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let total = 0;
     let overflow = false;
     let done = false;
-    const finish = (value: Buffer | undefined): void => {
+    const finish = (value: BodyReading): void => {
       if (done) return;
       done = true;
       resolve(value);
@@ -146,9 +207,78 @@ function readBytes(request: IncomingMessage, limit: number): Promise<Buffer | un
       }
       chunks.push(chunk);
     });
-    request.on("end", () => finish(overflow ? undefined : Buffer.concat(chunks)));
-    request.on("error", () => finish(undefined));
+    request.on("end", () => finish(overflow ? { ok: false, reason: "too_large" } : { ok: true, bytes: Buffer.concat(chunks) }));
+    request.on("error", () => finish({ ok: false, reason: "unreadable" }));
   });
+}
+
+/**
+ * The caller's own scope, as a document request names it.
+ *
+ * It is read from the query string and the body, and it is passed to the
+ * service *as the caller's claim about which session it is acting for*. The
+ * service resolves those ids and compares them with the document's session; a
+ * route never fills this in from the document it looked up, because that would
+ * make the comparison answer「是它自己」every time.
+ */
+function documentScopeOf(request: IncomingMessage, body?: Record<string, unknown>): DocumentAccessRef {
+  const query = new URLSearchParams((request.url ?? "").split("?")[1] ?? "");
+  const read = (key: string): string | undefined => {
+    const fromQuery = query.get(key);
+    if (fromQuery !== null && fromQuery.trim().length > 0) return fromQuery.trim();
+    const fromBody = body === undefined ? undefined : body[key];
+    return typeof fromBody === "string" && fromBody.trim().length > 0 ? fromBody.trim() : undefined;
+  };
+  const sessionId = read("sessionId");
+  const intentId = read("intentId");
+  const taskId = read("taskId");
+  const expected = body?.["expectedRevision"] ?? query.get("expectedRevision");
+  const expectedRevision =
+    typeof expected === "number" && Number.isInteger(expected) && expected > 0
+      ? expected
+      : typeof expected === "string" && /^[0-9]+$/.test(expected.trim())
+        ? Number(expected.trim())
+        : undefined;
+  return {
+    ...(sessionId === undefined ? {} : { sessionId }),
+    ...(intentId === undefined ? {} : { intentId }),
+    ...(taskId === undefined ? {} : { taskId }),
+    ...(expectedRevision === undefined ? {} : { expectedRevision }),
+  };
+}
+
+/**
+ * Writes a refusal with the status its own code calls for.
+ *
+ * The codes exist so that「这个会话里没有这份文档」、「这不是你的文档」、「文件太大」
+ * and「请求本身不合法」reach the caller as four different answers: a document
+ * belonging to another session is refused as forbidden rather than reported
+ * missing, because a caller that holds a valid session id is owed the truth
+ * about why it was refused.
+ */
+function sendRefusal(response: ServerResponse, refusal: Refusal): void {
+  const status =
+    refusal.code === "document_not_found"
+      ? 404
+      : refusal.code === "document_cross_session"
+        ? 403
+        : refusal.code === "document_too_large"
+          ? 413
+          : refusal.conflict === true
+            ? 409
+            : 400;
+  sendJson(response, status, {
+    error: refusal.problems.join("；"),
+    problems: refusal.problems,
+    guidance: refusal.guidance,
+    ...(refusal.code === undefined ? {} : { code: refusal.code }),
+    ...(refusal.conflict === true ? { conflict: true } : {}),
+  });
+}
+
+/** A list the caller is entitled to; a refusal is never presented as a list. */
+function rowsOf<T>(value: readonly T[] | Refusal): readonly T[] {
+  return "ok" in value ? [] : value;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -367,18 +497,20 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
      * bundle says which ones they marked as research material. The intent link
      * is what makes「这个题目是用户确认过的」readable from the project itself.
      */
-    documents: service.documentsOf({ taskId }).map((document) => ({
+    documents: rowsOf(service.documentsOf({ taskId })).map((document) => ({
       documentId: document.documentId,
       filename: document.originalFilename,
       title: document.title,
       sizeBytes: document.sizeBytes,
       origin: document.origin,
       conversionProvider: document.conversionProvider,
+      conversionTrust: document.conversion?.trust ?? null,
       usage: document.usage,
       status: document.status,
       linkedSourceId: document.linkedSourceId,
       chars: document.chars,
       outline: document.outline.map((heading) => `${"#".repeat(heading.level)} ${heading.text}`),
+      outlineTotal: document.outlineTotal,
       createdAt: document.createdAt,
     })),
     intent: (() => {
@@ -605,7 +737,20 @@ export function createResearchRouter(
     // The documents are saved before the first turn runs, so the first question
     // is asked about files that are already in the library.
     if (path === "/api/research/intents" && method === "POST") {
-      const body = asRecord(await readBody(request));
+      // Same envelope limit as the upload route: a document attached to a seed
+      // topic is the same document, and a 40 KiB one must not be dropped
+      // silently because the request that carried it was read with a limit that
+      // belongs to small JSON.
+      const reading = await readJsonBody(request, MAX_UPLOAD_JSON_BYTES);
+      if (reading.ok !== true) {
+        sendJson(response, reading.status, {
+          error: reading.problem,
+          problems: [reading.problem],
+          guidance: reading.status === 413 ? "请先单独上传这份 Markdown，再提交主题。" : "请检查请求体后重试。",
+        });
+        return;
+      }
+      const body = reading.body;
       const docs = Array.isArray(body["documents"]) ? (body["documents"] as unknown[]) : [];
       const sessionId = await routeOptions.createSession();
       const created = service.createIntent(sessionId, {
@@ -800,7 +945,19 @@ export function createResearchRouter(
       const isJson = contentType.includes("application/json") || contentType.startsWith("{");
       let upload: Parameters<typeof service.uploadDocument>[0];
       if (isJson) {
-        const body = asRecord(await readBody(request));
+        const reading = await readJsonBody(request, MAX_UPLOAD_JSON_BYTES);
+        if (reading.ok !== true) {
+          sendJson(response, reading.status, {
+            error: reading.problem,
+            problems: [reading.problem],
+            guidance:
+              reading.status === 413
+                ? `请把这份 Markdown 拆小到 ${Math.round(MAX_DOCUMENT_BYTES / 1024)} KB 以内再上传。`
+                : "请检查请求体后重试。",
+          });
+          return;
+        }
+        const body = reading.body;
         // Absent means absent: `asRecord` answers an empty object for anything
         // that is not one, so the conversion has to be tested before it is read.
         const conversionBody = body["conversion"];
@@ -833,12 +990,15 @@ export function createResearchRouter(
               }),
         };
       } else {
-        const bytes = await readBytes(request, MAX_UPLOAD_BYTES);
-        if (bytes === undefined) {
+        const reading = await readBytes(request, MAX_UPLOAD_BYTES);
+        if (reading.ok !== true) {
           sendJson(response, 413, {
-            error: `文件过大（单文件上限 ${MAX_DOCUMENT_BYTES} 字节）`,
-            problems: [`文件过大（单文件上限 ${MAX_DOCUMENT_BYTES} 字节）`],
-            guidance: "请拆分或压缩这份 Markdown 后再上传。",
+            error:
+              reading.reason === "too_large"
+                ? `文件过大（单文件上限 ${MAX_DOCUMENT_BYTES} 字节）`
+                : "请求体读取失败",
+            problems: [reading.reason === "too_large" ? `文件过大（单文件上限 ${MAX_DOCUMENT_BYTES} 字节）` : "请求体读取失败"],
+            guidance: reading.reason === "too_large" ? "请拆分或压缩这份 Markdown 后再上传。" : "请重新发起这次上传。",
           });
           return;
         }
@@ -847,12 +1007,12 @@ export function createResearchRouter(
           ...(query.get("intentId") === null ? {} : { intentId: query.get("intentId") as string }),
           ...(query.get("taskId") === null ? {} : { taskId: query.get("taskId") as string }),
           filename: query.get("filename"),
-          content: { bytes },
+          content: { bytes: reading.bytes },
         };
       }
       const result = service.uploadDocument(upload);
       if (result.ok !== true) {
-        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        sendRefusal(response, result);
         return;
       }
       sendJson(response, 201, {
@@ -871,8 +1031,23 @@ export function createResearchRouter(
     // MinerU (or any other converter) hands over normalized Markdown plus the
     // provenance of the file it came from, and it lands in the same library as
     // a direct upload: same persistence, same reading, same limits.
+    //
+    // What it cannot do here is make its provenance *verified*. Everything this
+    // route stores is a claim by the caller — including `converter: "mineru"`,
+    // a job id and a page map — and the record says so. Only
+    // `service.importConvertedDocument`, called by this server's own converter
+    // adapter, writes a conversion this process performed.
     if (path === "/api/research/documents/import" && method === "POST") {
-      const body = asRecord(await readBody(request));
+      const reading = await readJsonBody(request, MAX_UPLOAD_JSON_BYTES);
+      if (reading.ok !== true) {
+        sendJson(response, reading.status, {
+          error: reading.problem,
+          problems: [reading.problem],
+          guidance: reading.status === 413 ? "请把这份 Markdown 拆小后重新转换或上传。" : "请检查请求体后重试。",
+        });
+        return;
+      }
+      const body = reading.body;
       const conversion = asRecord(body["conversion"]);
       const originalFilename = typeof body["originalFilename"] === "string" ? body["originalFilename"] : "";
       const result = service.uploadDocument({
@@ -901,7 +1076,7 @@ export function createResearchRouter(
         },
       });
       if (result.ok !== true) {
-        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        sendRefusal(response, result);
         return;
       }
       sendJson(response, 201, {
@@ -910,7 +1085,13 @@ export function createResearchRouter(
         duplicate: result.duplicate,
         sessionId: result.sessionId,
         taskId: result.taskId,
-        note: result.note,
+        // The caller learns what its own record is worth: a claim, not a
+        // verified conversion. Sending `trusted: true` changes nothing here.
+        conversionTrust: result.document.conversion?.trust ?? null,
+        note:
+          result.document.conversion === null
+            ? result.note
+            : `${result.note} 这份转换记录由调用方自报，可信等级为 client_claimed（未经过服务端核验）；真正的可信转换只能由服务端的转换适配器写入。`,
       });
       return;
     }
@@ -924,13 +1105,15 @@ export function createResearchRouter(
         sendJson(response, 404, { error: "意图探索不存在" });
         return;
       }
-      const documents =
-        intent === undefined
-          ? service.documentsOf({
-              ...(query.get("sessionId") === null ? {} : { sessionId: query.get("sessionId") as string }),
-              ...(query.get("taskId") === null ? {} : { taskId: query.get("taskId") as string }),
-            })
-          : intent.documents;
+      if (intent !== undefined) {
+        sendJson(response, 200, { documents: intent.documents });
+        return;
+      }
+      const documents = service.documentsOf(documentScopeOf(request));
+      if ("ok" in documents) {
+        sendRefusal(response, documents);
+        return;
+      }
       sendJson(response, 200, { documents });
       return;
     }
@@ -938,9 +1121,9 @@ export function createResearchRouter(
     // GET /api/research/documents/:id — one document, with an outline.
     const documentIdMatch = /^\/api\/research\/documents\/([^/]+)$/.exec(path);
     if (documentIdMatch !== null && method === "GET") {
-      const document = service.documentViewOf(documentIdMatch[1] ?? "");
-      if (document === undefined) {
-        sendJson(response, 404, { error: "文档不存在" });
+      const document = service.documentViewOf(documentIdMatch[1] ?? "", documentScopeOf(request));
+      if ("ok" in document) {
+        sendRefusal(response, document);
         return;
       }
       sendJson(response, 200, { document, untrusted: UNTRUSTED_DOCUMENT_NOTE });
@@ -950,9 +1133,9 @@ export function createResearchRouter(
     // GET /api/research/documents/:id/content — the saved Markdown itself.
     const documentContentMatch = /^\/api\/research\/documents\/([^/]+)\/content$/.exec(path);
     if (documentContentMatch !== null && method === "GET") {
-      const document = service.documentTextOf(documentContentMatch[1] ?? "");
-      if (document === undefined) {
-        sendJson(response, 404, { error: "文档不存在" });
+      const document = service.documentTextOf(documentContentMatch[1] ?? "", documentScopeOf(request));
+      if ("ok" in document) {
+        sendRefusal(response, document);
         return;
       }
       sendText(response, 200, document.markdown, "text/markdown; charset=utf-8");
@@ -963,14 +1146,11 @@ export function createResearchRouter(
     const documentReadMatch = /^\/api\/research\/documents\/([^/]+)\/read$/.exec(path);
     if (documentReadMatch !== null && method === "POST") {
       const documentId = documentReadMatch[1] ?? "";
-      const existing = service.documentViewOf(documentId);
-      if (existing === undefined) {
-        sendJson(response, 404, { error: "文档不存在" });
-        return;
-      }
       const body = asRecord(await readBody(request));
+      // The caller's session is the one it named — never the document's own,
+      // which the service would then be comparing with itself.
       const result = service.readDocument({
-        sessionId: existing.sessionId,
+        ...documentScopeOf(request, body),
         documentId,
         request: {
           ...(typeof body["question"] === "string" ? { question: body["question"] } : {}),
@@ -981,7 +1161,7 @@ export function createResearchRouter(
         },
       });
       if (result.ok !== true) {
-        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        sendRefusal(response, result);
         return;
       }
       sendJson(response, 200, { ...result, untrusted: UNTRUSTED_DOCUMENT_NOTE });
@@ -991,9 +1171,9 @@ export function createResearchRouter(
     // PATCH /api/research/documents/:id {usage} — what this document is for.
     if (documentIdMatch !== null && method === "PATCH") {
       const body = asRecord(await readBody(request));
-      const result = service.setDocumentUsage(documentIdMatch[1] ?? "", body["usage"]);
+      const result = service.setDocumentUsage(documentIdMatch[1] ?? "", body["usage"], documentScopeOf(request, body));
       if (result.ok !== true) {
-        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        sendRefusal(response, result);
         return;
       }
       sendJson(response, 200, { ok: true, document: result.document, note: result.note });
@@ -1002,12 +1182,9 @@ export function createResearchRouter(
 
     // DELETE /api/research/documents/:id — remove it from the library.
     if (documentIdMatch !== null && method === "DELETE") {
-      const query = new URLSearchParams((request.url ?? "").split("?")[1] ?? "");
-      const result = service.deleteDocument(documentIdMatch[1] ?? "", {
-        ...(query.get("sessionId") === null ? {} : { sessionId: query.get("sessionId") as string }),
-      });
+      const result = service.deleteDocument(documentIdMatch[1] ?? "", documentScopeOf(request));
       if (result.ok !== true) {
-        sendJson(response, 404, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        sendRefusal(response, result);
         return;
       }
       sendJson(response, 200, { ok: true, documentId: result.documentId, note: result.note });
@@ -1023,9 +1200,9 @@ export function createResearchRouter(
         sendJson(response, 400, { error: "缺少 taskId" });
         return;
       }
-      const result = service.linkDocumentToTask(documentLinkMatch[1] ?? "", taskId);
+      const result = service.linkDocumentToTask(documentLinkMatch[1] ?? "", taskId, documentScopeOf(request, body));
       if (result.ok !== true) {
-        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        sendRefusal(response, result);
         return;
       }
       sendJson(response, 200, { ok: true, document: result.document, taskId: result.taskId, note: result.note });
@@ -1041,9 +1218,12 @@ export function createResearchRouter(
         sendJson(response, 400, { error: "缺少 taskId" });
         return;
       }
-      const result = service.promoteDocumentToSource(documentSourceMatch[1] ?? "", { taskId });
+      const result = service.promoteDocumentToSource(documentSourceMatch[1] ?? "", {
+        taskId,
+        ...(typeof body["sessionId"] === "string" && body["sessionId"].trim().length > 0 ? { sessionId: body["sessionId"].trim() } : {}),
+      });
       if (result.ok !== true) {
-        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        sendRefusal(response, result);
         return;
       }
       sendJson(response, 201, {

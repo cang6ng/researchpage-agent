@@ -623,7 +623,7 @@ describe("Scenario D' — one library, whatever the entry point", () => {
     const bySession = await get(`/api/research/documents?sessionId=${sessionId}`);
     expect((bySession.json["documents"] as readonly unknown[]).length).toBe(1);
 
-    const content = await getText(`/api/research/documents/${document.documentId}/content`);
+    const content = await getText(`/api/research/documents/${document.documentId}/content?sessionId=${sessionId}`);
     expect(content.status).toBe(200);
     expect(content.type).toContain("text/markdown");
     expect(content.text).toBe(NOTES_A);
@@ -631,13 +631,13 @@ describe("Scenario D' — one library, whatever the entry point", () => {
     // A read never claims the whole document unless it really brought it: with
     // no question it is a spread preview, with one it is an aimed excerpt, and
     // both say so in the same words.
-    const preview = await post(`/api/research/documents/${document.documentId}/read`, {});
+    const preview = await post(`/api/research/documents/${document.documentId}/read`, { sessionId });
     expect(preview.status).toBe(200);
     expect(preview.json["scope"]).toBe("partial");
     expect(String(preview.json["note"])).toContain("部分读取");
     expect((preview.json["fragments"] as readonly unknown[]).length).toBeGreaterThan(0);
 
-    const read = await post(`/api/research/documents/${document.documentId}/read`, { question: "prefill 成本" });
+    const read = await post(`/api/research/documents/${document.documentId}/read`, { sessionId, question: "prefill 成本" });
     expect(read.status).toBe(200);
     expect(read.json["scope"]).toBe("partial");
     expect(String(read.json["note"])).toContain("部分读取");
@@ -649,7 +649,7 @@ describe("Scenario D' — one library, whatever the entry point", () => {
     const marked = await fetch(`${app.pageOrigin}/api/research/documents/${document.documentId}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ usage: ["intent_context", "research_source"] }),
+      body: JSON.stringify({ sessionId, usage: ["intent_context", "research_source"] }),
     });
     expect(marked.status).toBe(200);
     expect((await marked.json() as { document: { usage: readonly string[] } }).document.usage).toEqual(["intent_context", "research_source"]);
@@ -657,13 +657,13 @@ describe("Scenario D' — one library, whatever the entry point", () => {
     // The one case where a read may say「已读取全文」: it really did.
     const single = await post("/api/research/documents", { sessionId, filename: "single.md", content: "只有一段。" });
     expect(single.status).toBe(201);
-    const singleRead = await post(`/api/research/documents/${(single.json["document"] as { documentId: string }).documentId}/read`, {});
+    const singleRead = await post(`/api/research/documents/${(single.json["document"] as { documentId: string }).documentId}/read`, { sessionId });
     expect(singleRead.json["scope"]).toBe("full");
     expect(String(singleRead.json["note"])).toContain("已读取全文");
 
-    const removed = await fetch(`${app.pageOrigin}/api/research/documents/${document.documentId}`, { method: "DELETE" });
+    const removed = await fetch(`${app.pageOrigin}/api/research/documents/${document.documentId}?sessionId=${sessionId}`, { method: "DELETE" });
     expect(removed.status).toBe(200);
-    expect((await get(`/api/research/documents/${document.documentId}`)).status).toBe(404);
+    expect((await get(`/api/research/documents/${document.documentId}?sessionId=${sessionId}`)).status).toBe(404);
   }, 60_000);
 
   it("refuses what the library does not accept, and says why", async () => {
@@ -782,7 +782,7 @@ describe("Scenarios F and G — material, reports and the boundary between them"
       const marked = await fetch(`${app.pageOrigin}/api/research/documents/${documentId}`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ usage: ["intent_context", "research_source"] }),
+        body: JSON.stringify({ sessionId, usage: ["intent_context", "research_source"] }),
       });
       expect(marked.status).toBe(200);
       const promoted = await post(`/api/research/documents/${documentId}/source`, { taskId });
@@ -846,7 +846,7 @@ describe("Scenarios F and G — material, reports and the boundary between them"
     const documentId = (uploaded.json["document"] as { documentId: string }).documentId;
 
     // Reading it is available, and it says what it read.
-    const read = await post(`/api/research/documents/${documentId}/read`, {});
+    const read = await post(`/api/research/documents/${documentId}/read`, { taskId });
     expect(read.status).toBe(200);
     expect(read.json["scope"]).toBe("full");
     expect(String(read.json["note"])).toContain("已读取全文");

@@ -468,6 +468,18 @@ export interface Paragraph {
   readonly text: string;
   readonly charStart: number;
   readonly charEnd: number;
+  /**
+   * Where the paragraph sits in the Markdown it was parsed out of, when that
+   * differs from the joined text.
+   *
+   * A user's document is stored as the file itself, so a read reports a
+   * paragraph in two coordinate systems at once: the joined text an excerpt is
+   * verified against (`charStart`/`charEnd`) and the stored Markdown a
+   * converter's page map is written in (this pair). Keeping them apart is what
+   * keeps a page number from being computed in the wrong one.
+   */
+  readonly sourceStart?: number | undefined;
+  readonly sourceEnd?: number | undefined;
 }
 
 /** An immutable read: the text a source returned, with locatable paragraphs. */
