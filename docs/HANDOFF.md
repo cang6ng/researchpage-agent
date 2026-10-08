@@ -10,6 +10,8 @@
 
 ## Current Status（2026-10-08）
 
+- **Step 3.7B F4 最终修复（`maxChars` 硬上限）已完成**：第三次复核只盯一件事——上一轮对 F4 的修复不彻底：`readDocument` 把预算强制抬高到 200（`maxChars=100` 的读取实际返回 170–199 字）、Context 块在预览之外追加了 100 字的不可信声明（`maxChars=100/200` 的块实际 200/301 字），而当时的测试断言没有覆盖这两处。本轮把口径收紧为「整份回答（正文 + 目录 + 截断提示 + 其它说明 + 分隔符）≤ 调用方给的 `maxChars`」：取消一切下限强制扩容，四种读取策略与预览 / Context 统一按「目录 → 回答自身的句子 → 正文」记账，句子放不下就用短语或整句省略（信息由 `scope` / `truncated` / `complete` / `outlineTruncated` 承载），Context 的不可信声明计入同一份 share。10 万字标题 + 10.8 万字正文实测：`maxChars=100` 时 Preview 99 / Context 99 / 四种读取 68–97 字，`maxChars=200` 时 Preview 199 / Context 200 / 读取 169–198 字（修复前为 174 / 200 / 301），原文定位与 `scope=partial` 语义不变。未改 F1/F2/F3/F5/F6、未重构文档库、未动前端 / Agent Core / Host / Protocol / Client、未进 MinerU。见下「Step 3.7B F4 最终修复」。
+
 - **Step 3.7B 收尾修复（复核剩余三项）已完成**：第二次复核在 3.7B Repair 之后又证实三项，本轮只关这三项——`GET /documents?sessionId=B&intentId=<A 的探索>` 会返回 A 的文档、`POST /documents/<A 的文档>/source?sessionId=B`（body 带 A 的 `taskId`）会成功建立来源（多作用域声明只被读取一项）；10 万字标题让 `maxChars=100/200` 的目录返回 208 字而正文拿到 0 字（`boundedOutline` 的第一条不受预算约束）；`POST /intents` 附带超过 512 KiB 的 Markdown 返回 400 而不是 413（服务层算出的 `document_too_large` 在路由处被丢掉）。分别按「所有入口统一收集全部作用域声明并交叉验证，冲突即 403」/「第一条目录同样遵守预算，且回答自身的句子计入预算」/「用同一个 `sendRefusal` 映射，拒绝不留半成品」修完，并新增 8 个反例测试（Service + 真实 HTTP + 真实任务）。未重写文档库、未改 Intent Discovery、未进 MinerU、未动前端。见下「Step 3.7B 收尾修复」。
 
 - **Step 3.7B Repair（独立复核的六项修复）已完成**：复核证实 3.7B 的文档库有两个 BLOCKER（任意 sessionId 即可读写删别人的文档；`role` 参数可把用户文档标成 official / primary）、三个 MAJOR（客户端可自报 MinerU 转换并获得看似可信的来源记录；单段 10 万字可绕过 `maxChars`、2 000 标题的目录可塞进 Context；JSON 上传被 32 KiB 限制挡住、非法 UTF-8 被静默替换）、一个 MINOR（pageMap 与读取用了两套字符坐标，页码错位），全部按服务层统一作用域校验 / 来源身份锁定 / 转换可信等级与内部可信写入路径 / 读取与目录硬上限 / 统一内容限制与 fatal UTF-8 / Markdown 坐标契约修完，并用 26 个反例测试（Service + 真实工具 + 真实 HTTP + runner）与既有 3.7B 测试一起验证。未改语义、未进 MinerU 开发、未动前端。见下「Step 3.7B Repair」。
@@ -72,7 +74,7 @@
 - **修复**：预算统一为**整份回答**——正文 + 目录 + 章节条目都在 `maxChars` 之内：
   - 所有策略（默认 / 按段落 / 按章节 / 按关键词 / 展开）共用同一套 `fit()`：段落放得下就整段、放不下就按**原文位置**取窗口（关键词匹配时窗口从命中处开始），并标 `fragment.truncated`；`scope` 只有在真的返回全文且没有被截断时才是 `full`。
   - 目录按字符上限 `MAX_DOCUMENT_OUTLINE_CHARS = 1200`（并占预算的三分之一以内）截断；被截断时明说「目录过长：共 N 个标题，这里只列出前 M 个（其余未列出）」——视图、读取结果、Context 块、runner 指令三处口径一致。标题本身也按 200 字符裁剪（一条超长标题不能霸占提示词）。
-  - `DocumentContext` 的 `previewChars + outlineChars ≤ 该文档的预算`，`documentPreview` 的 `maxChars` 同样覆盖两者；`GET /tasks/:id` bundle 的 `documents[].outline` 一并受限并带 `outlineTotal`。
+  - `DocumentContext` 的 `previewChars + outlineChars ≤ 该文档的预算`，`documentPreview` 的 `maxChars` 同样覆盖两者；`GET /tasks/:id` bundle 的 `documents[].outline` 一并受限并带 `outlineTotal`。（**注**：这两处当时的口径还没有把回答自身的句子与 Context 的不可信声明算进去，`maxChars` 也仍有 200 的下限；严格口径与最终实现见下「Step 3.7B F4 最终修复」。）
 
 ### 5. 上传内容限制与 UTF-8（MAJOR）
 
@@ -148,6 +150,60 @@
 | `apps/research/src/server/routes.ts` | `documentScopeOf` 收集 query + body 的全部声明、列表路由不再按 `intentId` 短路、上传 / 导入 / 转来源改用统一作用域、`/intents` 改用 `sendRefusal`、`sendRefusal` 增加 `403 document_scope_conflict` |
 
 未改动：前端、Agent Core / Host / Protocol / Client、Search / Retry / Circuit Breaker、Evidence Truth Contract、Claim Validator、PDF Renderer、Artifact Blueprint、Intent Discovery 语义、MinerU 集成。
+
+## Step 3.7B F4 最终修复（`maxChars` 是真正的硬上限）
+
+第三次复核只针对一件事：`maxChars` 没能生效。**收尾修复那一轮的测量与断言都不够严**——它验证的是「目录 + 正文 ≤ 预算」「正文 + 目录 ≤ 预算」，而回答自身的句子、Context 里那句不可信声明、以及 `maxChars` 的下限强制扩容都不在这些断言里。本轮把口径收紧为**整份回答 ≤ 调用方给的 `maxChars`**，并把这些断言写成永久回归测试。没有扩大范围：没有改 F1/F2/F3/F5/F6 已关闭的问题、没有重构文档库、没有碰前端 / Agent Core / Host / Protocol / Client / MinerU。
+
+### 1. 根因（三条，都在同一处记账里）
+
+- **下限强制扩容**：`readDocument` 用 `Math.max(200, maxChars ?? 默认)`,调用方说 100 时实际按 200 记账——`maxChars=100` 的读取返回 170–199 字。
+- **Context 块在预算之外追加说明**：`documentContextImpl` 用 `maxChars` 给预览，然后把 `UNTRUSTED_DOCUMENT_NOTE`（100 字）与一个空格拼在 `note` 上，这一句从不计入这份 share——`maxChars=100 / 200` 时块实际是 200 / 301 字。
+- **说明只按上限预留、不按实际写入**：句子预留用的是「比预算本身还长的措辞」（`maxChars` 当作 `readChars`），且写完不再回看是否真的放得下；预算小于那句话时（如 `maxChars=0`）仍然照写。
+
+### 2. 修复：一份预算，四个部分，都从同一份预算里出
+
+- **预算是调用方给的那个数**：`characterBudget(requested, fallback)` 取代所有 `Math.max(200, …)` ——没有下限、没有向上取整，只有「没给数」才回落到默认值。`maxChars=0` 返回空内容而不是 200 字。
+- **句子先付账、写的时候再确认一次**：`answerSentences` 把每句话写成「长措辞 + 短语」两种（`部分读取：63/100000 字` / `目录只列出前 12/2001 个标题` / `只返回了这一节的前 3/9 段`…），`writeSentences(parts, room)` 按剩余空间逐句决定用长句、短句还是**整句省略**——省略不丢信息，`scope` / `truncated` / `complete` / `outlineTruncated` 不用花一个字符就把同样的事说清楚。预留与最终写入是同一个函数，因此「预留是上界、实际只会更短」是可验证的性质。
+- **正文拿剩下的，写入后再核一次**：`readChars ≤ 预算 − 目录 − 预留`，最终 note 又只写在「预算 − 目录 − 实际正文」之内，所以 `readChars + outlineChars + note.length ≤ maxChars` 是**构造出来的**，不靠运气。
+- **`preview.complete` 仍然只由内容决定**：正文全部返回才是 `complete`，与预算松弛无关；`canBeWhole` 让「正好放得下」的短文档不至于因为预留了「被截断」那句话而被误判成 partial。
+- **Context 的 share 覆盖整块**：不可信声明是模型会读到的文字，因此从同一份 share 里出；它放不下时（share ≤ 100）块只带文档内容，而这句话仍然会由渲染这些块的地方（runner 指令、HTTP 响应与工具的 `untrusted` 字段）逐字给出，share 不会因此膨胀。
+
+### 3. 实测（10 万字标题 + 10.8 万字正文单段，`maxChars` 就是下面那个数）
+
+| 预算 | Preview（正文+目录+说明） | Context 块（预览+目录+说明） | Read：spread / match / section / paragraph |
+| --- | --- | --- | --- |
+| 100 | 31 + 33 + 35 = **99** | 31 + 33 + 35 = **99** | 72 / 69 / 68 / 97 |
+| 200 | 98 + 66 + 35 = **199** | 31 + 33 + 136 = **200** | 173 / 170 / 169 / 198 |
+
+- 修复前同样的输入：Read `maxChars=100` → 174 字；Context `maxChars=100 / 200` → **200 / 301** 字；`maxChars=0` → 174 字。
+- 所有读取仍 `scope=partial`、`truncated=true`，每个片段的 `sourceStart/sourceEnd` 都能在原文 Markdown 上取回同样的字符串，`charStart/charEnd` 在拼接文本上同样成立。
+- Runner 实测：1500 字预算的意图阶段，模型收到的文档块是 1460 字（预览 1159 + 目录 166 + 说明 135），块之外只有 runner 自己的固定标签（id / 文件名 / 字数 / 「目录：」「内容片段：」前缀）与那句不可信声明——文档片段严守预算，固定系统指令另行计算。
+
+### 4. 本轮新增/收紧的测试（4 例，其中 3 例是反例）
+
+先在**未打补丁**的源码上跑过（`git stash push -- documents.ts service.ts`），失败如下：读取 174 > 100、Context 200 > 100、`maxChars=0` 的读取 174 > 0；补丁恢复后全部通过。
+
+- 「每一种读取策略都不超过 `maxChars`（100 与 200）」：五种请求（默认 / question / terms / sectionIndex / paragraphIndex）逐一断言 `readChars + outlineChars + note.length ≤ maxChars`，并断言 `scope=partial`、`truncated=true`、`fragments.length > 0`、每个片段的 `sourceStart/sourceEnd` 与 `charStart/charEnd` 都能在原文字符串上取回。
+- 「Preview 与 Context 块都不超过 `maxChars`（100 / 200 / 600 / 1500）」：600 与 1500 是 runner 真正使用的预算；断言第一条目录被裁剪且仍是标签前缀、`complete=false`、块总量不超过预算。
+- 「预算小到放不下一句话时，宁可少写也不超」：`maxChars` 0 / 1 / 10 / 40 / 60 / 100 下读取、预览、Context 全部 ≤ 预算；`maxChars=45` 时正文改用短语「部分读取：14/… 字」而不是超预算的长句。
+- 「正常短文档仍然整篇返回」（护栏，非反例）：多段短文档在小预算与默认预算下每个段落都完整返回、没有任何片段被标 truncated、目录完整；单段短文档仍然 `scope=full` + 「已读取全文」。
+
+### 5. 本轮改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `packages/plugin-research/src/documents.ts` | `characterBudget`（取消下限）、`AnswerSentence` / `AnswerFacts` / `answerSentences` / `writeSentences` / `sentencesRoom`（长句 / 短句 / 省略）、`clippedParagraphSentence` / `sectionSentence` / `spreadSentence` / `matchSentence`、预览与读取按「目录 → 句子 → 正文」统一记账、`readDocument` 的 `settle` 改为按实际字数写句子 |
+| `packages/plugin-research/src/service.ts` | `documentContextImpl`：不可信声明计入同一份 share，块总长 ≤ `maxChars` |
+| `packages/plugin-research/src/tools.ts` | `read_document` 的 `maxChars` 说明改为「预算很小时正文会相应变短，甚至只剩一句或为空」 |
+
+未改动：F1 的作用域交叉验证、F2 / F3 / F6 已关闭的问题、F5 的 413 映射、前端、Agent Core / Host / Protocol / Client、MinerU。
+
+### 6. 已知边界（如实说明）
+
+- **多段落文档的 `scope` 口径未改**：`scope=full` 的判定是 `readChars === parsed.text.length`，而 `readChars` 只累计段落文字、不含段落之间的空行，因此一个「所有段落都返回了」的多段文档仍然报 `partial`（收尾轮之前就是这个行为，本轮未改动，也不在 F4 范围内）。单段文档、以及 `preview.complete` 的判定都不受此影响。
+- **极小预算是「简短」而不是「聪明」**：`maxChars=100` 对 10 万字标题的文档，先保证目录与那句话，正文只剩几到几十个字；这是预算本身的结论，不是新的截断逻辑。
+- **`maxChars` 仍然是 bearer 范围内的自我约束**：它保护的是「调用方给模型/自己准备的额度」，不是服务端的资源上限（真正的内容上限仍是 512 KiB / 20 份）。
 
 ## Step 3.7B 新增（本次工作产物）
 

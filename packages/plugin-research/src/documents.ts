@@ -557,18 +557,6 @@ function outlineSentence(total: number, shown: number): string {
   return `目录过长：共 ${total} 个标题，这里只列出前 ${shown} 个（其余未列出）`;
 }
 
-/**
- * The most the truncation sentence can cost for an outline this size.
- *
- * Reserved before the outline is bounded: the sentence is part of the answer the
- * caller asked to be bounded, so the room it needs is taken out of the budget
- * first. `shown` never exceeds `total`, so the longest form is the one written
- * with the same number.
- */
-function outlineSentenceRoom(total: number): number {
-  return outlineSentence(total, total).length;
-}
-
 /** The sentence that says how much of the text this answer carries. */
 function readSentence(readChars: number, totalChars: number, opening: boolean): string {
   return opening
@@ -582,26 +570,134 @@ function wholeSentence(totalChars: number): string {
 }
 
 /**
- * The room a read's own sentences need, before any content is fitted.
+ * The character budget an answer may spend, exactly as the caller asked for it.
  *
- * Every bounded answer in this file ends with sentences that say what it holds
- * and what it left out. They are part of the answer — a 400-character preview
- * that carries 400 characters of text and then appends a sentence about the
- * outline has answered more than 400 — so their room is paid for first, and it is
- * computed from counts, never from the document's own text, which is what keeps
- * it bounded however long the document is.
- *
- * The longer of the two wordings is reserved (「只读取了…」rather than「已读取
- * 全文」), and `readChars` is bounded by the budget itself: slack is safe,
- * overflow is not.
+ * There is no floor and no rounding up: a caller that asks for 100 characters
+ * gets an answer of at most 100, even when almost nothing fits in it. Growing a
+ * budget to make an answer nicer is how a limit stops being a limit — `maxChars`
+ * is named by a caller that is sizing something with it, and an answer that
+ * quietly carries twice what it was allowed is how the prompt it was sized for
+ * ends up over its own limit. Only the absence of a number falls back to the
+ * default budget.
  */
-function sentencesRoom(askChars: number, totalChars: number, opening: boolean, outlineTotal: number, outlineFits: boolean): number {
-  const status = readSentence(askChars, totalChars, opening).length;
-  // The sentence about the outline is only paid for when the outline really can
-  // be cut — which is knowable here: it is cut when it does not fit its share,
-  // and with a single heading there is nothing to drop.
-  const outline = outlineTotal > 1 && !outlineFits ? outlineSentenceRoom(outlineTotal) : 0;
-  return status + outline;
+function characterBudget(requested: number | undefined, fallback: number): number {
+  if (requested === undefined || !Number.isFinite(requested)) return fallback;
+  return Math.max(0, Math.floor(requested));
+}
+
+/** One sentence a bounded answer writes about itself, in two lengths. */
+type AnswerSentence = readonly [full: string, short: string];
+
+/** The facts a bounded answer states, as the sentences it may carry. */
+interface AnswerFacts {
+  /** True when this answer holds the whole text, so no sentence may say otherwise. */
+  readonly complete: boolean;
+  readonly readChars: number;
+  readonly totalChars: number;
+  readonly opening: boolean;
+  readonly outline: DocumentOutlineReading | null;
+  /** What this strategy left out, when it has something to say. */
+  readonly strategy: AnswerSentence | null;
+}
+
+/**
+ * The sentences a bounded answer writes, longest wording first.
+ *
+ * The short wording is not a euphemism:「部分读取：63/100000 字」carries the same
+ * two numbers as the sentence above it. It exists because a 60-character budget
+ * can hold one of the two, and the fact matters more than the phrasing.
+ */
+function answerSentences(facts: AnswerFacts): readonly AnswerSentence[] {
+  const parts: AnswerSentence[] = [];
+  if (facts.complete) {
+    const whole = wholeSentence(facts.totalChars);
+    parts.push([whole, whole]);
+  } else {
+    parts.push([
+      readSentence(facts.readChars, facts.totalChars, facts.opening),
+      `部分读取：${facts.readChars}/${facts.totalChars} 字`,
+    ]);
+  }
+  // The outline is bounded before these sentences are written, so whether it was
+  // cut is known here rather than guessed — a sentence about a cut that did not
+  // happen is as wrong as a cut that goes unmentioned.
+  if (facts.outline !== null && facts.outline.truncated) {
+    parts.push([
+      outlineNote(facts.outline),
+      `目录只列出前 ${facts.outline.headings.length}/${facts.outline.total} 个标题`,
+    ]);
+  }
+  if (facts.strategy !== null) parts.push(facts.strategy);
+  return parts;
+}
+
+/**
+ * The sentences, written into the room they were given, never over it.
+ *
+ * Each part is written in its long wording if that fits, in its short one if
+ * only that fits, and left out when neither does: `maxChars` bounds the answer,
+ * not just the text in it, so an answer that cannot hold the sentence about
+ * itself carries fewer words rather than more characters. Nothing is lost by
+ * leaving one out — `scope`, `truncated`, `complete` and `outlineTruncated` say
+ * the same things without spending a character.
+ */
+function writeSentences(parts: readonly AnswerSentence[], room: number): string {
+  const written: string[] = [];
+  let used = 0;
+  for (const [full, short] of parts) {
+    const gap = written.length === 0 ? 0 : 1;
+    if (used + gap + full.length <= room) {
+      written.push(full);
+      used += gap + full.length;
+      continue;
+    }
+    if (used + gap + short.length <= room) {
+      written.push(short);
+      used += gap + short.length;
+    }
+  }
+  return written.join("；");
+}
+
+/**
+ * The room a read's own sentences take, before any content is fitted.
+ *
+ * The numbers they will carry are the ones known here: the outline's counts are
+ * already settled, and `readChars` is bounded by the budget, so a sentence
+ * written with the budget as its number is never shorter than the one finally
+ * written — the room taken is an upper bound, and slack is safe while overflow
+ * is not. That is what keeps the sentence from being appended to an answer that
+ * had already spent its budget.
+ */
+function sentencesRoom(facts: AnswerFacts, room: number): number {
+  return writeSentences(answerSentences(facts), room).length;
+}
+
+/** What a clipped paragraph read says, with where in the file its words really are. */
+function clippedParagraphSentence(total: number, from: number, to: number): AnswerSentence {
+  const shown = to - from;
+  return [
+    `这个段落较长（${total} 字），只返回了它在原文 ${from}–${to} 位置的 ${shown} 字`,
+    `长段落：仅返回原文 ${from}–${to} 位置的 ${shown} 字`,
+  ];
+}
+
+/** What a bounded section read says about the paragraphs it left out. */
+function sectionSentence(inside: number, shown: number): AnswerSentence {
+  return [
+    `这一节有 ${inside} 段，本次只返回了前 ${shown} 段（受字符上限限制）`,
+    `只返回了这一节的前 ${shown}/${inside} 段`,
+  ];
+}
+
+/** What a spread read says about the paragraphs it left out. */
+function spreadSentence(shown: number, total: number): AnswerSentence {
+  return [`本次只返回了 ${shown} 段（共 ${total} 段，受字符上限限制）`, `只返回了 ${shown}/${total} 段`];
+}
+
+/** What a term-matched read says about the matches it left out. */
+function matchSentence(picked: number, shown: number): AnswerSentence {
+  return [`匹配到 ${picked} 段，本次只返回了前 ${shown} 段（受字符上限限制）`, `匹配 ${picked} 段，只返回前 ${shown} 段`];
 }
 
 /** How much of a document a bounded preview returned, in the product's words. */
@@ -626,11 +722,12 @@ export interface DocumentPreview {
  * A bounded preview: the opening of the document, its outline, and a count.
  *
  * `maxChars` is the budget for the whole answer — the opening, the outline, and
- * the sentences that say what the answer holds — exactly as a read's budget is.
- * The outline takes at most a third of what the sentences leave, and what the
- * outline costs is what the text gets less of, so a caller that asks for a small
- * preview gets a small preview however many headings the document has, and
- * whatever its labels are made of.
+ * the sentences that say what the answer holds — exactly as a read's budget is,
+ * and it is spent exactly: `charsRead + outlineChars + note.length ≤ maxChars`,
+ * however long the document's labels are. The outline takes at most a third of
+ * it, what the outline costs is what the text gets less of, and a budget too
+ * small for the sentences carries fewer words instead of more characters, so a
+ * caller that asks for a small preview gets a small preview.
  *
  * `complete` is the field the rest of the product reads, and it is true only
  * when every character of the stored text is in `text`. A preview that was cut
@@ -646,21 +743,36 @@ export function documentPreview(input: {
   /** The characters the outline may cost at most; it is part of the same budget. */
   readonly outlineChars?: number;
 }): DocumentPreview {
-  const maxChars = Math.max(0, input.maxChars ?? MAX_DOCUMENT_PREVIEW_CHARS);
+  const maxChars = characterBudget(input.maxChars, MAX_DOCUMENT_PREVIEW_CHARS);
   const text = input.parsed.text;
   const outlineCap = input.outlineChars ?? MAX_DOCUMENT_OUTLINE_CHARS;
   // A preview is for the opening of the text: a document whose labels are longer
-  // than its prose must not be「read」as a table of contents.
-  const share = (room: number): number => Math.min(outlineCap, Math.floor(Math.max(0, room) / 3));
-  const outlineCost = input.parsed.outline.reduce((sum, heading) => sum + outlineEntryChars(heading), 0);
-  const noteRoom = Math.min(
-    maxChars,
-    sentencesRoom(maxChars, text.length, true, input.parsed.outline.length, outlineCost <= share(maxChars)),
+  // than its prose must not be「read」as a table of contents. The outline is cut
+  // to its share of the budget first, so what it costs is known when the
+  // sentences below are measured against the same budget.
+  const outline = boundedOutline(input.parsed.outline, Math.min(outlineCap, Math.floor(maxChars / 3)));
+  const outlineRoom = Math.max(0, maxChars - outline.chars);
+  // If the whole text and the sentence that says so fit, the answer can be
+  // complete, and the room is reserved for the shorter wording it will really
+  // use: a document that fits its budget must not be cut short because room was
+  // held for the sentence about being cut short.
+  const wholeFacts: AnswerFacts = {
+    complete: true,
+    readChars: text.length,
+    totalChars: text.length,
+    opening: true,
+    outline,
+    strategy: null,
+  };
+  const canBeWhole = text.length + outline.chars + sentencesRoom(wholeFacts, outlineRoom) <= maxChars;
+  const noteRoom = sentencesRoom(
+    canBeWhole
+      ? wholeFacts
+      : { complete: false, readChars: maxChars, totalChars: text.length, opening: true, outline, strategy: null },
+    outlineRoom,
   );
-  const outline = boundedOutline(input.parsed.outline, share(maxChars - noteRoom));
-  // What the outline and the sentences cost is what the text no longer has: one
-  // budget, three parts, and the text is the part that gives way.
-  const textBudget = Math.max(0, maxChars - noteRoom - outline.chars);
+  // One budget, three parts, and the text is the part that gives way.
+  const textBudget = Math.max(0, maxChars - outline.chars - noteRoom);
   const slice = text.length <= textBudget ? text : text.slice(0, textBudget);
   const complete = slice.length === text.length;
   return {
@@ -675,10 +787,13 @@ export function documentPreview(input: {
     outlineChars: outline.chars,
     outlineTotal: outline.total,
     outlineTruncated: outline.truncated,
-    note: [
-      complete ? wholeSentence(text.length) : readSentence(slice.length, text.length, true),
-      ...(outline.truncated ? [outlineNote(outline)] : []),
-    ].join("；"),
+    // The sentences are written into what the text did not take, which is at
+    // least the room they were reserved: this is the second half of「the answer
+    // never costs more than it was allowed」.
+    note: writeSentences(
+      answerSentences({ complete, readChars: slice.length, totalChars: text.length, opening: true, outline, strategy: null }),
+      Math.max(0, maxChars - outline.chars - slice.length),
+    ),
   };
 }
 
@@ -776,10 +891,13 @@ function sectionOwner(outline: readonly DocumentHeading[], charIndex: number): D
  * field says whether the whole document was returned or only a part of it.
  *
  * The bound is on the *answer*, not on the paragraphs it quotes: `maxChars`
- * covers the fragments, the outline and the sentences that explain them together,
- * and a paragraph longer than what is left is cut at a real position in the
- * user's text (never padded, never merged) and marked `truncated`. That is the
- * whole reason this function exists in the library rather than in the caller: a
+ * covers the fragments, the outline and the sentences that explain them
+ * together, and it is spent exactly — `readChars + outlineChars + note.length ≤
+ * maxChars`, with no floor raising a small budget to a comfortable one. A
+ * paragraph longer than what is left is cut at a real position in the user's
+ * text (never padded, never merged) and marked `truncated`; a budget too small
+ * for the sentences carries fewer words, not more characters. That is the whole
+ * reason this function exists in the library rather than in the caller: a
  * 100,000-character paragraph must not be able to answer a 400-character request
  * with all of itself, and neither must a 100,000-character heading.
  */
@@ -792,18 +910,12 @@ export function readDocument(input: {
   readonly conversion?: DocumentConversion | null;
 }): DocumentReadResult {
   const conversion = input.conversion ?? null;
-  const asked = Math.max(200, input.request.maxChars ?? MAX_DOCUMENT_EXCERPT_CHARS);
-  const outlineCap = Math.max(0, Math.min(MAX_DOCUMENT_OUTLINE_CHARS, Math.floor(asked / 3)));
-  const outlineCost = input.parsed.outline.reduce((sum, heading) => sum + outlineEntryChars(heading), 0);
-  // The answer's own sentences are paid for first, from counts rather than from
-  // the document's text, so what is left for the fragments and the outline is
-  // known before either is chosen.
-  const noteRoom = Math.min(
-    asked,
-    sentencesRoom(asked, input.parsed.text.length, false, input.parsed.outline.length, outlineCost <= outlineCap),
-  );
-  const outline = boundedOutline(input.parsed.outline, Math.max(0, Math.min(MAX_DOCUMENT_OUTLINE_CHARS, Math.floor((asked - noteRoom) / 3))));
+  const asked = characterBudget(input.request.maxChars, MAX_DOCUMENT_EXCERPT_CHARS);
   const paragraphs = input.parsed.paragraphs;
+  const outline = boundedOutline(input.parsed.outline, Math.min(MAX_DOCUMENT_OUTLINE_CHARS, Math.floor(asked / 3)));
+  // What the outline cost is room the sentences and the fragments no longer
+  // have: one budget, and the outline takes its share of it first.
+  const outlineRoom = Math.max(0, asked - outline.chars);
   const base = {
     documentId: input.documentId,
     title: input.title,
@@ -843,10 +955,19 @@ export function readDocument(input: {
     };
   };
 
+  /**
+   * Settles an answer: its fragments, the sentences about them, and the truth
+   * about whether it is the whole document.
+   *
+   * `strategy` is what this strategy has to say about what it left out, written
+   * from the counts the answer really has. The room it gets is what the outline
+   * and the fragments did not take, and the sentences are written to fit it — so
+   * the answer as a whole is bounded by `maxChars` by construction, not by luck.
+   */
   const settle = (
     strategy: DocumentReadResult["strategy"],
     fragments: readonly DocumentFragment[],
-    note: string,
+    strategySentence: AnswerSentence | null,
   ): DocumentReadResult => {
     const readChars = fragments.reduce((sum, fragment) => sum + fragment.text.length, 0);
     const clipped = fragments.some((fragment) => fragment.truncated);
@@ -859,23 +980,49 @@ export function readDocument(input: {
       readChars,
       fragments,
       truncated: !whole,
-      note: [
-        whole ? wholeSentence(input.parsed.text.length) : readSentence(readChars, input.parsed.text.length, false),
-        ...(note.length === 0 ? [] : [note]),
-        ...(outline.truncated ? [outlineNote(outline)] : []),
-      ].join("；"),
+      note: writeSentences(
+        answerSentences({
+          complete: whole,
+          readChars,
+          totalChars: input.parsed.text.length,
+          opening: false,
+          outline,
+          // A complete answer has nothing to explain about what it left out.
+          strategy: whole ? null : strategySentence,
+        }),
+        Math.max(0, asked - outline.chars - readChars),
+      ),
     };
   };
 
   /**
-   * What the fragments may cost, once the outline and the sentences are paid for.
+   * What the fragments may cost, once the outline and the sentences about them
+   * are paid for.
    *
-   * `strategyRoom` is the room the sentence this strategy writes needs, sized
-   * from the counts the strategy has already settled on — so it is known before
-   * the fit rather than after it, and the answer cannot end up over budget
-   * because a sentence turned out longer than expected.
+   * The strategy's sentence is reserved in the longest wording it can be written
+   * in — its counts are at their largest before the fit — so the room is known
+   * before a fragment is chosen, and the answer cannot end up over budget
+   * because a sentence turned out longer than expected. The sentence finally
+   * written names smaller numbers and is bounded by the room the fragments
+   * really left.
    */
-  const contentBudget = (strategyRoom: number): number => Math.max(0, asked - noteRoom - strategyRoom - outline.chars);
+  const contentBudget = (strategySentence: AnswerSentence | null): number =>
+    Math.max(
+      0,
+      asked -
+        outline.chars -
+        sentencesRoom(
+          {
+            complete: false,
+            readChars: asked,
+            totalChars: input.parsed.text.length,
+            opening: false,
+            outline,
+            strategy: strategySentence,
+          },
+          outlineRoom,
+        ),
+    );
 
   /** Paragraphs are added while they fit whole; the first one may be clipped. */
   const fit = (candidates: readonly Paragraph[], windowOf: (paragraph: Paragraph) => number, budget: number): readonly DocumentFragment[] => {
@@ -902,41 +1049,38 @@ export function readDocument(input: {
 
   if (input.request.paragraphIndex !== undefined) {
     const paragraph = paragraphs.find((candidate) => candidate.index === input.request.paragraphIndex);
-    if (paragraph === undefined) return settle("paragraph", [], "");
-    // The sentence is written from the paragraph and the budget rather than from
-    // the fragment, so its room is exact and its numbers are upper bounds: the
-    // paragraph is longer than the most the text could get, so it will be cut.
-    const most = Math.max(0, asked - noteRoom - outline.chars);
-    const clipped = paragraph.text.length > most;
-    const returned = Math.min(paragraph.text.length, most);
+    if (paragraph === undefined) return settle("paragraph", [], null);
+    // The sentence is reserved from the paragraph and the budget rather than
+    // from the fragment, so its room is known before the fit and its numbers are
+    // upper bounds: a paragraph longer than everything the answer has will be
+    // cut, and a shorter one writes a shorter sentence or none at all.
+    const most = Math.max(0, asked - outline.chars);
     const from = sourceOffsetOf(paragraph);
-    const sentenceRoom = clipped
-      ? `这个段落较长（${paragraph.text.length} 字），只返回了它在原文 ${from}–${from + returned} 位置的 ${returned} 字`.length
-      : 0;
-    const fragments = fit([paragraph], () => 0, contentBudget(sentenceRoom));
+    const reserved =
+      paragraph.text.length > most ? clippedParagraphSentence(paragraph.text.length, from, from + most) : null;
+    const fragments = fit([paragraph], () => 0, contentBudget(reserved));
     const first = fragments[0];
     return settle(
       "paragraph",
       fragments,
       first !== undefined && first.truncated
-        ? `这个段落较长（${paragraph.text.length} 字），只返回了它在原文 ${first.sourceStart}–${first.sourceEnd} 位置的 ${first.text.length} 字`
-        : "",
+        ? clippedParagraphSentence(paragraph.text.length, first.sourceStart, first.sourceEnd)
+        : null,
     );
   }
 
   if (input.request.sectionIndex !== undefined) {
     const heading = input.parsed.outline[input.request.sectionIndex];
-    if (heading === undefined) return settle("section", [], "");
+    if (heading === undefined) return settle("section", [], null);
     const inside = paragraphs.filter(
       (paragraph) => paragraph.charStart >= heading.charStart && paragraph.charEnd <= Math.max(heading.charEnd, heading.charStart),
     );
     const offered = inside.slice(0, MAX_DOCUMENT_FRAGMENTS);
-    const sentenceRoom = `这一节有 ${inside.length} 段，本次只返回了前 ${offered.length} 段（受字符上限限制）`.length;
-    const fragments = fit(offered, () => 0, contentBudget(sentenceRoom));
+    const fragments = fit(offered, () => 0, contentBudget(sectionSentence(inside.length, offered.length)));
     return settle(
       "section",
       fragments,
-      fragments.length < offered.length ? `这一节有 ${inside.length} 段，本次只返回了前 ${fragments.length} 段（受字符上限限制）` : "",
+      fragments.length < offered.length ? sectionSentence(inside.length, fragments.length) : null,
     );
   }
 
@@ -993,22 +1137,16 @@ export function readDocument(input: {
       spread.push(paragraph);
       if (spread.length >= MAX_DOCUMENT_FRAGMENTS) break;
     }
-    const sentenceRoom = `本次只返回了 ${spread.length} 段（共 ${paragraphs.length} 段，受字符上限限制）`.length;
-    const fragments = fit(spread, () => 0, contentBudget(sentenceRoom));
+    const fragments = fit(spread, () => 0, contentBudget(spreadSentence(spread.length, paragraphs.length)));
     return settle(
       "spread",
       fragments,
-      fragments.length < spread.length ? `本次只返回了 ${fragments.length} 段（共 ${paragraphs.length} 段，受字符上限限制）` : "",
+      fragments.length < spread.length ? spreadSentence(fragments.length, paragraphs.length) : null,
     );
   }
 
-  const sentenceRoom = `匹配到 ${picked.length} 段，本次只返回了前 ${picked.length} 段（受字符上限限制）`.length;
-  const fragments = fit(picked, matchWindow, contentBudget(sentenceRoom));
-  return settle(
-    "match",
-    fragments,
-    fragments.length < picked.length ? `匹配到 ${picked.length} 段，本次只返回了前 ${fragments.length} 段（受字符上限限制）` : "",
-  );
+  const fragments = fit(picked, matchWindow, contentBudget(matchSentence(picked.length, picked.length)));
+  return settle("match", fragments, fragments.length < picked.length ? matchSentence(picked.length, fragments.length) : null);
 }
 
 /** Terms a question is read into; the product's own tokenizer, kept local. */

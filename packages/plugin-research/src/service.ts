@@ -2684,21 +2684,34 @@ export function createResearchService(options: ResearchServiceOptions): Research
     let budget = totalChars;
     for (const document of documentsFor(scope)) {
       if (budget <= 0) break;
+      // What one block may cost is one share, and the share covers *everything*
+      // in it — the opening, the outline, the preview's own sentences, and the
+      // sentence that says what this text is. That last one is text a model
+      // reads like any other, so it is paid for out of the share instead of
+      // being appended to a preview that had already spent it: a 200-character
+      // share that answers with 301 characters is not a bound.
+      const share = Math.min(maxChars, budget);
+      const sentenceRoom = share > UNTRUSTED_DOCUMENT_NOTE.length ? UNTRUSTED_DOCUMENT_NOTE.length + 1 : 0;
       const parsed = parseDocument(document.markdown);
       const preview = documentPreview({
         documentId: document.id,
         filename: document.originalFilename,
         title: document.title,
         parsed,
-        maxChars: Math.min(maxChars, budget),
+        maxChars: Math.max(0, share - sentenceRoom),
       });
       const outline = preview.outline.map((heading) => `${"#".repeat(heading.level)} ${heading.text}`);
-      // What the block costs the *total* is everything it carries — the opening,
-      // the outline, and the sentences that say how much of the document this is
-      // and that its text is data rather than instruction. A preview that fits
-      // its own budget and then hands a caller three sentences of explanation has
-      // spent more than it counted.
-      budget -= preview.charsRead + preview.outlineChars + UNTRUSTED_DOCUMENT_NOTE.length + preview.note.length + 1;
+      // When the share cannot hold that sentence, the block carries the
+      // document's own content and nothing else — every surface that renders
+      // these blocks prints the sentence itself, so it is not lost, and the
+      // share stays a share.
+      const note =
+        sentenceRoom === 0
+          ? preview.note
+          : preview.note.length === 0
+            ? UNTRUSTED_DOCUMENT_NOTE
+            : `${UNTRUSTED_DOCUMENT_NOTE} ${preview.note}`;
+      budget -= preview.charsRead + preview.outlineChars + note.length + 1;
       contexts.push({
         documentId: document.id,
         filename: document.originalFilename,
@@ -2714,7 +2727,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         outline,
         outlineTotal: preview.outlineTotal,
         outlineTruncated: preview.outlineTruncated,
-        note: `${UNTRUSTED_DOCUMENT_NOTE} ${preview.note}`,
+        note,
       });
     }
     return contexts;

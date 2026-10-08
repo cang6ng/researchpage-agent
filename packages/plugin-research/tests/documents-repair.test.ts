@@ -25,6 +25,7 @@ import {
   MAX_DOCUMENT_EXCERPT_CHARS,
   MAX_DOCUMENT_OUTLINE_CHARS,
   createResearchService,
+  documentPreview,
   openResearchRepository,
   parseDocument,
   type ResearchService,
@@ -630,76 +631,182 @@ describe("the library's own rules stay intact", () => {
 });
 
 /**
- * The closing review's first defect, with the counterexample that proved it: the
- * outline's first entry was exempt from the budget that was bounding it, so a
- * 100,000-character label answered a 100-character request with 208 characters of
- * table of contents and no text at all.
+ * The closing review's first defect, with the counterexample that proved it:
+ * `maxChars` was not a limit. Reads below 200 characters were quietly widened to
+ * 200, the outline's first entry was exempt from the budget that was bounding it,
+ * and the answer's own sentences were appended after the budget had been spent —
+ * so a 100,000-character label answered a 100-character request with 208
+ * characters, and a context block asked for 200 answered with 301.
+ *
+ * Every assertion below is the same statement the review made: what comes back
+ * is at most what was asked for. The budget is asserted against the exact
+ * `maxChars` — never a widened one.
  */
 describe("a heading longer than the budget cannot spend the budget", () => {
-  // 100,000 characters of label and 100,000 of prose: the first outline entry used
-  // to be kept whatever it cost, so a 100-character preview answered with 208
-  // characters of table of contents and no text at all. The text is Latin so that
-  // the file is 200 KB rather than the library's own 512 KB limit.
+  // 105,000 characters of label and 108,000 of prose in a single paragraph. The
+  // filler is Latin so the file stays well under the library's own 512 KB limit.
   const LABEL = "a-long-heading-label-".repeat(5_000);
   const BODY = "a-body-paragraph-sentence. ".repeat(4_000);
   const document = `# ${LABEL}\n\n${BODY}`;
+  const joined = parseDocument(document).text;
+  let sessions = 0;
 
-  /** Everything a bounded answer carries: the outline, the text, its own sentences. */
-  function carried(answer: { readonly outlineChars: number; readonly readChars: number; readonly note: string }): number {
-    return answer.outlineChars + answer.readChars + answer.note.length;
+  /** What one long document project looks like; each case gets its own service. */
+  function longDocument(): { readonly app: ResearchService; readonly sessionId: string; readonly documentId: string } {
+    const app = service();
+    const sessionId = `head_${sessions += 1}`;
+    app.createIntent(sessionId, { seedTopic: "超长标题" });
+    const uploaded = app.uploadDocument({ sessionId, filename: "long-heading.md", content: { text: document } });
+    if (uploaded.ok !== true) throw new Error(JSON.stringify(uploaded));
+    return { app, sessionId, documentId: uploaded.document.documentId };
   }
 
-  it("bounds the first heading and the sentences about it, at maxChars 100 and 200", () => {
-    const app = service();
-    app.createIntent("head_a", { seedTopic: "超长标题" });
-    const uploaded = app.uploadDocument({ sessionId: "head_a", filename: "long-heading.md", content: { text: document } });
-    if (uploaded.ok !== true) throw new Error(JSON.stringify(uploaded));
-    const documentId = uploaded.document.documentId;
+  /** Everything a bounded read carries: the fragments, the outline, its own sentences. */
+  function readChars(read: { readonly readChars: number; readonly outlineChars: number; readonly note: string }): number {
+    return read.readChars + read.outlineChars + read.note.length;
+  }
 
+  /** Everything a bounded preview carries. */
+  function previewChars(preview: { readonly charsRead: number; readonly outlineChars: number; readonly note: string }): number {
+    return preview.charsRead + preview.outlineChars + preview.note.length;
+  }
+
+  /** Everything a context block carries — the sentence that marks the text as data included. */
+  function blockChars(block: { readonly previewChars: number; readonly outline: readonly string[]; readonly note: string }): number {
+    return block.previewChars + block.outline.reduce((sum, line) => sum + line.length, 0) + block.note.length;
+  }
+
+  it("returns at most maxChars from every read strategy, at 100 and at 200", () => {
+    const { app, sessionId, documentId } = longDocument();
     for (const maxChars of [100, 200]) {
-      const contexts = app.documentContextOf({ documentIds: [documentId] }, maxChars);
-      const block = contexts[0];
-      if (block === undefined) throw new Error("no context block");
-      const outlineChars = block.outline.reduce((sum, line) => sum + line.length, 0);
-      // The block a prompt would carry, against the budget it was given.
-      expect(outlineChars + block.previewChars).toBeLessThanOrEqual(maxChars);
-      expect(block.complete).toBe(false);
-      expect(block.note).toContain("部分读取");
-      // The first entry is not the whole label: it was cut down to what fits.
-      const first = block.outline[0] ?? "";
-      expect(first.length).toBeLessThanOrEqual(maxChars);
-      expect(LABEL.startsWith(first.replace(/^#+\s*/, "").replace(/…$/, ""))).toBe(true);
-
-      // A read is bounded the same way, with its own sentences paid for out of
-      // the same budget. `maxChars` has a floor of 200 on this path.
-      const read = app.readDocument({ sessionId: "head_a", documentId, request: { maxChars } });
-      if (read.ok !== true) throw new Error("read refused");
-      expect(carried(read)).toBeLessThanOrEqual(Math.max(200, maxChars));
-      expect(read.scope).toBe("partial");
-      expect(read.outlineChars).toBeLessThanOrEqual(Math.max(200, maxChars));
+      for (const request of [{}, { question: "body" }, { terms: ["body"] }, { sectionIndex: 0 }, { paragraphIndex: 0 }]) {
+        const read = app.readDocument({ sessionId, documentId, request: { ...request, maxChars } });
+        if (read.ok !== true) throw new Error("read refused");
+        const label = `maxChars=${maxChars} ${JSON.stringify(request)}`;
+        expect(readChars(read), label).toBeLessThanOrEqual(maxChars);
+        expect(read.outlineChars, label).toBeLessThanOrEqual(maxChars);
+        // A document this long cannot be read whole inside these budgets, and the
+        // answer may not pretend otherwise.
+        expect(read.scope, label).toBe("partial");
+        expect(read.truncated, label).toBe(true);
+        expect(read.fragments.length, label).toBeGreaterThan(0);
+        for (const fragment of read.fragments) {
+          // Whatever the budget did to the answer, the text is still the user's
+          // own characters at the position it reports — in the stored Markdown,
+          // and in the joined text an excerpt is verified against.
+          expect(document.slice(fragment.sourceStart, fragment.sourceEnd), label).toBe(fragment.text);
+          expect(joined.slice(fragment.charStart, fragment.charEnd), label).toBe(fragment.text);
+          expect(fragment.truncated, label).toBe(true);
+        }
+      }
     }
   });
 
-  it("keeps every read strategy inside the budget, and each excerpt where it says it is", () => {
-    const app = service();
-    app.createIntent("head_b", { seedTopic: "超长标题" });
-    const uploaded = app.uploadDocument({ sessionId: "head_b", filename: "long-heading.md", content: { text: document } });
-    if (uploaded.ok !== true) throw new Error(JSON.stringify(uploaded));
-    const documentId = uploaded.document.documentId;
+  it("returns at most maxChars from a preview and from a context block, at 100 and at 200", () => {
+    const { app, documentId } = longDocument();
+    // 100 and 200 are the review's own numbers; 600 and 1 500 are the budgets the
+    // research runner asks for, so these are the sizes its prompts really carry.
+    for (const maxChars of [100, 200, 600, 1_500]) {
+      const preview = documentPreview({
+        documentId,
+        filename: "long-heading.md",
+        title: "超长标题",
+        parsed: parseDocument(document),
+        maxChars,
+      });
+      expect(previewChars(preview), `preview ${maxChars}`).toBeLessThanOrEqual(maxChars);
+      expect(preview.complete).toBe(false);
+      expect(preview.note).toContain("部分读取");
+      // The first outline entry obeys the same budget as the rest of the answer:
+      // a 105,000-character label is cut down, never kept whole.
+      const first = preview.outline[0];
+      if (first === undefined) throw new Error("no heading");
+      expect(preview.outlineChars, `preview ${maxChars}`).toBeLessThanOrEqual(maxChars);
+      expect(first.text.length).toBeLessThan(LABEL.length);
+      expect(LABEL.startsWith(first.text.replace(/…$/, "")), `preview ${maxChars}`).toBe(true);
 
-    for (const request of [{}, { question: "正文段落" }, { sectionIndex: 0 }, { paragraphIndex: 0 }]) {
-      const read = app.readDocument({ sessionId: "head_b", documentId, request: { ...request, maxChars: 200 } });
-      if (read.ok !== true) throw new Error("read refused");
-      expect(carried(read), JSON.stringify(request)).toBeLessThanOrEqual(200);
-      expect(read.scope).toBe("partial");
-      for (const fragment of read.fragments) {
-        // Whatever the budget did, the text is still the user's own characters at
-        // the position it reports — in the stored Markdown and in the joined text.
-        expect(document.slice(fragment.sourceStart, fragment.sourceEnd)).toBe(fragment.text);
-        expect(fragment.charStart).toBeLessThanOrEqual(fragment.charEnd);
-        expect(fragment.sourceStart).toBeLessThanOrEqual(fragment.sourceEnd);
+      const contexts = app.documentContextOf({ documentIds: [documentId] }, maxChars);
+      const block = contexts[0];
+      if (block === undefined) throw new Error("no context block");
+      expect(blockChars(block), `context ${maxChars}`).toBeLessThanOrEqual(maxChars);
+      expect(block.complete).toBe(false);
+      // The block's own sentence is inside the budget rather than appended to it.
+      expect(block.note.length, `context ${maxChars}`).toBeLessThanOrEqual(maxChars);
+    }
+  });
+
+  it("keeps a budget too small for a sentence instead of writing one anyway", () => {
+    // The other end of the same rule: when nothing fits, the answer is empty or
+    // nearly so —「宁可返回空内容或简短的截断结果」— because a budget that small
+    // was named by a caller sizing something with it.
+    const { app, sessionId, documentId } = longDocument();
+    const parsed = parseDocument(document);
+    for (const maxChars of [0, 1, 10, 40, 60, 100]) {
+      for (const request of [{}, { paragraphIndex: 0 }, { terms: ["body"] }]) {
+        const read = app.readDocument({ sessionId, documentId, request: { ...request, maxChars } });
+        if (read.ok !== true) throw new Error("read refused");
+        expect(readChars(read), `read ${maxChars} ${JSON.stringify(request)}`).toBeLessThanOrEqual(maxChars);
+      }
+      const preview = documentPreview({ documentId, filename: "long.md", title: "t", parsed, maxChars });
+      expect(previewChars(preview), `preview ${maxChars}`).toBeLessThanOrEqual(maxChars);
+      for (const block of app.documentContextOf({ documentIds: [documentId] }, maxChars)) {
+        expect(blockChars(block), `block ${maxChars}`).toBeLessThanOrEqual(maxChars);
       }
     }
+
+    // A 45-character budget cannot hold the long「只读取了…」sentence, so the same
+    // fact is written in its short form — the numbers are the numbers, and the
+    // answer stays inside 45 either way.
+    const shortForm = app.readDocument({ sessionId, documentId, request: { maxChars: 45 } });
+    if (shortForm.ok !== true) throw new Error("read refused");
+    expect(readChars(shortForm)).toBeLessThanOrEqual(45);
+    expect(shortForm.note).toMatch(/部分读取：\d+\/\d+ 字/);
+  });
+
+  it("still reads a short document in full, without truncating it to be safe", () => {
+    // The strict budget must not become「everything is partial」: a document that
+    // fits is still returned whole, at a small budget and at the default one.
+    const short = "# 短文\n\n一句话。\n\n## 第二节\n\n另一句话。";
+    const app = service();
+    app.createIntent("short_a", { seedTopic: "短文" });
+    const uploaded = app.uploadDocument({ sessionId: "short_a", filename: "short.md", content: { text: short } });
+    if (uploaded.ok !== true) throw new Error("upload refused");
+    const documentId = uploaded.document.documentId;
+    const parsed = parseDocument(short);
+    const contentChars = parsed.paragraphs.reduce((sum, paragraph) => sum + paragraph.text.length, 0);
+
+    for (const maxChars of [200, 400, undefined]) {
+      const read = app.readDocument({ sessionId: "short_a", documentId, request: maxChars === undefined ? {} : { maxChars } });
+      if (read.ok !== true) throw new Error("read refused");
+      const label = `maxChars=${String(maxChars)}`;
+      // Every paragraph came back, whole, and nothing claims otherwise.
+      expect(read.fragments.length, label).toBe(parsed.paragraphs.length);
+      expect(read.fragments.every((fragment) => !fragment.truncated), label).toBe(true);
+      expect(read.readChars, label).toBe(contentChars);
+      expect(read.outlineTruncated, label).toBe(false);
+      expect(read.outline.length, label).toBe(parsed.outline.length);
+      for (const fragment of read.fragments) {
+        expect(short.slice(fragment.sourceStart, fragment.sourceEnd), label).toBe(fragment.text);
+      }
+      if (maxChars !== undefined) expect(readChars(read), label).toBeLessThanOrEqual(maxChars);
+    }
+
+    // The one case where a read may say it read everything: a document whose text
+    // is a single paragraph, which is the case the whole-text claim is defined
+    // against. It says so, at a budget far smaller than the default one.
+    const single = app.uploadDocument({ sessionId: "short_a", filename: "single.md", content: { text: "# t\n\n一句话。" } });
+    if (single.ok !== true) throw new Error("upload refused");
+    const whole = app.readDocument({ sessionId: "short_a", documentId: single.document.documentId, request: { maxChars: 200 } });
+    if (whole.ok !== true) throw new Error("read refused");
+    expect(whole.scope).toBe("full");
+    expect(whole.truncated).toBe(false);
+    expect(whole.note).toContain("已读取全文");
+    expect(readChars(whole)).toBeLessThanOrEqual(200);
+
+    const preview = documentPreview({ documentId, filename: "short.md", title: "短文", parsed, maxChars: 400 });
+    expect(preview.complete).toBe(true);
+    expect(preview.text).toBe(parsed.text);
+    expect(previewChars(preview)).toBeLessThanOrEqual(400);
   });
 
   it("keeps a clipped first heading located in the stored Markdown", () => {

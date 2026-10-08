@@ -374,12 +374,15 @@ ${"补充说明段落。".repeat(200)}`;
     expect(context).toHaveLength(1);
     expect(context[0]?.note).toContain(UNTRUSTED_DOCUMENT_NOTE);
     expect(context[0]?.complete).toBe(false);
-    // The budget covers the whole block: the opening and the outline together.
+    // The budget covers the whole block — the opening, the outline, the
+    // sentences that say how much of the document this is, and the sentence
+    // that says the text is data — and the document itself is most of it.
     const block = context[0];
     if (block === undefined) return;
     const outlineChars = block.outline.reduce((sum, line) => sum + line.length, 0);
-    expect(block.previewChars + outlineChars).toBeLessThanOrEqual(400);
-    expect(block.previewChars).toBeGreaterThan(300);
+    expect(block.previewChars + outlineChars + block.note.length).toBeLessThanOrEqual(400);
+    expect(block.previewChars).toBeGreaterThan(200);
+    expect(block.previewChars).toBeGreaterThan(block.note.length + outlineChars);
     expect(block.chars).toBeGreaterThan(1_000);
   });
 
