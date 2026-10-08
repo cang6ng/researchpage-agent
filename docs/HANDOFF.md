@@ -114,6 +114,25 @@
 - 转换 → `research_source` → Source：`role=user-provided`；`read_source` 后快照 728 字、2 条证据，每条 excerpt 都是快照的精确子串（`task_56434529ddb76c2e`）。
 - 转换后的 Markdown 保留了 MinerU 的原始形态（`#`/`##` 标题、`<table>…</table>` 表格），产品原样保存，不做二次改写。
 
+### OCR 与「文字层提取」是两件事（本轮实测）
+
+- **适配器不传任何 OCR 参数**：`parse_documents` 只收到 `{file_sources, output_dir}`，没有 `enable_ocr`、没有 `language`、没有 `model`。因此 OCR 是 MCP 服务自己的 auto-detect 默认值，语言是服务端默认 `ch`。**产品没有、也不会替用户打开或关闭 OCR**。
+- **出生数字型 PDF = 文字层提取，不是 OCR**：三个常规材料（Chrome 打印的样例、python-docx 的 DOCX、arXiv 论文）都带真实文字层，MinerU 直接提取，产物是干净的段落与标题。
+- **扫描件（纯图像 PDF）实测走了真正的识别**：把样例 PDF 逐页栅格化成图片、重新封装成没有任何文字层的 PDF（用 pypdfium2 复核 `text_layer_chars=0`），再经产品真实转换：116 116 B，工具调用 31 257 ms，任务 32 309 ms，**782 字**返回，内容与图上文字一致，并且带 OCR 典型痕迹（`Thebenchmark`、`thesamecorpus`、`1.引言Introduction`）——即文本只能来自识别，不可能是复制文字层。入口：`RESEARCHPAGE_SMOKE_SCANNED_PDF=<path> RESEARCHPAGE_SMOKE_EXPECT_TEXT="A|B"`（与 `RESEARCHPAGE_REAL_MINERU=1` 一起用），断言识别结果里必须出现给定的字符串。
+- **边界（如实说明）**：本轮只实测了这一份扫描件（单一语言、印刷体、清晰）；没有实测手写体、低质量扫描、复杂版面、多栏扫描件，也没有实测 `enable_ocr: true` 强制 OCR 或其它 `language` 取值。Flash 模式的 20 页 / 10 MB 限制对扫描件同样成立。
+
+### MinerU 只在用户主动转换时被调用（本轮实测的「不调用」证据）
+
+- **静态入口**：`mineru.ts` 只被三处引用——`conversions.ts`（真正的使用者）、`routes.ts`（只取两个限制常量）、`composition.ts`（读设置）。`convertWithMineru` 全仓库**只有一个调用点**（`conversions.ts:441`，任务尝试内部），`probeMineru` 只有一个（`conversions.ts:542`，`GET /api/research/mineru` 的 readiness）。而这两个入口都只能由 `conversions.submit`（`POST /documents/convert`）与 `conversions.retry` 触发。
+- **检索 / 读取 / 报告路径完全不知道转换器存在**：`search.ts`、`openalex.ts`、`discovery.ts`、`read.ts`、`article.ts`、`report.ts`、`revision.ts`、`runner.ts` 里检索 `mineru` / `mcp` 均为 0 命中；`service.importConvertedDocument` 的唯一生产调用点是 `conversions.ts:473`。
+- **行为证据（负例 + 正控）**：`apps/research/tests/document-api.test.ts` 在**配置了可达转换器**的情况下跑完一整个真实流程（确认方向 → 任务卡 → 真实读取两份文档 → 矩阵 → 报告写入与校验），然后断言转换器的调用标记文件**不存在**、也没有任何转换任务；紧接着的转换用例再断言标记文件**出现**（正控）——否则「没调用」可能只是因为探针失灵。因此：arXiv / OpenAlex 检索、`read_source`、Snapshot 复用、报告生成都不会调用 MinerU；只有用户发起 `POST /api/research/documents/convert`（或对失败任务重试）才会。
+- **`GET /api/research/mineru` 会启动一次 MCP 服务**（connect + `tools/list`，实测 ~1–3 s），这是唯一「不转换也会接触 MinerU 子进程」的入口，且只在被显式请求时发生（结果缓存 60 s）；它不上传任何文件。
+
+### 转换缓存：没有实现（如实标注）
+
+- **按 `contentHash` 的去重发生在转换之后**：同一份 Markdown 进入同一会话时，文档库识别为同一份（`duplicate: true`，不重复存储）——这是 3.7B 已有的行为。
+- **转换本身没有缓存**：`sha256` 只在提交时算出来写进任务记录（`conversions.ts:603`），**转换前不查任何缓存**；同一个 PDF 再上传一次就会真的再跑一次 MinerU（新的 jobId、新的网络往返）。前端若要减少重复转换，需要在 3.7D 用 `sha256` 做一次显式「这份文件转换过了」的提示或确认，而不是由服务端静默复用——本轮不做。
+
 ### 已知边界与诚实说明
 
 - **转换任务只活在进程内**：任务记录不落库（重启后 `job_not_found`，并给出「重新上传」的说明），已经进入文档库的文档不受影响。真正持久的事实是文档与它的 `conversion` 记录。

@@ -13,9 +13,10 @@
  * tools, the matrix and the report validator are the real ones.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { ModelClient, ModelEvent, ModelMessage, ModelRequest, RuntimeContext } from "@every-dagent/agent-core";
 import { DEFAULT_MODEL_FRAMING } from "@every-dagent/agent-core";
@@ -34,7 +35,18 @@ function slow(name: string, body: () => Promise<void>): void {
   it(name, body, 120_000);
 }
 
+const here = dirname(fileURLToPath(import.meta.url));
+const fakeMineru = join(here, "helpers", "fake-mineru-mcp.mjs");
+const samplePdf = join(here, "fixtures", "conversion", "conversion-sample.pdf");
 const workDir = mkdtempSync(join(tmpdir(), "researchpage-document-api-"));
+/**
+ * Every tool call the configured converter received, if any.
+ *
+ * A converter that was never asked leaves no trace in its answers, so the
+ * scripted MCP peer is told to write one line per call instead: this is how the
+ * suite proves that a whole research run did not reach MinerU.
+ */
+const mineruCalls = join(workDir, "mineru-calls.log");
 const dataDir = join(workDir, "data");
 const staticRoot = join(process.cwd(), "apps", "research", "public");
 
@@ -539,6 +551,15 @@ beforeAll(async () => {
       search: () => Promise.reject(new Error("this test never searches")),
       read: () => Promise.reject(new Error("this test never reads the network")),
     },
+    // The converter is the scripted MCP peer: what this file is about is what a
+    // converted document does to a project that already has a report, not what
+    // mineru.net answers. It is configured with a marker file so the same suite
+    // can also show that nothing else in the product ever calls it.
+    mineru: {
+      command: process.execPath,
+      args: [fakeMineru, "--mode=success", `--marker=${mineruCalls}`],
+      packageSpec: "mineru-open-mcp==1.0.22-test",
+    },
     log: () => undefined,
   });
 }, 60_000);
@@ -866,6 +887,62 @@ describe("Scenarios F and G — material, reports and the boundary between them"
     expect((afterUpload["intent"] as { seedTopic: string }).seedTopic).toContain("Transformer");
     expect((afterUpload["intent"] as { direction: { topic: string } }).direction.topic).toBe("长上下文模型的推理成本比较");
   }, 60_000);
+
+  it("G. a whole research and report pass never calls the converter", async () => {
+    // Everything above this line — a direction confirmed, a task card, real
+    // reads of the documents, a matrix, a report written and validated — ran
+    // with a converter configured and reachable. None of it may have used it:
+    // MinerU is called when the user asks for a PDF/DOCX to be converted, and
+    // never by discovery, reading, snapshot reuse or report writing.
+    expect(existsSync(mineruCalls), existsSync(mineruCalls) ? readFileSync(mineruCalls, "utf8") : "no calls").toBe(false);
+    // Nor did those paths create a conversion job.
+    expect(app.conversions.view("conv_none", { taskId })).toMatchObject({ ok: false, kind: "job_not_found" });
+  }, 30_000);
+
+  it("G. a converted file brought into a project with a report is readable and moves nothing", async () => {
+    // 3.7C's entry, on a project that already has a published report: the file
+    // is converted by the scripted MCP peer, lands in the same library, is read
+    // like any other document — and the report is exactly where it was. A
+    // converted file is not a different kind of document, and it is not a write
+    // into the report either.
+    const before = await taskBundle(taskId);
+    const beforeReport = app.service.reportsOf(taskId).find((report) => report.id === String(before["currentReportId"]));
+    expect(beforeReport?.contentHash).toBeDefined();
+
+    const query = new URLSearchParams({ sessionId, filename: "converted-notes.pdf", usage: "intent_context", consent: "third_party_upload" });
+    const created = await fetch(`${app.pageOrigin}/api/research/documents/convert?${query.toString()}`, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: new Uint8Array(readFileSync(samplePdf)),
+    });
+    expect(created.status, await created.clone().text()).toBe(202);
+    const jobId = ((await created.json()) as { job: { jobId: string } }).job.jobId;
+
+    let documentId = "";
+    for (let attempt = 0; attempt < 300 && documentId === ""; attempt += 1) {
+      const status = await get(`/api/research/documents/convert/${jobId}?sessionId=${encodeURIComponent(sessionId)}`);
+      const job = status.json["job"] as { status: string; document?: { documentId: string } };
+      if (job.status === "failed") throw new Error(`conversion failed: ${JSON.stringify(status.json)}`);
+      if (job.status === "succeeded") documentId = job.document?.documentId ?? "";
+      else await new Promise((done) => setTimeout(done, 150));
+    }
+    expect(documentId).not.toBe("");
+
+    const read = await post(`/api/research/documents/${documentId}/read`, { taskId });
+    expect(read.status, JSON.stringify(read.json)).toBe(200);
+    expect(JSON.stringify(read.json)).toContain("转换得到的 Markdown");
+
+    const after = await taskBundle(taskId);
+    const afterReport = app.service.reportsOf(taskId).find((report) => report.id === String(after["currentReportId"]));
+    expect(afterReport?.id).toBe(beforeReport?.id);
+    expect(afterReport?.contentHash).toBe(beforeReport?.contentHash);
+    expect(app.service.reportsOf(taskId)).toHaveLength(1);
+    expect((after["task"] as { reportNeedsReview: unknown }).reportNeedsReview).toBeNull();
+    expect((after["documents"] as readonly { documentId: string }[]).some((entry) => entry.documentId === documentId)).toBe(true);
+    // Positive control for the case above: the marker does record a call when
+    // there is one, so its absence during the research pass meant something.
+    expect(existsSync(mineruCalls) ? readFileSync(mineruCalls, "utf8") : "").toContain("parse_documents");
+  }, 120_000);
 
   it("G'. a change the file suggests still needs a proposal the user accepts", async () => {
     // The only path to the report's text is a proposal: the document library

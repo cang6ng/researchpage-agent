@@ -62,6 +62,10 @@ uvx --from mineru-open-mcp==1.0.22 mineru-open-mcp --transport streamable-http -
   拒绝**（413 `conversion_file_too_large`）。
 - 转化能力（以官方工具描述为准）：PDF、DOCX、图片、PPTx、xls/xlsx。本轮产品只开放
   **PDF 与 DOCX** 两个入口，其它扩展名回 415。
+- **OCR 由服务端自动决定**：产品不传 `enable_ocr`、也不传 `language`（服务端默认 `ch`）。
+  带文字层的 PDF 走文字提取；**纯图像扫描件会走识别**——实测一份 0 文字层的 1 页扫描件
+  通过真实 MCP 返回了 782 字可读 Markdown（约 31 s）。更强的语言控制、强制 OCR 或更复杂
+  的扫描件本轮没有实测。
 - **设置 `MINERU_API_TOKEN` 后**进入官方说的精确模式（更高上限、更多输出格式）。
   Token 只在服务端环境里，不写入任何记录或响应；`GET /api/research/mineru` 只会告诉你
   当前是 `"mode": "flash"` 还是 `"token"`。
