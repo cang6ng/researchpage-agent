@@ -436,7 +436,10 @@ describe("what the converter's refusals look like", () => {
       const settled = await waitForJob(opaque, session, jobOf(created)["jobId"] as string);
       expect(settled["status"]).toBe("failed");
       expect((settled["failure"] as Record<string, unknown>)["code"]).toBe("conversion_failed");
-      expect(String((settled["failure"] as Record<string, unknown>)["problem"])).toContain("没有说明原因");
+      // The general sentence, and not a word of the converter's own message —
+      // its「Check server logs for details.」stays on the server.
+      expect((settled["failure"] as Record<string, unknown>)["problem"]).toBe("文档转换失败，请检查文件或稍后重试。");
+      expect(JSON.stringify(settled)).not.toContain("Check server logs");
     } finally {
       await opaque.close();
     }
@@ -547,8 +550,10 @@ describe("what the converter's refusals look like", () => {
       await noTool.close();
     }
 
-    // A converter that dies before the handshake is a start failure, and its
-    // own dying words travel with the record.
+    // A converter that dies before the handshake is a start failure. Its own
+    // dying words — and the MCP client's message about the closed connection —
+    // stay on the server: the client hears which failure it was, in this
+    // server's own words.
     const crashing = await appWithMode("crash");
     try {
       const session = await newSession(crashing, "起不来的服务");
@@ -556,7 +561,8 @@ describe("what the converter's refusals look like", () => {
       const settled = await waitForJob(crashing, session, jobOf(created)["jobId"] as string);
       expect(settled["status"]).toBe("failed");
       expect((settled["failure"] as Record<string, unknown>)["code"]).toBe("mcp_handshake_failed");
-      expect(String((settled["failure"] as Record<string, unknown>)["detail"])).toContain("Connection closed");
+      expect((settled["failure"] as Record<string, unknown>)["problem"]).toBe("MinerU 服务启动或连接失败。");
+      expect(JSON.stringify(settled)).not.toContain("Connection closed");
     } finally {
       await crashing.close();
     }
@@ -586,7 +592,10 @@ describe("what the converter's refusals look like", () => {
       expect(settled["status"]).toBe("failed");
       const failure = settled["failure"] as Record<string, unknown>;
       expect(failure["code"], JSON.stringify(failure)).toBe("conversion_timeout");
-      expect(String(failure["problem"])).toContain("12 秒");
+      expect(String(failure["problem"])).toBe("文档转换超时，可以重试。");
+      // The converter's own answer — it was still holding the call when the
+      // deadline passed — is not what the client is told.
+      expect(JSON.stringify(settled)).not.toContain("Connection closed");
       expect(settled["retryable"]).toBe(true);
       // And nothing of the conversion was kept: no document, no output files.
       expect((await get(slow, `/api/research/documents?sessionId=${encodeURIComponent(session)}`)).json["documents"]).toEqual([]);

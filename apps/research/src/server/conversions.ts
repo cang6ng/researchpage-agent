@@ -71,9 +71,6 @@ const MAX_ATTEMPTS = 3;
  * exception, because the alternative is a retry button that can only apologize.
  */
 const MAX_RETAINED_FAILURES = 8;
-/** How long a converter's own error text may be when it leaves this process. */
-const MAX_DETAIL_CHARS = 2_000;
-
 /** How long a readiness probe is believed, in ms. */
 const PROBE_TTL_MS = 60_000;
 
@@ -81,6 +78,134 @@ const PROBE_TTL_MS = 60_000;
 const CONVERSION_FORMATS: Readonly<Record<string, string>> = Object.freeze({ ".pdf": "pdf", ".docx": "docx" });
 
 export const MAX_CONVERSION_FILENAME_CHARS = 200;
+
+/**
+ * What a client is allowed to read about a failed conversion.
+ *
+ * Three fields, all of them this server's own: a code from a closed set, a
+ * sentence written here, and what to do next. There is deliberately no field
+ * for the converter's words — not a truncated one, not a sanitised one. A
+ * converter's failure carries a credential, a presigned URL, the traceback of
+ * an HTTP client with its request line in it, a fragment of the document being
+ * converted, an absolute path on this machine; the only way for none of that to
+ * reach a client is for the response to have nowhere to put it.
+ */
+export interface ConversionFailureView {
+  readonly code: string;
+  readonly problem: string;
+  readonly guidance: string;
+}
+
+/**
+ * The sentences this server publishes, by code — an allowlist, not a filter.
+ *
+ * Everything the user is told is composed here from constants of our own, so
+ * classification can stay as sharp as it was (`flash_page_limit` and
+ * `network_unavailable` are still two different answers with two different
+ * fixes) without any of it being copied from the converter. A code that is not
+ * in this table — a future one, or a bug — falls back to the general sentence
+ * by lookup rather than by matching, which is the safe answer by construction.
+ */
+const PUBLIC_FAILURES: Readonly<Record<string, ConversionFailureView>> = Object.freeze({
+  conversion_failed: {
+    code: "conversion_failed",
+    problem: "文档转换失败，请检查文件或稍后重试。",
+    guidance: "可以重试一次；若仍然失败，请换一份文件，或在服务端日志里按这份转换的任务号排查。",
+  },
+  mcp_not_installed: {
+    code: "mcp_not_installed",
+    problem: "服务端没有找到启动 MinerU 转换所需的 uvx，转换无法执行。",
+    guidance: "请在运行服务端的机器上安装 uv（https://docs.astral.sh/uv/），然后重新发起转换。",
+  },
+  mcp_handshake_failed: {
+    code: "mcp_handshake_failed",
+    problem: "MinerU 服务启动或连接失败。",
+    guidance: "请检查 uvx 是否可用、mineru-open-mcp 是否已下载，以及这台机器能否访问网络。",
+  },
+  mcp_tools_missing: {
+    code: "mcp_tools_missing",
+    problem: "MinerU 服务没有提供文档转换所需的工具，转换无法执行。",
+    guidance: "服务端安装的 mineru-open-mcp 版本可能不对，请按部署说明确认版本后重试。",
+  },
+  mcp_disconnected: {
+    code: "mcp_disconnected",
+    problem: "与 MinerU 服务的连接中断了，这次转换没有完成。",
+    guidance: "可以重试；若反复出现，请检查服务端的网络与 MinerU 可用性。",
+  },
+  conversion_timeout: {
+    code: "conversion_timeout",
+    problem: "文档转换超时，可以重试。",
+    guidance: "稍后重试，或换一份更小的文件；服务端的单次转换超时也可以通过 MINERU_TIMEOUT_MS 调整。",
+  },
+  conversion_cancelled: {
+    code: "conversion_cancelled",
+    problem: "这次转换被中止了（服务端正在关闭）。",
+    guidance: "重新发起即可。",
+  },
+  flash_file_too_large: {
+    code: "flash_file_too_large",
+    problem: "文件超过当前 MinerU 模式的大小限制（Flash 模式为 10 MB）。",
+    guidance: "请压缩或拆分这份文件，或在服务端配置 MINERU_API_TOKEN 后使用更大的限制。",
+  },
+  flash_page_limit: {
+    code: "flash_page_limit",
+    problem: "文件超过当前 MinerU 模式的页数限制（Flash 模式为 20 页）。",
+    guidance: "超出的页面不会被解析，所以这次转换被拒绝了：请拆分文件，或配置 MINERU_API_TOKEN 后重试。",
+  },
+  flash_unsupported_type: {
+    code: "flash_unsupported_type",
+    problem: "当前 MinerU 模式不支持这种文件类型。",
+    guidance: "请改用 PDF 或 DOCX；或在服务端配置 MINERU_API_TOKEN 后重试。",
+  },
+  flash_rate_limited: {
+    code: "flash_rate_limited",
+    problem: "MinerU 请求过于频繁，请稍后重试。",
+    guidance: "稍等一会儿再重试即可；这是 MinerU 免费模式的频率限制。",
+  },
+  provider_auth: {
+    code: "provider_auth",
+    problem: "MinerU 拒绝了这次请求的凭据。",
+    guidance: "请检查服务端环境变量 MINERU_API_TOKEN 是否正确，或去掉它改用 Flash 模式。",
+  },
+  network_unavailable: {
+    code: "network_unavailable",
+    problem: "无法连接 MinerU 服务，请检查网络。",
+    guidance: "文档没有被解析，也没有写入文档库；请检查服务端的网络（或代理）设置后重试。",
+  },
+  markdown_empty: {
+    code: "markdown_empty",
+    problem: "MinerU 返回了空的转换结果，这份文件没有被转换。",
+    guidance: "请确认文件不是空的或损坏的，然后重试。",
+  },
+  output_missing: {
+    code: "output_missing",
+    problem: "MinerU 没有给出完整的转换结果，这次转换没有被采用。",
+    guidance: "请重试；若反复出现，请换一份文件。",
+  },
+  output_outside_workdir: {
+    code: "output_outside_workdir",
+    problem: "MinerU 返回的结果文件不在本次转换的工作目录里，出于安全考虑没有读取它。",
+    guidance: "这次转换已被安全地放弃，没有文档被写入；请重试或联系服务端维护者。",
+  },
+  document_too_large: {
+    code: "document_too_large",
+    problem: "转换得到的 Markdown 超过文档库的单份上限（512 KB）。",
+    guidance: "请拆分这份文件，或只转换其中的一部分页面后再试。",
+  },
+  import_refused: {
+    code: "import_refused",
+    problem: "转换成功，但文档库拒绝保存这份文档。",
+    guidance: "请检查文件大小与当前会话的文档数量后重试。",
+  },
+});
+
+/** The answer for a code nobody taught this table, or for one that is missing. */
+const GENERAL_FAILURE: ConversionFailureView = PUBLIC_FAILURES["conversion_failed"] as ConversionFailureView;
+
+/** What a client is allowed to read about a failed conversion. */
+function publicFailure(code: string): ConversionFailureView {
+  return PUBLIC_FAILURES[code] ?? GENERAL_FAILURE;
+}
 
 /**
  * A refusal from this file, told apart from the library's own refusals.
@@ -144,9 +269,16 @@ export interface ConversionJobView {
     readonly pageMap: null;
     readonly trust: "server_verified";
   } | null;
+  /**
+   * What the converter was asked to do and what it answered.
+   *
+   * The tool's identity, the server that answered, the timing and the size of
+   * the result — all of it this server's own observations. The *arguments* and
+   * the converter's log stay out of it: the first names paths on this machine,
+   * the second is the converter's own text (see `ConversionFailureView`).
+   */
   readonly toolCall: {
     readonly tool: string;
-    readonly command: string;
     readonly server: { readonly name: string; readonly version: string };
     readonly durationMs: number;
     readonly status: string;
@@ -155,7 +287,7 @@ export interface ConversionJobView {
     readonly extractPath: string | null;
     readonly fromFile: boolean;
   } | null;
-  readonly failure: { readonly code: string; readonly problem: string; readonly guidance: string; readonly detail: string | null } | null;
+  readonly failure: ConversionFailureView | null;
   readonly note: string;
   readonly limits: {
     readonly maxBytes: number;
@@ -186,7 +318,7 @@ interface ConversionJob {
   conversion: ConversionJobView["conversion"];
   toolCall: MineruToolCall | null;
   fromFile: boolean;
-  failure: ConversionJobView["failure"];
+  failure: ConversionFailureView | null;
   /** Set while the job is running, so shutdown can stop it. */
   abort: AbortController | null;
 }
@@ -359,7 +491,6 @@ export function createConversionManager(options: ConversionManagerOptions): Conv
           ? null
           : {
               tool: job.toolCall.tool,
-              command: job.toolCall.command,
               server: job.toolCall.server,
               durationMs: job.toolCall.durationMs,
               status: job.toolCall.status,
@@ -398,28 +529,30 @@ export function createConversionManager(options: ConversionManagerOptions): Conv
   }
 
   /**
-   * What a person may read about a failure.
+   * Records a failed conversion, and says as little about it as is useful.
    *
-   * The detail is the converter's own stderr and stack trace: useful for the
-   * operator, and exactly the place a credential could leak into a log line and
-   * then into a response. The token this process holds is removed, and what
-   * remains is bounded so a runaway traceback cannot become the payload.
+   * `converterSaid` is the converter's own text — its stderr and traceback,
+   * which is where a credential, a presigned URL or a fragment of the document
+   * would be. It is used for exactly one thing here, a *length* in the server's
+   * log, so an operator can tell「转换器说了很多」from「转换器什么都没说」
+   * without the log itself becoming a copy of it. Everything a client reads
+   * comes from `PUBLIC_FAILURES`, looked up by code.
+   *
+   * Diagnosis happens the way it does for any stuck conversion: the record
+   * keeps the code, the phase, the timing and the job id, and the converter can
+   * be run by hand with the same command and the same file.
    */
-  function safeDetail(detail: string | null): string | null {
-    if (detail === null) return null;
-    const token = settings.token ?? "";
-    const redacted = token.length >= 8 ? detail.split(token).join("«MINERU_API_TOKEN»") : detail;
-    return redacted.length > MAX_DETAIL_CHARS ? `${redacted.slice(0, MAX_DETAIL_CHARS)}…（已截断）` : redacted;
-  }
-
-  function fail(job: ConversionJob, code: string, message: string, guidance: string, detail: string | null): void {
+  function fail(job: ConversionJob, code: string, converterSaid: string | null): void {
+    const published = publicFailure(code);
     job.status = "failed";
     job.finishedAt = nowIso();
-    job.failure = { code, problem: message, guidance, detail: safeDetail(detail) };
+    job.failure = { code: published.code, problem: published.problem, guidance: published.guidance };
     job.abort = null;
     cleanupAfterFailure(job);
     evictOldFailures();
-    log(`[convert] ${job.id} failed (${code}): ${message}`);
+    log(
+      `[convert] ${job.id} failed (code=${published.code}, phase=converting, elapsed=${job.startedAt === null ? 0 : Date.parse(job.finishedAt) - Date.parse(job.startedAt)}ms, converterMessage=${String(converterSaid?.length ?? 0)}chars)`,
+    );
   }
 
   /**
@@ -452,15 +585,7 @@ export function createConversionManager(options: ConversionManagerOptions): Conv
         // answering, so it is the freshest evidence the product has.
         probe = { at: Date.now(), status: readinessFromCall(failure.call) };
       }
-      fail(
-        job,
-        failure.code,
-        failure.problem,
-        controller.signal.aborted
-          ? "服务端正在关闭，这次转换被中断。重新发起即可。"
-          : "可以稍后重试；若重试仍失败，请换一份更小的文件，或先确认这台机器能访问 mineru.net。",
-        failure.detail,
-      );
+      fail(job, failure.code, failure.detail);
       return;
     }
 
@@ -490,13 +615,11 @@ export function createConversionManager(options: ConversionManagerOptions): Conv
       },
     });
     if (imported.ok !== true) {
-      fail(
-        job,
-        "import_refused",
-        imported.problems.join("；"),
-        imported.guidance,
-        `import refused: ${imported.problems.join(" | ")}`,
-      );
+      // A conversion that worked and a document the library would not take are
+      // two different stories, and the library says which one it is with a code
+      // of its own — so the published answer is a lookup, not the library's
+      // sentence copied through.
+      fail(job, imported.code === "document_too_large" ? "document_too_large" : "import_refused", imported.problems.join("；"));
       return;
     }
     job.status = "succeeded";
@@ -528,7 +651,7 @@ export function createConversionManager(options: ConversionManagerOptions): Conv
     try {
       await attempt(next);
     } catch (error) {
-      fail(next, "conversion_failed", "转换过程中服务端出现内部错误，这次转换没有完成。", "请重试；如果反复出现，请查看服务端日志。", error instanceof Error ? error.stack ?? error.message : String(error));
+      fail(next, "conversion_failed", error instanceof Error ? error.message : String(error));
     } finally {
       running = null;
     }

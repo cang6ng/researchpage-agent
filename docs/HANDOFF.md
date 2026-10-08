@@ -46,6 +46,59 @@
 - **Step 1（Research Editing Semantics）已完成**：Ask / Research / Edit 三种正式意图由应用签发 Action Grant 约束；Edit 产出待接受 Proposal；报告版本可冻结、导出只读冻结依赖包；矩阵状态不再由「有正文片段」直接升级为充分。
 - 真实 Demo 两个主题此前均通过（真实模型 + 真实 arXiv + 真实 Chrome PDF）；Step 2 后又用新版各重跑一次（见「Current Status」与「Step 2 的验证入口」）。
 
+## Step 3.7C Security Closure（Codex Release Gate MAJOR E：诊断信息泄漏）
+
+发布门禁发现一个 MAJOR：**MinerU 转换器的原始错误信息会进入公开的 HTTP 响应**。已用真实 HTTP + 脚本化 MCP 服务复现（A–G 七个场景全部泄漏，另有两条额外通道），并按「公开错误采用 allowlist」的原则修掉。没有重写适配器、没有改 `parse_documents` 调用、没有动任务状态机、文档库、Intent 或 Claim Contract、没有加前端、没有加通用 MCP Manager。
+
+### 根因（三层，不只是那一个函数）
+
+1. **过滤而非隔离**：`safeDetail()` 试图用「抹掉这个进程持有的 Token（≥8 位）再截断」来清洗，而 `failure.detail` 这个字段本身就允许承载转换器的 stderr——只要泄漏物的形状不在正则里（7 位 Token、OSS 预签名 URL 的查询串、请求 URL、文档片段、绝对路径、未知异常），它就原样到达客户端。**给一个不该存在的字段打补丁，而不是让这个字段不存在。**
+2. **同一条数据还有别的出口**：`toolCall.command` 是完整命令行（`command + args`），而 `args` 来自操作者配置（`MINERU_MCP_COMMAND`），可能带凭据；实测在成功路径上也会泄漏（把载荷作为参数传给转换器时，成功响应的 `toolCall.command` 里就有它）。
+3. **`failure.problem` 当时直接采用适配器给出的字符串**：`import_refused` 等路径把外部/库内的原文当作公开文案。分类没错，但「谁写这句话」没有边界。
+
+### 修复：内部错误与公开错误分成两个类型
+
+- **公开发布表**（`apps/research/src/server/conversions.ts` 的 `PUBLIC_FAILURES`）：按错误码给出**服务端自己写的**固定 `problem` + `guidance`，全部由本仓库的常量拼成（页数上限 20、大小上限 10 MB、文档库上限 512 KB 都是我们自己的常量）。`ConversionFailureView = { code, problem, guidance }`——**没有 detail 字段，也没有任何「截断后的原文」字段**。
+- **查表而不是过滤**：`publicFailure(code)` 只做一次 `??` 兜底，未知 code 一律落到 `conversion_failed` 的通用句子。这是「构造上安全」而不是「匹配上安全」：转换器的文字在这条路径上没有地方可去。
+- **保留分类与重试语义**：`flash_page_limit` / `flash_rate_limited` / `network_unavailable` / `conversion_timeout` / `provider_auth` / `markdown_empty` / `output_outside_workdir` / `document_too_large` … 仍是各自不同的答案，`retryable` 仍由任务状态决定（成功/失败、尝试次数、源文件是否还在），没有改动状态机。
+- **`toolCall.command` 不再公开**：客户端能读到工具名、服务端名/版本、耗时、结果字数、是否从文件读取、`extractPath`；命令行是操作者配置，不进响应。
+- **内部日志只留安全坐标**：失败时记录 `code` / 阶段 / 耗时 / **转换器信息长度**（`converterMessage=…chars`），不记录原文；排队与成功两行本来就是自己的话。需要原始 stderr 时按 `docs/MINERU_WINDOWS.md` 手动用同一命令复现。
+- **`import_refused` 的来源**：文档库拒绝保存时的具体原因用库自己的 `code` 映射到本表（例如 `document_too_large` 有自己的句子），其余归入通用 `import_refused` 文案——不再把库的句子直接透传到这个 DTO 里。
+
+### 出口审查（逐个看过，不是只改一个函数）
+
+| 出口 | 结论 |
+| --- | --- |
+| `GET /api/research/documents/convert/:jobId` | `failure` = `{code, problem, guidance}`；`toolCall` 不再有 `command`/`arguments`/`stderrTail`；`conversion`/`document`/`limits` 全是我们自己的字段 |
+| `POST /api/research/documents/convert` | 202 返回同一个 job 视图；400/403/413/415/429 的文案全部是本文件的固定句子（含同意、格式、字节、作用域） |
+| `POST .../retry` | 同一个 job 视图；拒绝是固定句子（`job_not_retryable` / `file_gone` / 跨会话） |
+| `GET /api/research/mineru` | 只有 `ok / mineru{transport, command, package, mode, server, tools, parseDocuments, durationMs} / limits / problem`；`problem` 是适配器的固定句子，`MineruStatus.detail` **不序列化**。`command` 只是 `uvx` 可执行文件路径（**不含参数**，参数才可能带凭据），保留以便操作者判断「装在哪」；`server.name/version` 是 MCP 服务自报身份 |
+| Conversion Job 列表 | 不存在列表路由（只有按 jobId 查询） |
+| 其它 Activity / Error / Debug | `routes.ts` / `presentation.ts` 里 grep `detail`/`stderr`/`stack` 均为 0 命中；文档记录里的 `conversion` 只有 provider/version/原文件名/原格式/状态/时间/`sourceRef`（`mineru-open-mcp parse_documents job=<id>`） |
+
+### 敏感信息反例（`apps/research/tests/conversion-leak.test.ts`，10 例）
+
+**先在未打补丁的源码上跑过，全部失败**（A–G 七个场景 + 成功路径 + 握手路径各泄漏一次），补丁后全部通过。脚本化 MCP 把载荷同时写进**工具自己的 error 字段**与**stderr**（真实失败就是这两条通道），然后走真实 HTTP 断言最终 JSON：
+
+| 场景 | 载荷 | 修复前 | 修复后 |
+| --- | --- | --- | --- |
+| A 短凭据 | `sk-7char`（7 位，旧的正则完全不管） | 泄漏 | 无泄漏，`conversion_failed` |
+| B 长凭据 | 40 位 `sk-live-…` | 泄漏 | 无泄漏，`conversion_failed` |
+| C 预签名 URL | 完整 OSS URL 含 `Expires`/`OSSAccessKeyId`/`Signature` | 泄漏 | 无泄漏（`mineru.oss-`、`Signature=`、`Expires=` 均不出现） |
+| D HTTP SDK 多行 stderr + 请求 URL | `httpx.HTTPStatusError … api_key=SECRETREQUESTKEY` 等 4 行 | 泄漏 | 无泄漏，分类仍是 `provider_auth`（它确实是 401） |
+| E 用户文档片段 | 「内部机密：这段结论只存在于用户上传的文档里…」 | 泄漏 | 无泄漏 |
+| F 本机绝对路径 | `C:\Users\Administrator\Documents\私有资料\…pdf` | 泄漏 | 无泄漏 |
+| G 未知异常 | `KeyError: 'markdown_url'` + 未知 `status` | 泄漏 | 无泄漏，`conversion_failed`（不猜原因） |
+| 成功路径 | 转换成功但在 stderr 里记了预签名 URL（真实服务 INFO 就会这样） | 泄漏（经 `toolCall.command`） | 无泄漏 |
+| 握手失败 | 服务在回答前把长凭据写进 stderr 并退出 | 泄漏 | `/mineru` 与任务视图都无泄漏，`mcp_handshake_failed` |
+| 字段形状 | — | `failure` 带 `detail` | `failure` 的键**恰好**是 `code/guidance/problem`，整个 job JSON 不含 `"detail"`/`stderr`/`stack` |
+
+每个场景同时断言：不出现任何载荷原文、不出现签名 URL、错误 code 正确、`retryable` 仍为 `true`、`problem` 是一句合理的中文安全说明。**没有调用真实 MinerU**（全部走脚本化 MCP，不消耗 Flash 额度）。
+
+### 回归
+
+`conversion-api.test.ts`（25 例，三处旧断言按新文案收紧）、`conversion-leak.test.ts`（10 例）、`document-api.test.ts`（10 例，含「整轮研究不调用转换器」与场景 E）、`document-isolation.test.ts`（12 例）、`documents.test.ts` + `documents-repair.test.ts` = **100 例通过**；`pnpm typecheck`、`pnpm build:research` 通过；全量套件 **174 文件 / 2080 例通过**（24 skip）。真实 MinerU 验收（PDF / DOCX / 扫描件 OCR / 页数上限 / 来源与快照）在修复后重跑，全部通过。
+
 ## Step 3.7C 新增（本次工作产物）
 
 本轮只做一件事：**把官方的 MinerU MCP 真正接进产品**——PDF / DOCX → `mineru-open-mcp`（stdio）→ Markdown → 既有文档库。没有改 Agent Core / Host / Protocol / Client，没有改 3.7A 的 Fallback、3.7B 的 Intent Discovery 与 provenance / Claim Contract，没有动 Report Renderer 与任何界面（前端按钮属于 3.7D）。

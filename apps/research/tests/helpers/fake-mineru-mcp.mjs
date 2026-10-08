@@ -30,6 +30,13 @@
  * - `flaky`              — fails with a page-limit error until the file named by
  *                          `--recover-file` exists, then succeeds
  *
+ * `--leak=A…G` makes the failure carry a payload that must never reach a client
+ * (a short credential, a long one, a presigned URL, a multi-line HTTP traceback,
+ * a fragment of the user's document, an absolute Windows path, an unknown
+ * exception); `--leak-stderr=<payload>` logs a payload on an otherwise
+ * successful call; `--fail-handshake=<payload>` writes one to stderr and dies
+ * before answering. `--marker=<path>` appends one line per tool call.
+ *
  * `--markdown` overrides the Markdown it returns, so a test can put a known
  * string (or a known number of characters) into the library. Every successful
  * answer also carries a trailing comment naming the file it was handed and the
@@ -63,6 +70,58 @@ const recoverFile = option("recover-file", "");
  * observable from a server's answers, only from a server that was never asked.
  */
 const marker = option("marker", "");
+
+/**
+ * What the server writes into its failure, when a test asks it to leak.
+ *
+ * `--leak=<key>` puts that payload in the entry's error *and* on stderr, which
+ * are the two channels a converter's diagnostics really travel on. The real
+ * server does both: it names a reason in the entry and prints stack traces,
+ * HTTP request lines and presigned OSS URLs on stderr. A test uses these to
+ * check what a *client* can read, not what the server said.
+ */
+const LEAKS = {
+  // A. a short credential — seven characters, the length the token redaction
+  //    used to ignore entirely.
+  A: "sk-7char",
+  // B. a long credential.
+  B: "sk-live-9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+  // C. a complete presigned object-storage URL, query string included.
+  C: "https://mineru.oss-cn-shanghai.aliyuncs.com/api-upload/extract/2026-10-08/agent/8f3a.pdf?Expires=1791551834&OSSAccessKeyId=LTAI5t8fSGMgiRhQn4mpp926&Signature=sEcReTsIgNaTuRe%2BQ%3D",
+  // D. a multi-line HTTP SDK traceback with a request URL carrying a key.
+  D: [
+    "httpx.HTTPStatusError: Client error '401 Unauthorized' for url 'https://api.mineru.example/v1/parse?api_key=SECRETREQUESTKEY'",
+    "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/401",
+    '  File "httpx\\_client.py", line 914, in send',
+    "    response = self._send_handling_auth(request)",
+  ].join("\n"),
+  // E. a fragment of the user's own document, quoted back inside an error.
+  E: "内部机密：这段结论只存在于用户上传的文档里，比如「上下文翻倍时成本涨了三倍」。",
+  // F. an absolute path on this machine.
+  F: "C:\\Users\\Administrator\\Documents\\私有资料\\尚未公开的论文.pdf",
+  // G. an exception nobody has seen before: no rule matches it.
+  G: "KeyError: 'markdown_url' —— 一个从未见过的异常类型",
+};
+const leak = option("leak", "");
+const leakPayload = leak === "" ? "" : (LEAKS[leak] ?? "");
+
+/**
+ * A payload the server logs on an otherwise *successful* call.
+ *
+ * This is not hypothetical: the real server logs its own HTTP traffic at INFO,
+ * so a presigned URL goes past on the way to a perfectly good result.
+ */
+const leakStderr = option("leak-stderr", "");
+
+/**
+ * A payload written to stderr right before the server dies without answering,
+ * so the failure happens during the handshake rather than during a call.
+ */
+const failHandshake = option("fail-handshake", "");
+if (failHandshake !== "") {
+  process.stderr.write(`${failHandshake}\n`);
+  process.exit(4);
+}
 
 const DEFAULT_MARKDOWN = [
   "# 转换得到的 Markdown",
@@ -119,6 +178,21 @@ function answer(args) {
     // reason is in the entry, and nothing about it is on stderr.
     return errorAnswer(name, "file page count exceeds API limit (20 pages), please input page_range to specify the page range");
   }
+  if (leakPayload !== "") {
+    // Both channels at once, the way a real failure arrives: the entry names a
+    // reason, and the server's own log carries the traceback and the URLs.
+    process.stderr.write(`mineru - ERROR - Processing failed for ${name}: ${leakPayload}\n`);
+    process.stderr.write(`mineru.exceptions.UnknownError: ${leakPayload}\n`);
+    if (leak === "G") {
+      return {
+        status: "error",
+        results: [{ filename: name, status: "melted", error: leakPayload }],
+        summary: { total_files: 1, success_count: 0, error_count: 1 },
+      };
+    }
+    return errorAnswer(name, leakPayload);
+  }
+  if (leakStderr !== "") process.stderr.write(`mineru - INFO - HTTP Request: PUT ${leakStderr} "HTTP/1.1 200 OK"\n`);
   if (mode === "opaque") {
     // The same shape with nothing to classify: the adapter must report an
     // unknown refusal rather than invent a cause for it.
