@@ -34,6 +34,8 @@ import type {
 import type { Proposal } from "./proposal.js";
 import type { FrozenRevision } from "./revision.js";
 import type { GuideQuestion } from "./brief.js";
+import type { IntentDraft } from "./intent.js";
+import type { StoredDocument } from "./documents.js";
 
 export function newId(prefix: string): string {
   return `${prefix}_${randomBytes(8).toString("hex")}`;
@@ -106,6 +108,37 @@ export interface ResearchRepository {
    */
   appendActivity(event: ResearchActivityEvent): void;
   listActivity(taskId: string, limit?: number): readonly ResearchActivityEvent[];
+
+  /**
+   * One intent exploration per session: the conversation that precedes a task.
+   *
+   * It is stored under the session rather than under a task because it exists
+   * *before* any task does — and because a conversation about what to research
+   * must survive a page reload just as a research task does.
+   */
+  saveIntent(intent: IntentDraft): void;
+  getIntent(intentId: string): IntentDraft | undefined;
+  intentForSession(sessionId: string): IntentDraft | undefined;
+  /** Removes an exploration that never got past its own first request. */
+  deleteIntent(intentId: string): void;
+
+  /**
+   * The document library: what the user handed the product, and when.
+   *
+   * Documents are keyed by session and may be attached to a task later. Their
+   * text lives in its own column for the same reason a read snapshot's does: it
+   * is the large part, and every excerpt taken from it is checked against it.
+   */
+  addDocument(document: StoredDocument): void;
+  getDocument(documentId: string): StoredDocument | undefined;
+  listDocumentsBySession(sessionId: string): readonly StoredDocument[];
+  listDocumentsForTask(taskId: string): readonly StoredDocument[];
+  /** The documents whose ids are listed, in the order asked for. */
+  listDocumentsByIds(documentIds: readonly string[]): readonly StoredDocument[];
+  /** A document with the same bytes already in this session, if there is one. */
+  findDocumentByHash(sessionId: string, contentHash: string): StoredDocument | undefined;
+  updateDocument(document: StoredDocument): void;
+  deleteDocument(documentId: string): void;
 
   /**
    * Runs several writes as one unit.
@@ -213,6 +246,26 @@ CREATE TABLE IF NOT EXISTS research_activity (
   at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS research_activity_task ON research_activity (task_id, at);
+CREATE TABLE IF NOT EXISTS research_intents (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS research_intents_session ON research_intents (session_id);
+CREATE TABLE IF NOT EXISTS research_documents (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  task_id TEXT,
+  content_hash TEXT NOT NULL,
+  markdown TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS research_documents_session ON research_documents (session_id);
+CREATE INDEX IF NOT EXISTS research_documents_task ON research_documents (task_id);
+CREATE INDEX IF NOT EXISTS research_documents_hash ON research_documents (session_id, content_hash);
 `;
 
 export function openResearchRepository(options: { readonly location: string }): ResearchRepository {
@@ -231,6 +284,14 @@ export function openResearchRepository(options: { readonly location: string }): 
       | { payload: string }
       | undefined;
     return row === undefined ? undefined : readJson<ReportTask>(row.payload);
+  }
+
+  function documentByKey(documentId: string): StoredDocument | undefined {
+    const row = database.prepare("SELECT markdown, payload FROM research_documents WHERE id = ?").get(documentId) as
+      | { markdown: string; payload: string }
+      | undefined;
+    if (row === undefined) return undefined;
+    return { ...readJson<Omit<StoredDocument, "markdown">>(row.payload), markdown: row.markdown };
   }
 
   return {
@@ -461,6 +522,84 @@ export function openResearchRepository(options: { readonly location: string }): 
         .prepare("SELECT payload FROM research_activity WHERE task_id = ? ORDER BY at DESC, rowid DESC LIMIT ?")
         .all(taskId, Math.max(1, Math.trunc(limit))) as { payload: string }[];
       return rows.map((row) => readJson<ResearchActivityEvent>(row.payload)).reverse();
+    },
+
+    saveIntent(intent: IntentDraft): void {
+      database
+        .prepare(
+          "INSERT INTO research_intents (id, session_id, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)" +
+            " ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+        )
+        .run(intent.id, intent.sessionId, JSON.stringify(intent), intent.createdAt, intent.updatedAt);
+    },
+    getIntent(intentId: string): IntentDraft | undefined {
+      const row = database.prepare("SELECT payload FROM research_intents WHERE id = ?").get(intentId) as
+        | { payload: string }
+        | undefined;
+      return row === undefined ? undefined : readJson<IntentDraft>(row.payload);
+    },
+    intentForSession(sessionId: string): IntentDraft | undefined {
+      const row = database
+        .prepare("SELECT payload FROM research_intents WHERE session_id = ? ORDER BY created_at DESC LIMIT 1")
+        .get(sessionId) as { payload: string } | undefined;
+      return row === undefined ? undefined : readJson<IntentDraft>(row.payload);
+    },
+    deleteIntent(intentId: string): void {
+      database.prepare("DELETE FROM research_intents WHERE id = ?").run(intentId);
+    },
+
+    addDocument(document: StoredDocument): void {
+      const { markdown, ...rest } = document;
+      database
+        .prepare(
+          "INSERT INTO research_documents (id, session_id, task_id, content_hash, markdown, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          document.id,
+          document.sessionId,
+          document.taskId,
+          document.contentHash,
+          markdown,
+          JSON.stringify(rest),
+          document.createdAt,
+        );
+    },
+    getDocument: documentByKey,
+    listDocumentsBySession(sessionId: string): readonly StoredDocument[] {
+      const rows = database
+        .prepare("SELECT markdown, payload FROM research_documents WHERE session_id = ? ORDER BY created_at ASC, rowid ASC")
+        .all(sessionId) as { markdown: string; payload: string }[];
+      return rows.map((row) => ({ ...readJson<Omit<StoredDocument, "markdown">>(row.payload), markdown: row.markdown }));
+    },
+    listDocumentsForTask(taskId: string): readonly StoredDocument[] {
+      const rows = database
+        .prepare("SELECT markdown, payload FROM research_documents WHERE task_id = ? ORDER BY created_at ASC, rowid ASC")
+        .all(taskId) as { markdown: string; payload: string }[];
+      return rows.map((row) => ({ ...readJson<Omit<StoredDocument, "markdown">>(row.payload), markdown: row.markdown }));
+    },
+    listDocumentsByIds(documentIds: readonly string[]): readonly StoredDocument[] {
+      const documents: StoredDocument[] = [];
+      for (const documentId of documentIds) {
+        const document = documentByKey(documentId);
+        if (document !== undefined) documents.push(document);
+      }
+      return documents;
+    },
+    findDocumentByHash(sessionId: string, contentHash: string): StoredDocument | undefined {
+      const row = database
+        .prepare("SELECT markdown, payload FROM research_documents WHERE session_id = ? AND content_hash = ? ORDER BY rowid ASC LIMIT 1")
+        .get(sessionId, contentHash) as { markdown: string; payload: string } | undefined;
+      if (row === undefined) return undefined;
+      return { ...readJson<Omit<StoredDocument, "markdown">>(row.payload), markdown: row.markdown };
+    },
+    updateDocument(document: StoredDocument): void {
+      const { markdown, ...rest } = document;
+      database
+        .prepare("UPDATE research_documents SET task_id = ?, markdown = ?, payload = ? WHERE id = ?")
+        .run(document.taskId, markdown, JSON.stringify(rest), document.id);
+    },
+    deleteDocument(documentId: string): void {
+      database.prepare("DELETE FROM research_documents WHERE id = ?").run(documentId);
     },
 
     transact<T>(work: () => T): T {

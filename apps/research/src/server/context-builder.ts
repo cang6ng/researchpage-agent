@@ -19,6 +19,33 @@ export interface ResearchContextBuilderOptions {
   readonly systemPrompt?: string;
 }
 
+/**
+ * What a session without a task is told about itself.
+ *
+ * A session that has an exploration in progress is *not* one that has nothing:
+ * it is one where the user has asked for something and not yet confirmed it,
+ * and the model has to know that before it decides what to do with the tool it
+ * was given. `undefined` from `researchTaskBrief` means no task exists yet —
+ * which is exactly the state the intent conversation runs in.
+ */
+function noTaskBrief(service: ResearchService, sessionId: string): string {
+  const intent = service.intentForSession(sessionId);
+  if (intent === undefined) {
+    return "本会话还没有研究任务：如果用户给出主题，先与用户确认研究方向（Intent Discovery），而不是直接替用户确定题目。";
+  }
+  const openFields = intent.openFields.length === 0 ? "（无）" : intent.openFields.join("、");
+  return [
+    "【当前意图探索】本会话还没有研究任务，正处于「与用户确认研究方向」阶段：",
+    `- 用户最初的输入：${intent.seedTopic}`,
+    `- 状态：${intent.statusLabel}；已记录 ${intent.userMessages.length} 条用户消息、${intent.assistantQuestions.length} 个助手问题`,
+    `- 已提出的研究方向：${intent.proposalSummary === null ? "（尚未提出）" : intent.proposal?.topic ?? ""}`,
+    `- 用户已确认的方向：${intent.confirmedDirection === null ? "（尚未确认）" : intent.confirmedDirection.topic}`,
+    `- 这份方向尚未确定的简报字段：${openFields}`,
+    `- 文档：${intent.documents.length === 0 ? "（无）" : intent.documents.map((document) => document.originalFilename).join("、")}`,
+    "本阶段你只能提问（ask_intent_question）或提出研究方向（propose_research_direction）；确认只能由用户在界面上完成。",
+  ].join("\n");
+}
+
 export function createResearchContextBuilder(options: ResearchContextBuilderOptions): ContextBuilder {
   const basePrompt =
     options.systemPrompt === undefined || options.systemPrompt.trim() === ""
@@ -27,9 +54,7 @@ export function createResearchContextBuilder(options: ResearchContextBuilderOpti
 
   const promptFor = (sessionId: string): string => {
     const brief = researchTaskBrief(options.service, sessionId);
-    return brief === undefined
-      ? `${basePrompt}\n\n【当前研究任务】本会话还没有研究任务：如果用户给出主题，先调用 propose_task 建立任务卡。`
-      : `${basePrompt}\n\n${brief}`;
+    return brief === undefined ? `${basePrompt}\n\n${noTaskBrief(options.service, sessionId)}` : `${basePrompt}\n\n${brief}`;
   };
 
   return {

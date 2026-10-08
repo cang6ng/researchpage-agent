@@ -8,6 +8,12 @@
  * evidence ids, and every id is resolved through the caller's lookup first.
  */
 
+// Both are type-only imports: the direction a task was created from, and where
+// a user's document came from. The runtime dependency runs the other way, so
+// nothing here creates a module cycle.
+import type { ResearchDirection } from "./intent.js";
+import type { DocumentOrigin } from "./documents.js";
+
 /** What a task is doing right now. Completion is never a self-reported label. */
 export type TaskStatus = "draft" | "confirmed" | "researching" | "ready" | "failed";
 
@@ -336,6 +342,50 @@ export interface ReportTask {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly error: string | null;
+  /**
+   * The research direction the user confirmed, once they confirmed one.
+   *
+   * It is written when the card is created from a confirmed intent, and it is
+   * what makes「用户确认过研究方向」a checkable fact about this task rather than a
+   * memory of a conversation: the topic and purpose in the brief come from here,
+   * and a later proposal may not silently replace them. Absent on tasks created
+   * before Intent Discovery existed, and on tasks created through the
+   * compatibility entry that never had an intent to confirm.
+   */
+  readonly intent?: TaskIntentLink | null;
+}
+
+/**
+ * The confirmed direction a task was created from, kept with the task.
+ *
+ * `seedTopic` is what the user typed first and is kept verbatim: it is the one
+ * string in this feature that is unambiguously the user's own, and a report
+ * whose topic drifted away from it should be readable against it.
+ */
+export interface TaskIntentLink {
+  readonly intentId: string;
+  readonly seedTopic: string;
+  readonly direction: ResearchDirection;
+  readonly confirmedAt: string;
+}
+
+/**
+ * The document a source was made from, when it was a user's own file.
+ *
+ * A source created from a document is not pretending to be a publication: it
+ * carries the file it came from, whether that file was uploaded as Markdown or
+ * converted by a tool, and the page mapping when the converter supplied one.
+ * `pageMap: null` means no page is known — and the product then answers `null`
+ * for every page lookup rather than inventing a number.
+ */
+export interface SourceDocumentRef {
+  readonly documentId: string;
+  readonly filename: string;
+  readonly origin: DocumentOrigin;
+  readonly conversionProvider: string | null;
+  readonly originalFilename: string | null;
+  readonly originalFormat: string | null;
+  readonly pageMap: readonly { readonly page: number; readonly charStart: number; readonly charEnd: number }[] | null;
 }
 
 /** Why the working report may no longer reflect the material behind it. */
@@ -401,6 +451,15 @@ export interface Source {
   readonly retrievalNote: string;
   readonly failure: string | null;
   readonly snapshotId: string | null;
+  /**
+   * The user's own file this source was made from, when there is one.
+   *
+   * It is the one difference between material a user supplied and material
+   * discovery found: everything after it — the snapshot, the excerpt check, the
+   * support assessment, the claim contract — is the same path. It is also how
+   * `Original File → Converter → Markdown → Snapshot` stays traceable.
+   */
+  readonly document?: SourceDocumentRef | null;
 }
 
 export interface Paragraph {
@@ -698,10 +757,12 @@ export interface ExportArtifact {
  * actions, which write nothing to the report. The stage is also what the
  * workspace shows the user, so "what is happening" is a fact about the task
  * rather than about a request. `guide` is the program's own stage for writing
- * the next guided question about the brief. `followup` only survives as the
- * value old records carry.
+ * the next guided question about the brief. `intent` is the stage that runs
+ * *before* a task exists at all: it turns a seed topic into a research
+ * direction the user then confirms. `followup` only survives as the value old
+ * records carry.
  */
-export type ResearchStage = "card" | "guide" | "research" | "gap" | "report" | "synthesis" | "ask" | "edit" | "followup";
+export type ResearchStage = "intent" | "card" | "guide" | "research" | "gap" | "report" | "synthesis" | "ask" | "edit" | "followup";
 
 /**
  * What one user action added, measured against the project it started in.
@@ -1073,4 +1134,8 @@ export const ID_PREFIX = Object.freeze({
   assessment: "asm",
   guide: "gq",
   activity: "actv",
+  intent: "itn",
+  turn: "trn",
+  decision: "dec",
+  document: "doc",
 } as const);

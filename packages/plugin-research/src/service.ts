@@ -20,6 +20,7 @@ import type {
   CoverageAssessment,
   CoverageEvidence,
   ClaimType,
+  Dimension,
   DiscoveryTelemetry,
   EditActionOutcome,
   ReportDraftState,
@@ -42,6 +43,7 @@ import type {
   RunOutcome,
   Source,
   SourceRole,
+  Subject,
   SupportAssessment,
   AssessmentDirectness,
   AssessmentRelationship,
@@ -64,6 +66,47 @@ import {
   type ProposalTarget,
 } from "./proposal.js";
 import { readSource, type ReadOutcome, type ReadRequest } from "./read.js";
+import {
+  documentPreview,
+  documentSummaryLine,
+  documentViewOf as documentViewOfStored,
+  markdownNameFor,
+  MAX_DOCUMENTS_PER_SESSION,
+  MAX_DOCUMENT_BYTES,
+  MAX_DOCUMENT_PREVIEW_CHARS,
+  parseDocument,
+  readDocument as readDocumentText,
+  readDocumentContent,
+  readDocumentFilename,
+  UNTRUSTED_DOCUMENT_NOTE,
+  type DocumentConversion,
+  type DocumentOrigin,
+  type DocumentReadRequest,
+  type DocumentReadResult,
+  type DocumentUsage,
+  type DocumentView,
+  type StoredDocument,
+} from "./documents.js";
+import {
+  asksForDirection,
+  confirmedBriefFacts,
+  createIntentDraft,
+  DIRECTION_CONFIRM_QUESTION,
+  fieldsLeftOpen,
+  intentViewOf,
+  lastUserMessage,
+  MAX_INTENT_DECISIONS,
+  MAX_INTENT_TURNS,
+  readDirection,
+  readIntentMessage,
+  readIntentQuestion,
+  type ConfirmedBriefFacts,
+  type IntentDecision,
+  type IntentDraft,
+  type IntentTurn,
+  type IntentView,
+  type ResearchDirection,
+} from "./intent.js";
 import { newId, type ResearchRepository } from "./repository.js";
 import { createGrant, EMPTY_ACTION_USAGE, type ActionCapability, type ActionGrant, type ActionUsage, type GrantInput } from "./semantics.js";
 import { PROVIDER_NAMES, SearchError, type SearchCandidate, type SearchOutcome } from "./search.js";
@@ -93,11 +136,14 @@ import {
   guideReadinessDecisions,
   isStructural,
   lockedFieldStates,
+  MAX_BRIEF_DIMENSIONS,
+  MAX_BRIEF_SUBJECTS,
   nextGuideTarget,
   patchFromFreeText,
   readBriefPatch,
   validateBriefDraft,
   type BriefFieldName,
+  type BriefFieldState,
   type BriefFieldStates,
   type BriefPatch,
   type BriefValidation,
@@ -566,6 +612,118 @@ export interface BriefConflict {
   readonly brief: BriefView;
 }
 
+/** A refusal that hands back the intent, so a client can resync the conversation. */
+export interface IntentConflict {
+  readonly ok: false;
+  readonly stale: true;
+  readonly problems: readonly string[];
+  readonly guidance: string;
+  readonly intent: IntentView;
+}
+
+export interface IntentResult {
+  readonly ok: true;
+  readonly intent: IntentView;
+  readonly created: boolean;
+  readonly note: string;
+}
+
+/** What one turn of the conversation recorded, and what it changed. */
+export interface IntentTurnResult {
+  readonly ok: true;
+  readonly intent: IntentView;
+  readonly question: string;
+  readonly options: readonly string[];
+  readonly decisionsRecorded: number;
+  readonly note: string;
+}
+
+/** A direction the assistant proposed, or the user edited, still unconfirmed. */
+export interface IntentDirectionResult {
+  readonly ok: true;
+  readonly intent: IntentView;
+  readonly direction: ResearchDirection;
+  readonly note: string;
+}
+
+/** A message the user sent, appended to the record of the conversation. */
+export interface IntentMessageResult {
+  readonly ok: true;
+  readonly intent: IntentView;
+  readonly note: string;
+}
+
+/** The user's confirmation, and what it settles for the brief. */
+export interface IntentConfirmResult {
+  readonly ok: true;
+  readonly intent: IntentView;
+  readonly direction: ResearchDirection;
+  readonly plan: ConfirmedBriefFacts;
+  /** The fields the confirmation leaves for guided planning to ask about. */
+  readonly openFields: readonly string[];
+  readonly note: string;
+}
+
+/** One document as a bounded context block: what a prompt may carry of it. */
+export interface DocumentContext {
+  readonly documentId: string;
+  readonly filename: string;
+  readonly title: string;
+  readonly origin: DocumentOrigin;
+  readonly conversionProvider: string | null;
+  readonly usage: readonly DocumentUsage[];
+  readonly chars: number;
+  readonly previewChars: number;
+  /** True only when the preview really is the whole document. */
+  readonly complete: boolean;
+  readonly preview: string;
+  readonly outline: readonly string[];
+  /** The sentence that has to travel with this text, always. */
+  readonly note: string;
+}
+
+export interface DocumentUploadInput {
+  readonly sessionId?: string | undefined;
+  readonly intentId?: string | undefined;
+  readonly taskId?: string | undefined;
+  readonly filename: unknown;
+  readonly content: { readonly text?: string | undefined; readonly bytes?: Uint8Array | undefined };
+  readonly usage?: readonly DocumentUsage[] | undefined;
+  /**
+   * A converter's own record, when this Markdown was not uploaded as Markdown.
+   *
+   * It is the whole of the 3.7C contract on this side: a provider name, the
+   * file it was given, its format, whether the conversion was complete, when it
+   * ran, and the page map *when there is one*. A conversion that carries no map
+   * is stored as one, and every page lookup then answers `null` rather than
+   * inventing a page number.
+   */
+  readonly conversion?:
+    | {
+        readonly provider: unknown;
+        readonly version?: unknown;
+        readonly originalFilename?: unknown;
+        readonly originalFormat?: unknown;
+        readonly status?: unknown;
+        readonly pageMap?: unknown;
+        readonly sourceRef?: unknown;
+        readonly convertedAt?: unknown;
+      }
+    | undefined;
+}
+
+/** A bounded document read that succeeded, told apart from a refusal by `ok`. */
+export type DocumentReadOutcome = (DocumentReadResult & { readonly ok: true }) | Refusal;
+
+export interface DocumentUploadResult {
+  readonly ok: true;
+  readonly document: DocumentView;
+  readonly duplicate: boolean;
+  readonly sessionId: string;
+  readonly taskId: string | null;
+  readonly note: string;
+}
+
 export interface ResearchService {
   /** The task a session is trusted to: the only way a tool finds its target. */
   taskForSession(sessionId: string): ReportTask | undefined;
@@ -579,6 +737,96 @@ export interface ResearchService {
    * still incomplete is refused here rather than silently researched.
    */
   confirmTask(taskId: string, input?: { readonly expectedVersion?: number }): ConfirmResult | Refusal;
+
+  // ------------------------------------------------------- intent discovery --
+  /**
+   * Starts (or reopens) the exploration that precedes a research task.
+   *
+   * The session is the binding: everything the exploration does afterwards is
+   * found through it, so a model that invents an intent id reaches nothing. The
+   * documents are saved *before* the caller starts the first stage, which is
+   * what keeps the first question from being written about a file that is not
+   * in the library yet.
+   */
+  createIntent(
+    sessionId: string,
+    input: { readonly seedTopic: unknown; readonly documents?: readonly Omit<DocumentUploadInput, "sessionId" | "intentId">[] },
+  ): IntentResult | Refusal;
+  intentViewOf(intentId: string): IntentView | undefined;
+  intentForSession(sessionId: string): IntentView | undefined;
+  /**
+   * Stores the question a conversation stage wrote, and what it understood.
+   *
+   * The tool-facing half of the conversation: the model may ask and may record
+   * its reading of the answers, and neither of those is a decision. A proposal
+   * that was on the table is retired by a new question, because the user asked
+   * to keep talking about it.
+   */
+  recordIntentQuestion(sessionId: string, input: unknown): IntentTurnResult | Refusal;
+  /**
+   * Stores a proposed research direction, still awaiting confirmation.
+   *
+   * There is deliberately no tool that confirms: this writes `proposal`, and
+   * only `confirmIntentDirection` — which an application route calls on the
+   * user's behalf — can move it to `confirmedDirection`.
+   */
+  proposeIntentDirection(sessionId: string, input: unknown): IntentDirectionResult | Refusal;
+  /** Appends one user message; the caller then runs the next stage. */
+  submitIntentMessage(
+    intentId: string,
+    input: { readonly text: unknown; readonly documentIds?: readonly string[]; readonly expectedVersion?: number },
+  ): IntentMessageResult | Refusal | IntentConflict;
+  /** The user's own edit of the direction on the table. */
+  editIntentDirection(
+    intentId: string,
+    input: { readonly patch: unknown; readonly expectedVersion?: number },
+  ): IntentDirectionResult | Refusal | IntentConflict;
+  /**
+   * The user confirms the direction — the only way `confirmedDirection` is set.
+   *
+   * A confirmation with no direction to confirm is refused: the product asks
+   * 「我理解你的研究方向是……」about something it has actually proposed, and a
+   * user cannot confirm a direction that does not exist yet.
+   */
+  confirmIntentDirection(
+    intentId: string,
+    input?: { readonly expectedVersion?: number; readonly direction?: unknown },
+  ): IntentConfirmResult | Refusal | IntentConflict;
+  /** Records the task a confirmed intent produced, once the card exists. */
+  bindIntentToTask(intentId: string, taskId: string): IntentView;
+
+  // ------------------------------------------------------------- documents --
+  /** Saves one Markdown document into the library; duplicates are found here. */
+  uploadDocument(input: DocumentUploadInput): DocumentUploadResult | Refusal;
+  documentViewOf(documentId: string): DocumentView | undefined;
+  documentTextOf(documentId: string): StoredDocument | undefined;
+  documentsOf(scope: { readonly sessionId?: string; readonly taskId?: string; readonly documentIds?: readonly string[] }): readonly DocumentView[];
+  /**
+   * The bounded context of documents, for a prompt or a panel.
+   *
+   * It is the only way document text reaches a model: an outline, a truncated
+   * preview and an honest count of what was left out, wrapped in the sentence
+   * that says the text is data. Never the whole file, and never as an
+   * instruction.
+   */
+  documentContextOf(scope: { readonly sessionId?: string; readonly taskId?: string; readonly documentIds?: readonly string[] }, maxChars?: number): readonly DocumentContext[];
+  /** A bounded, located read of one document — the agent's way into the full text. */
+  readDocument(input: { readonly sessionId: string; readonly documentId: string; readonly request: DocumentReadRequest }): DocumentReadOutcome;
+  /** Removes a document from the library; saved reads and evidence stay. */
+  deleteDocument(documentId: string, input?: { readonly sessionId?: string }): { readonly ok: true; readonly documentId: string; readonly note: string } | Refusal;
+  /** Declares what a document is for: understanding intent, material, or both. */
+  setDocumentUsage(documentId: string, usage: unknown): DocumentUploadResult | Refusal;
+  /** Attaches a document to the task it belongs to. */
+  linkDocumentToTask(documentId: string, taskId: string, input?: { readonly sessionId?: string }): DocumentUploadResult | Refusal;
+  /**
+   * Turns a document the user marked as material into a real research source.
+   *
+   * The source is an ordinary source from here on: `user-provided` is its role,
+   * its snapshot is the document's own text, and its evidence still has to pass
+   * the same excerpt check and the same support assessment as anything found on
+   * the network. Nothing about it is allowed to look like a publication.
+   */
+  promoteDocumentToSource(documentId: string, input: { readonly taskId: string; readonly sessionId?: string }): { readonly ok: true; readonly source: Source; readonly created: boolean; readonly note: string } | Refusal;
 
   // ------------------------------------------------------------------ brief --
   /** The Research Brief: the editable draft, or the frozen record once confirmed. */
@@ -1215,6 +1463,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
     research: "检索、读取与保存证据",
     report: "保存报告版本",
     proposal: "生成修改提案",
+    intent: "记录意图探索的对话与研究方向提案",
   });
 
   /**
@@ -1860,12 +2109,548 @@ export function createResearchService(options: ResearchServiceOptions): Research
     return { ok: true, complete: false, leadIn, question, whyThisMatters, fieldTargets, options };
   }
 
+  // ------------------------------------------------------- intent discovery --
+
+  function requireIntent(intentId: string): IntentDraft {
+    const intent = repo.getIntent(intentId);
+    if (intent === undefined) throw new Error(`没有找到意图探索：${intentId}`);
+    return intent;
+  }
+
+  function saveIntent(intent: IntentDraft): IntentDraft {
+    const next: IntentDraft = { ...intent, updatedAt: isoNow() };
+    repo.saveIntent(next);
+    return next;
+  }
+
+  function intentDocumentsOf(intent: IntentDraft): readonly StoredDocument[] {
+    return repo.listDocumentsByIds(intent.documentIds);
+  }
+
+  function viewOfIntent(intent: IntentDraft): IntentView {
+    return intentViewOf(intent, intentDocumentsOf(intent).map(documentViewOfStored));
+  }
+
+  /**
+   * Refuses a write written against a conversation that has moved on.
+   *
+   * A turn and a confirmation are both statements about a specific state of the
+   * record: answering a question that has been replaced, or confirming a
+   * direction that has been rewritten since it was read, has to be refused
+   * rather than applied, or the user's decision lands on text they never saw.
+   */
+  function intentVersionConflict(intent: IntentDraft, expected: number | undefined): IntentConflict | undefined {
+    if (expected === undefined || expected === intent.version) return undefined;
+    return {
+      ok: false,
+      stale: true,
+      problems: [`这段意图对话已经更新到版本 ${intent.version}，不是 ${expected}`],
+      guidance: "请重新读取意图状态后再提交，避免覆盖刚刚发生的对话。",
+      intent: viewOfIntent(intent),
+    };
+  }
+
+  const STUDIO_INTENT_TEXT = "只能提出澄清问题或提出研究方向；不能建立任务卡、不能确认方向、不能检索";
+
+  /** Appends one assistant turn, keeping the conversation bounded. */
+  function withAssistantTurn(intent: IntentDraft, turn: IntentTurn): readonly IntentTurn[] {
+    return [...intent.turns, turn].slice(-MAX_INTENT_TURNS);
+  }
+
+  // ------------------------------------------------------------- documents --
+
+  function resolveDocumentScope(input: { readonly sessionId?: string; readonly intentId?: string; readonly taskId?: string }):
+    | { readonly ok: true; readonly sessionId: string; readonly taskId: string | null; readonly intent: IntentDraft | null }
+    | Refusal {
+    let sessionId = (input.sessionId ?? "").trim();
+    let taskId: string | null = null;
+    let intent: IntentDraft | null = null;
+    const intentId = (input.intentId ?? "").trim();
+    if (intentId.length > 0) {
+      const found = repo.getIntent(intentId);
+      if (found === undefined) {
+        return { ok: false, problems: [`没有找到意图探索：${intentId}`], guidance: "请确认 intentId（它由创建意图探索的接口返回）。" };
+      }
+      if (sessionId.length > 0 && found.sessionId !== sessionId) {
+        return { ok: false, problems: ["这个意图探索不属于该会话"], guidance: "文档只能保存到它所属的会话。" };
+      }
+      intent = found;
+      sessionId = found.sessionId;
+      taskId = found.taskId;
+    }
+    const rawTaskId = (input.taskId ?? "").trim();
+    if (rawTaskId.length > 0) {
+      const task = repo.getTask(rawTaskId);
+      if (task === undefined) {
+        return { ok: false, problems: [`没有找到研究任务：${rawTaskId}`], guidance: "请确认 taskId。" };
+      }
+      if (sessionId.length > 0 && task.sessionId !== sessionId) {
+        return { ok: false, problems: ["这个研究任务不属于该会话，不能把文档关联过去"], guidance: "文档只能关联到它所属会话的研究任务。" };
+      }
+      sessionId = task.sessionId;
+      taskId = task.id;
+    }
+    if (sessionId.length === 0) {
+      return {
+        ok: false,
+        problems: ["缺少会话信息"],
+        guidance: "保存文档需要 sessionId / intentId / taskId 中的一个，文档必须绑定到可信会话，不能匿名保存。",
+      };
+    }
+    // Whichever id the caller had, the document belongs to the session's
+    // exploration when there is one: an attachment is part of the conversation
+    // that produced it, and a client that only knows the session id must not be
+    // able to leave a file unattached by accident.
+    if (intent === null) intent = repo.intentForSession(sessionId) ?? null;
+    return { ok: true, sessionId, taskId, intent };
+  }
+
+  function readDocumentUsage(value: unknown, fallback: readonly DocumentUsage[]): { readonly usage: readonly DocumentUsage[]; readonly problem: string } {
+    if (value === undefined) return { usage: fallback, problem: "" };
+    if (!Array.isArray(value)) return { usage: fallback, problem: "usage 必须是数组（intent_context / research_source）" };
+    const usage: DocumentUsage[] = [];
+    for (const entry of value) {
+      if (entry !== "intent_context" && entry !== "research_source") {
+        return { usage: fallback, problem: "usage 只允许 intent_context（帮助理解意图）与 research_source（作为研究材料）" };
+      }
+      if (!usage.includes(entry)) usage.push(entry);
+    }
+    if (usage.length === 0) return { usage: fallback, problem: "usage 不能为空：至少说明这份文档是帮助理解意图还是研究材料" };
+    return { usage, problem: "" };
+  }
+
+  /** Reads a converter's own record, keeping only what it can be held to. */
+  function readConversion(input: DocumentUploadInput["conversion"]): { readonly conversion: DocumentConversion | null; readonly problems: readonly string[] } {
+    if (input === undefined) return { conversion: null, problems: [] };
+    const provider = typeof input.provider === "string" ? input.provider.trim() : "";
+    if (provider.length === 0) return { conversion: null, problems: ["转换来源必须写清 provider（例如 mineru）"] };
+    const status = input.status === "partial" ? "partial" : input.status === "succeeded" || input.status === undefined ? "succeeded" : null;
+    if (status === null) {
+      return {
+        conversion: null,
+        problems: ["转换状态只接受 succeeded 或 partial；转换失败的文件不会进入文档库（请转换成功后重传）"],
+      };
+    }
+    const originalFilename = typeof input.originalFilename === "string" ? input.originalFilename.trim() : "";
+    const originalFormat = typeof input.originalFormat === "string" ? input.originalFormat.trim().toLowerCase() : "";
+    if (originalFilename.length === 0 || originalFormat.length === 0) {
+      return { conversion: null, problems: ["转换来源必须写明原始文件名（originalFilename）与原始格式（originalFormat）"] };
+    }
+    const pageMap: { page: number; charStart: number; charEnd: number }[] = [];
+    if (Array.isArray(input.pageMap)) {
+      for (const entry of input.pageMap) {
+        if (typeof entry !== "object" || entry === null) continue;
+        const record = entry as Record<string, unknown>;
+        const page = typeof record["page"] === "number" && Number.isInteger(record["page"]) && record["page"] > 0 ? record["page"] : null;
+        const charStart = typeof record["charStart"] === "number" && Number.isInteger(record["charStart"]) && record["charStart"] >= 0 ? record["charStart"] : null;
+        const charEnd = typeof record["charEnd"] === "number" && Number.isInteger(record["charEnd"]) && record["charEnd"] > 0 ? record["charEnd"] : null;
+        if (page === null || charStart === null || charEnd === null || charEnd <= charStart) {
+          return { conversion: null, problems: ["pageMap 的每一项必须是 { page, charStart, charEnd }，且 charEnd > charStart（没有页码映射就不要提供 pageMap）"] };
+        }
+        pageMap.push({ page, charStart, charEnd });
+      }
+    }
+    return {
+      conversion: {
+        provider,
+        version: typeof input.version === "string" && input.version.trim().length > 0 ? input.version.trim() : null,
+        originalFilename,
+        originalFormat,
+        status,
+        convertedAt: typeof input.convertedAt === "string" && input.convertedAt.trim().length > 0 ? input.convertedAt.trim() : isoNow(),
+        pageMap,
+        sourceRef: typeof input.sourceRef === "string" && input.sourceRef.trim().length > 0 ? input.sourceRef.trim() : null,
+      },
+      problems: [],
+    };
+  }
+
+  function documentUsageLine(usage: readonly DocumentUsage[]): string {
+    return usage
+      .map((entry) => (entry === "intent_context" ? "帮助理解意图" : "作为研究材料"))
+      .join("、");
+  }
+
+  function uploadDocumentImpl(input: DocumentUploadInput): DocumentUploadResult | Refusal {
+    const scope = resolveDocumentScope(input);
+    if (scope.ok !== true) return scope;
+
+    const filename = readDocumentFilename(input.filename);
+    if (!filename.ok) {
+      return {
+        ok: false,
+        problems: [filename.problem],
+        guidance: `文件名必须是纯文件名（不接受任何路径），扩展名为 ${".md / .markdown"}，且长度不超过 200 字符。`,
+      };
+    }
+    const content = readDocumentContent({ bytes: input.content.bytes, text: input.content.text });
+    if (!content.ok) {
+      return {
+        ok: false,
+        problems: content.problems,
+        guidance: `本轮只接受 UTF-8 的 Markdown 文本，单文件上限 ${MAX_DOCUMENT_BYTES} 字节；PDF / DOCX / HTML 需要先转换成 Markdown 再导入。`,
+      };
+    }
+    const conversion = readConversion(input.conversion);
+    if (conversion.problems.length > 0) {
+      return { ok: false, problems: conversion.problems, guidance: "转换来源的元信息必须完整，否则这份文档无法追踪到原始文件。" };
+    }
+    const usageReading = readDocumentUsage(input.usage, ["intent_context"]);
+    if (usageReading.problem.length > 0) {
+      return { ok: false, problems: [usageReading.problem], guidance: "用途只能是 intent_context / research_source，至少一个。" };
+    }
+
+    // The same bytes in the same session are the same document: the library
+    // answers with the one it has instead of storing a second copy the user
+    // would then have to keep in sync.
+    const existing = repo.findDocumentByHash(scope.sessionId, content.contentHash);
+    if (existing !== undefined) {
+      if (scope.intent !== null) attachToIntent(scope.intent, existing.id);
+      return {
+        ok: true,
+        document: documentViewOfStored(existing),
+        duplicate: true,
+        sessionId: scope.sessionId,
+        taskId: existing.taskId,
+        note: `这份内容与已保存的「${existing.originalFilename}」完全相同（内容 hash 一致），沿用已有文档，没有重复保存。`,
+      };
+    }
+
+    const saved = repo.listDocumentsBySession(scope.sessionId).length;
+    if (saved >= MAX_DOCUMENTS_PER_SESSION) {
+      return {
+        ok: false,
+        problems: [`这个会话已经保存了 ${saved} 份文档（上限 ${MAX_DOCUMENTS_PER_SESSION}）`],
+        guidance: "请先删除不再需要的文档，或把它们合并成一份再上传。",
+      };
+    }
+
+    const at = isoNow();
+    const parsed = parseDocument(content.markdown);
+    const converted = conversion.conversion;
+    const document: StoredDocument = {
+      id: newId(ID_PREFIX.document),
+      sessionId: scope.sessionId,
+      taskId: scope.taskId,
+      originalFilename: filename.value,
+      title: parsed.title.length > 0 ? parsed.title : filename.value.replace(/\.(markdown|md)$/i, ""),
+      sizeBytes: content.sizeBytes,
+      contentHash: content.contentHash,
+      createdAt: at,
+      updatedAt: at,
+      origin: converted === null ? "direct_upload" : "converted",
+      conversionProvider: converted === null ? null : converted.provider,
+      conversion: converted,
+      status: "ready",
+      usage: usageReading.usage,
+      outline: parsed.outline,
+      note: `${documentSummaryLine({ filename: filename.value, sizeBytes: content.sizeBytes, origin: converted === null ? "direct_upload" : "converted", conversion: converted })}；用途：${documentUsageLine(usageReading.usage)}`,
+      failure: null,
+      linkedSourceId: null,
+      promotedAt: null,
+      markdown: content.markdown,
+    };
+    repo.addDocument(document);
+    if (scope.intent !== null) attachToIntent(scope.intent, document.id);
+    return {
+      ok: true,
+      document: documentViewOfStored(document),
+      duplicate: false,
+      sessionId: scope.sessionId,
+      taskId: document.taskId,
+      note:
+        converted === null
+          ? `已保存 ${filename.value}（${content.sizeBytes} 字节，${parsed.paragraphs.length} 段）。它是用户提供的材料，不会自动成为研究来源。`
+          : `已保存 ${filename.value}（由 ${converted.provider} 从 ${converted.originalFormat} 转换${converted.status === "partial" ? "，转换不完整" : ""}；${converted.pageMap.length === 0 ? "没有页码映射，读取时不会给出页码" : `带 ${converted.pageMap.length} 段页码映射`}）。`,
+    };
+  }
+
+  /** Records a document on the exploration it was uploaded to. */
+  function attachToIntent(intent: IntentDraft, documentId: string): IntentDraft {
+    if (intent.documentIds.includes(documentId)) return intent;
+    return saveIntent({ ...intent, documentIds: [...intent.documentIds, documentId], version: intent.version + 1 });
+  }
+
+  /**
+   * The comparison objects the card is built on.
+   *
+   * When the direction named objects, those are the objects: the user read「我
+   * 理解你要比较 Alpha 和 Beta」and confirmed it, so a card that quietly compared
+   * four different things would be answering a different question. The model's
+   * own list is used only when the direction named none — and also when the
+   * direction's list is too short to compare at all, because a card needs at
+   * least two objects whatever the direction said.
+   */
+  function cardSubjectsOf(direction: ResearchDirection, proposed: readonly Subject[]): readonly Subject[] {
+    if (direction.subjects.length < 2) return proposed;
+    const subjects: Subject[] = [];
+    const takenIds = new Set<string>();
+    const takenNames = new Set<string>();
+    direction.subjects.slice(0, MAX_BRIEF_SUBJECTS).forEach((entry, index) => {
+      const id = slugId("sub", entry.name, index);
+      if (takenIds.has(id) || takenNames.has(entry.name.toLowerCase())) return;
+      takenIds.add(id);
+      takenNames.add(entry.name.toLowerCase());
+      subjects.push({
+        id,
+        name: entry.name,
+        ...(entry.note === undefined || entry.note.length === 0 ? {} : { note: entry.note }),
+      });
+    });
+    return subjects.length >= 2 ? subjects : proposed;
+  }
+
+  /** The dimensions the card is built on, on the same rule. */
+  function cardDimensionsOf(direction: ResearchDirection, proposed: readonly Dimension[]): readonly Dimension[] {
+    if (direction.dimensions.length < 3) return proposed;
+    const dimensions: Dimension[] = [];
+    const takenIds = new Set<string>();
+    const takenNames = new Set<string>();
+    direction.dimensions.slice(0, MAX_BRIEF_DIMENSIONS).forEach((entry, index) => {
+      const id = slugId("dim", entry.name, index);
+      if (takenIds.has(id) || takenNames.has(entry.name.toLowerCase())) return;
+      takenIds.add(id);
+      takenNames.add(entry.name.toLowerCase());
+      dimensions.push({ id, name: entry.name, question: entry.question });
+    });
+    return dimensions.length >= 3 ? dimensions : proposed;
+  }
+
+  /**
+   * The card, as the direction the user confirmed shapes it.
+   *
+   * The confirmation is the one thing a later proposal may not overwrite: the
+   * topic and purpose in the brief are the ones the user agreed to, and a
+   * model's guess is not allowed to replace them under its own name. What the
+   * direction offered as *suggestions* — objects and dimensions — is kept as
+   * the baseline the card starts from and stays marked `suggested`, because the
+   * user approved a direction rather than each one of those names.
+   *
+   * The field states are what keeps the two questionnaires from becoming one
+   * after the other: a field the confirmation settled counts as a decision the
+   * user already made, so guided planning skips it instead of asking again.
+   */
+  function applyConfirmedDirection(task: ReportTask, intent: IntentDraft, direction: ResearchDirection, at: string): ReportTask {
+    const facts = confirmedBriefFacts(direction);
+    const subjects = cardSubjectsOf(direction, task.subjects);
+    const dimensions = cardDimensionsOf(direction, task.dimensions);
+    const states: Record<string, BriefFieldState> = { ...suggestedFieldStates() };
+    for (const [field, state] of Object.entries(facts.fieldStates)) {
+      if (state !== undefined) states[field] = state;
+    }
+    return {
+      ...task,
+      topic: facts.topic,
+      purpose: facts.purpose,
+      audience: facts.audience.length > 0 ? facts.audience : task.audience,
+      focus: facts.focus.length > 0 ? facts.focus : task.focus,
+      exclusions: facts.exclusions.length > 0 ? facts.exclusions : task.exclusions,
+      lengthTarget: facts.lengthTarget.length > 0 ? facts.lengthTarget : task.lengthTarget,
+      subjects,
+      dimensions,
+      matrix: buildMatrix(subjects, dimensions, at),
+      briefFieldStates: states as BriefFieldStates,
+      intent: {
+        intentId: intent.id,
+        seedTopic: intent.seedTopic,
+        direction,
+        confirmedAt: intent.confirmedAt ?? at,
+      },
+      updatedAt: at,
+    };
+  }
+
+  function documentsFor(scope: { readonly sessionId?: string; readonly taskId?: string; readonly documentIds?: readonly string[] }): readonly StoredDocument[] {
+    if (scope.documentIds !== undefined && scope.documentIds.length > 0) return repo.listDocumentsByIds(scope.documentIds);
+    if (scope.taskId !== undefined && scope.taskId.trim().length > 0) return repo.listDocumentsForTask(scope.taskId.trim());
+    if (scope.sessionId !== undefined && scope.sessionId.trim().length > 0) return repo.listDocumentsBySession(scope.sessionId.trim());
+    return [];
+  }
+
+  /**
+   * The blocks a prompt may carry of the user's documents.
+   *
+   * Bounded twice over — a preview per document, and a total the caller
+   * chooses — because the one thing this product must never do is paste whole
+   * uploads into a model's context and then behave as if the model had read
+   * them. Each block says how much of its document it really contains, and
+   * carries the sentence that marks the text as data rather than instruction.
+   */
+  function documentContextImpl(
+    scope: { readonly sessionId?: string; readonly taskId?: string; readonly documentIds?: readonly string[] },
+    maxChars: number,
+    totalChars: number,
+  ): readonly DocumentContext[] {
+    const contexts: DocumentContext[] = [];
+    let budget = totalChars;
+    for (const document of documentsFor(scope)) {
+      if (budget <= 0) break;
+      const parsed = parseDocument(document.markdown);
+      const preview = documentPreview({
+        documentId: document.id,
+        filename: document.originalFilename,
+        title: document.title,
+        parsed,
+        maxChars: Math.min(maxChars, budget),
+      });
+      budget -= preview.charsRead;
+      contexts.push({
+        documentId: document.id,
+        filename: document.originalFilename,
+        title: document.title,
+        origin: document.origin,
+        conversionProvider: document.conversionProvider,
+        usage: document.usage,
+        chars: document.markdown.length,
+        previewChars: preview.charsRead,
+        complete: preview.complete,
+        preview: preview.text,
+        outline: parsed.outline.map((heading) => `${"#".repeat(heading.level)} ${heading.text}`),
+        note: `${UNTRUSTED_DOCUMENT_NOTE} ${preview.note}`,
+      });
+    }
+    return contexts;
+  }
+
+  /** The read a user's own document produces, in the read layer's own shape. */
+  function documentReadOutcome(document: StoredDocument): ReadOutcome {
+    const parsed = parseDocument(document.markdown);
+    const converted = document.conversion;
+    const provenance =
+      converted === null
+        ? `用户上传的 Markdown 文档（${document.originalFilename}）`
+        : `${converted.provider} 从 ${converted.originalFormat} 转换得到的 Markdown（原始文件：${converted.originalFilename}${converted.status === "partial" ? "；转换不完整" : ""}）`;
+    return {
+      status: "ok",
+      readUrl: `document://${document.id}`,
+      fetchedAt: isoNow(),
+      title: document.title.length > 0 ? document.title : document.originalFilename,
+      scope: "full_text",
+      text: parsed.text,
+      paragraphs: parsed.paragraphs,
+      contentType: "text/markdown",
+      note: `${provenance}；user-provided：这是用户提供的材料，不是公开可验证的论文正文，也没有经过出版方校验（读取范围：该文档保存的全部文本）`,
+      failure: null,
+    };
+  }
+
+  function promoteDocumentImpl(
+    documentId: string,
+    input: { readonly taskId: string; readonly sessionId?: string },
+  ): { readonly ok: true; readonly source: Source; readonly created: boolean; readonly note: string } | Refusal {
+    const document = repo.getDocument(documentId);
+    if (document === undefined) {
+      return { ok: false, problems: [`没有找到文档：${documentId}`], guidance: "请确认 documentId。" };
+    }
+    const task = repo.getTask(input.taskId);
+    if (task === undefined) {
+      return { ok: false, problems: [`没有找到研究任务：${input.taskId}`], guidance: "请确认 taskId。" };
+    }
+    if (document.sessionId !== task.sessionId) {
+      return {
+        ok: false,
+        problems: ["这份文档与目标任务不属于同一个会话"],
+        guidance: "文档只能成为所属会话的研究来源，避免把一份材料悄悄放进别的项目。",
+      };
+    }
+    if (input.sessionId !== undefined && input.sessionId.trim().length > 0 && input.sessionId.trim() !== document.sessionId) {
+      return { ok: false, problems: ["这份文档不属于该会话"], guidance: "请从上传它的那个会话里操作。" };
+    }
+    if (!document.usage.includes("research_source")) {
+      return {
+        ok: false,
+        problems: ["这份文档还没有被指定为研究材料"],
+        guidance: "请先把它的用途设为 research_source（作为研究材料）——文档首先是帮助理解需求的材料，是否进入研究来源由用户决定。",
+      };
+    }
+    if (document.linkedSourceId !== null) {
+      const existing = repo.getSource(document.linkedSourceId);
+      if (existing !== undefined && existing.taskId === task.id) {
+        return { ok: true, source: existing, created: false, note: `「${document.originalFilename}」早前已经作为来源 ${existing.id} 加入本项目。` };
+      }
+    }
+
+    const parsed = parseDocument(document.markdown);
+    const at = isoNow();
+    const converted = document.conversion;
+    const source: Source = {
+      id: newId(ID_PREFIX.source),
+      taskId: task.id,
+      title: document.title.length > 0 ? document.title : document.originalFilename,
+      authors: [],
+      org: "",
+      url: `document://${document.id}`,
+      pdfUrl: null,
+      doi: null,
+      publishedAt: null,
+      venue: converted === null ? "用户提供的 Markdown 文档" : `${converted.provider} 从 ${converted.originalFormat} 转换的文档`,
+      // The role is the honest one: this is material a user supplied. It is not
+      // a primary source, it is not an official one, and the claim contract
+      // treats it accordingly.
+      role: "user-provided",
+      abstract: parsed.text.slice(0, 600),
+      discovery: {
+        provider: "user-document",
+        providerId: document.id,
+        query: "",
+        queriedAt: at,
+        target: null,
+      },
+      readStatus: "not_read",
+      readScope: null,
+      readAt: null,
+      readUrl: null,
+      retrievalNote: "",
+      failure: null,
+      snapshotId: null,
+      document: {
+        documentId: document.id,
+        filename: document.originalFilename,
+        origin: document.origin,
+        conversionProvider: document.conversionProvider,
+        originalFilename: converted === null ? null : converted.originalFilename,
+        originalFormat: converted === null ? null : converted.originalFormat,
+        pageMap: converted === null || converted.pageMap.length === 0 ? null : converted.pageMap,
+      },
+    };
+    repo.addSource(source);
+    repo.updateDocument({
+      ...document,
+      taskId: task.id,
+      usage: [...new Set<DocumentUsage>([...document.usage, "research_source"])],
+      linkedSourceId: source.id,
+      promotedAt: at,
+      updatedAt: at,
+    });
+    return {
+      ok: true,
+      source,
+      created: true,
+      note: `「${document.originalFilename}」已加入本项目的来源（角色：user-provided）。它不会被当作一手或官方来源；请用 read_source 真实读取后再提取证据，支持评估与其它来源同一套规则。`,
+    };
+  }
+
   return {
     taskForSession: (sessionId) => repo.taskForSession(sessionId),
 
     proposeTask(sessionId, card) {
       const refusal = requireSessionCapability(sessionId, "card");
       if (refusal !== undefined) return refusal;
+      // Intent Discovery stands between the seed topic and the task card: while
+      // a conversation is still open there is no card to build, and a model
+      // that tries anyway is refused by name instead of quietly producing a
+      // topic nobody confirmed. The refusal is a result, so the run it happens
+      // in can go back to asking or proposing instead of failing.
+      const intent = repo.intentForSession(sessionId);
+      const direction = intent?.confirmedDirection ?? null;
+      if (intent !== undefined && direction === null) {
+        return {
+          ok: false,
+          problems: ["这个会话还在确认研究方向，还没有可以建立任务卡的正式方向"],
+          guidance:
+            "正式研究主题必须由用户确认：请先向用户提出一个澄清问题，或提出一个研究方向（推荐题目 / 目的 / 范围）等待用户确认；确认之后才能建立任务卡。",
+        };
+      }
       const normalized = normalizeCard(card);
       if (!normalized.ok) {
         return {
@@ -1882,7 +2667,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
           return { ok: true, created: false, task: existing };
         }
         const at = isoNow();
-        const next: ReportTask = {
+        let next: ReportTask = {
           ...existing,
           ...normalized.value,
           structure: { sections: blueprintSections(TECHNICAL_COMPARISON_V2) },
@@ -1896,6 +2681,9 @@ export function createResearchService(options: ResearchServiceOptions): Research
           guideClosed: null,
           updatedAt: at,
         };
+        if (intent !== undefined && direction !== null) {
+          next = applyConfirmedDirection(next, intent, direction, at);
+        }
         // A proposal that proposes what the card already says changes nothing.
         // That is not politeness: a model may call propose_task more than once
         // in a stage, and a version bump for each call would invalidate the
@@ -1906,9 +2694,24 @@ export function createResearchService(options: ResearchServiceOptions): Research
         repo.updateTask(next);
         return { ok: true, created: false, task: next };
       }
-      const task = createTask({ sessionId, card: normalized.value, now: isoNow() });
+      const at = isoNow();
+      let task = createTask({ sessionId, card: normalized.value, now: at });
+      if (intent !== undefined && direction !== null) {
+        task = applyConfirmedDirection(task, intent, direction, at);
+      }
       repo.createTask(task);
       repo.bindSession(sessionId, task.id);
+      if (intent !== undefined) {
+        saveIntent({ ...intent, taskId: task.id });
+        // Files uploaded while the user was still saying what they wanted are
+        // part of the project they were describing: the task inherits them, so
+        // "uploaded before the task existed" never means "lost".
+        for (const documentId of intent.documentIds) {
+          const document = repo.getDocument(documentId);
+          if (document === undefined || document.taskId === task.id) continue;
+          repo.updateDocument({ ...document, taskId: task.id, updatedAt: at });
+        }
+      }
       return { ok: true, created: true, task };
     },
 
@@ -1964,6 +2767,459 @@ export function createResearchService(options: ResearchServiceOptions): Research
       });
       return { ok: true, task: next, briefVersion: briefVersionOf(next), matrixRebuilt: synced.rebuilt };
     },
+
+    // ------------------------------------------------------- intent discovery --
+
+    createIntent(sessionId, input) {
+      const existing = repo.intentForSession(sessionId);
+      if (existing !== undefined) {
+        return {
+          ok: true,
+          created: false,
+          intent: viewOfIntent(existing),
+          note: "这个会话已经有一段意图探索，继续用它即可（种子主题不会被改写）。",
+        };
+      }
+      const seedTopic = typeof input.seedTopic === "string" ? input.seedTopic.trim() : "";
+      if (seedTopic.length < 2) {
+        return { ok: false, problems: ["主题太短：至少写两个字"], guidance: "给出一个要研究的主题即可，例如「Transformer」。" };
+      }
+      const at = isoNow();
+      let intent = createIntentDraft({
+        id: newId(ID_PREFIX.intent),
+        sessionId,
+        seedTopic: seedTopic.slice(0, 300),
+        now: at,
+      });
+      repo.saveIntent(intent);
+
+      // The attachments are saved *before* this returns, and the caller starts
+      // the first conversation stage only afterwards: the first question is
+      // therefore written about files that are already in the library, not
+      // about files that are still on their way.
+      const attached: string[] = [];
+      for (const document of input.documents ?? []) {
+        const uploaded = uploadDocumentImpl({ ...document, sessionId, intentId: intent.id });
+        if (uploaded.ok !== true) {
+          // Nothing half-made is left behind: a request that carried a file the
+          // library refused creates neither the documents nor the exploration,
+          // so the user can fix the file and submit the same request again.
+          for (const documentId of attached) repo.deleteDocument(documentId);
+          repo.deleteIntent(intent.id);
+          return { ok: false, problems: uploaded.problems, guidance: uploaded.guidance };
+        }
+        attached.push(uploaded.document.documentId);
+      }
+      intent = repo.getIntent(intent.id) ?? intent;
+      return {
+        ok: true,
+        created: true,
+        intent: viewOfIntent(intent),
+        note:
+          attached.length === 0
+            ? "已开始了解研究意图，请等待第一个问题。"
+            : `已保存 ${attached.length} 份随主题一起提交的 Markdown，第一个问题会读到它们。`,
+      };
+    },
+
+    intentViewOf: (intentId) => {
+      const intent = repo.getIntent(intentId);
+      return intent === undefined ? undefined : viewOfIntent(intent);
+    },
+
+    intentForSession: (sessionId) => {
+      const intent = repo.intentForSession(sessionId);
+      return intent === undefined ? undefined : viewOfIntent(intent);
+    },
+
+    recordIntentQuestion(sessionId, input) {
+      const authRefusal = requireSessionCapability(sessionId, "intent");
+      if (authRefusal !== undefined) return authRefusal;
+      const intent = repo.intentForSession(sessionId);
+      if (intent === undefined) {
+        return {
+          ok: false,
+          problems: ["当前会话还没有意图探索"],
+          guidance: "意图探索由用户在首页发起（提交主题）；在它存在之前不要调用本工具。",
+        };
+      }
+      if (intent.confirmedAt !== null) {
+        return {
+          ok: false,
+          problems: ["研究方向已经由用户确认过了，不能再继续提问"],
+          guidance: "确认之后进入任务卡与简报阶段；如果用户想改变方向，由用户重新发起一次意图探索。",
+        };
+      }
+      const reading = readIntentQuestion(input);
+      if (!reading.ok) {
+        return {
+          ok: false,
+          problems: reading.problems,
+          guidance: "question 必填（不含 HTML 标签）；whyThisMatters 一句话；options 最多 5 个；decisions 只写你从用户原话里读到的理解。",
+        };
+      }
+      // The user decides when the conversation is over. If the last thing they
+      // said was「给出方向」, another question is the assistant overriding them,
+      // so it is refused — the same shape as the guided brief's floor, pointed
+      // the other way.
+      if (asksForDirection(lastUserMessage(intent))) {
+        return {
+          ok: false,
+          problems: ["用户已经明确要求你给出研究方向，此时不应该再提问"],
+          guidance:
+            "请改用 propose_research_direction 给出完整方向（topic / purpose / scope / summary），由用户确认或修改；如果确实还有关键歧义，也应在同一份方向里写清你的假设，而不是再问一轮。",
+        };
+      }
+      const at = isoNow();
+      const turn: IntentTurn = {
+        id: newId(ID_PREFIX.turn),
+        role: "assistant",
+        at,
+        text: reading.question,
+        ...(reading.why.length === 0 ? {} : { why: reading.why }),
+        ...(reading.options.length === 0 ? {} : { options: reading.options }),
+      };
+      const decisions: IntentDecision[] = reading.decisions.map((entry) => ({
+        id: newId(ID_PREFIX.decision),
+        field: entry.field,
+        value: entry.value,
+        basedOn: entry.basedOn,
+        at,
+      }));
+      const next = saveIntent({
+        ...intent,
+        turns: withAssistantTurn(intent, turn),
+        decisions: [...intent.decisions, ...decisions].slice(-MAX_INTENT_DECISIONS),
+        // Asking again reopens the conversation: whatever direction was on the
+        // table is no longer the current offer, and the record keeps the turn
+        // that carried it.
+        proposal: null,
+        status: "exploring",
+        version: intent.version + 1,
+      });
+      return {
+        ok: true,
+        intent: viewOfIntent(next),
+        question: reading.question,
+        options: reading.options,
+        decisionsRecorded: decisions.length,
+        note: "问题已记录，等待用户回答；本次没有写入任何研究数据。",
+      };
+    },
+
+    proposeIntentDirection(sessionId, input) {
+      const authRefusal = requireSessionCapability(sessionId, "intent");
+      if (authRefusal !== undefined) return authRefusal;
+      const intent = repo.intentForSession(sessionId);
+      if (intent === undefined) {
+        return {
+          ok: false,
+          problems: ["当前会话还没有意图探索"],
+          guidance: "意图探索由用户在首页发起（提交主题）；在它存在之前不要调用本工具。",
+        };
+      }
+      if (intent.confirmedAt !== null) {
+        return {
+          ok: false,
+          problems: ["研究方向已经由用户确认过了，不能再次提出方向"],
+          guidance: "确认后的方向由用户拥有；如需修改，请让用户直接编辑简报或重新发起意图探索。",
+        };
+      }
+      const reading = readDirection(input, { at: isoNow(), source: "agent" });
+      if (!reading.ok) {
+        return {
+          ok: false,
+          problems: reading.problems,
+          guidance:
+            "研究方向必须同时给出：topic（推荐题目）、purpose（研究目的或要回答的问题）、scope（大致研究范围）、summary（一段「我理解你的研究方向是……」的总结）。这份提案只是提案，用户确认之前不会写入任何研究任务。",
+        };
+      }
+      const direction = reading.direction as ResearchDirection;
+      const at = direction.at;
+      const turn: IntentTurn = {
+        id: newId(ID_PREFIX.turn),
+        role: "assistant",
+        at,
+        text: direction.summary,
+        proposesDirection: true,
+      };
+      const next = saveIntent({
+        ...intent,
+        turns: withAssistantTurn(intent, turn),
+        proposal: direction,
+        status: "ready_to_confirm",
+        version: intent.version + 1,
+      });
+      return {
+        ok: true,
+        intent: viewOfIntent(next),
+        direction,
+        note: `研究方向已作为提案记录，等待用户确认（模型不能替用户确认）：${DIRECTION_CONFIRM_QUESTION}`,
+      };
+    },
+
+    submitIntentMessage(intentId, input) {
+      const intent = requireIntent(intentId);
+      if (intent.confirmedAt !== null) {
+        return {
+          ok: false,
+          problems: ["研究方向已经确认过了"],
+          guidance: "确认之后进入任务卡与简报阶段；如需重新讨论方向，请新建一次意图探索。",
+          conflict: true,
+        };
+      }
+      const conflict = intentVersionConflict(intent, input.expectedVersion);
+      if (conflict !== undefined) return conflict;
+      const message = readIntentMessage(input.text);
+      if (!message.ok) {
+        return { ok: false, problems: [message.problem], guidance: "用一两句话说明你的想法即可，不需要写成正式条目。" };
+      }
+      const documentIds: string[] = [];
+      for (const documentId of input.documentIds ?? []) {
+        const document = repo.getDocument(documentId);
+        if (document === undefined || document.sessionId !== intent.sessionId) {
+          return { ok: false, problems: [`文档 ${documentId} 不属于这段意图探索`], guidance: "只能引用上传到同一会话里的文档。" };
+        }
+        if (!documentIds.includes(documentId)) documentIds.push(documentId);
+      }
+      const at = isoNow();
+      const turn: IntentTurn = {
+        id: newId(ID_PREFIX.turn),
+        role: "user",
+        at,
+        text: message.text,
+        ...(documentIds.length === 0 ? {} : { documentIds }),
+      };
+      const next = saveIntent({
+        ...intent,
+        turns: [...intent.turns, turn].slice(-MAX_INTENT_TURNS),
+        documentIds: [...new Set([...intent.documentIds, ...documentIds])],
+        version: intent.version + 1,
+      });
+      return {
+        ok: true,
+        intent: viewOfIntent(next),
+        note:
+          documentIds.length === 0
+            ? "已记录你的回答。"
+            : `已记录你的回答，并把 ${documentIds.length} 份文档一并交给这次探索。`,
+      };
+    },
+
+    editIntentDirection(intentId, input) {
+      const intent = requireIntent(intentId);
+      if (intent.confirmedAt !== null) {
+        return {
+          ok: false,
+          problems: ["研究方向已经确认过了，不能再修改这份提案"],
+          guidance: "已确认的方向属于用户；如需改变方向，请新建一次意图探索，或在简报里直接修改字段。",
+          conflict: true,
+        };
+      }
+      const conflict = intentVersionConflict(intent, input.expectedVersion);
+      if (conflict !== undefined) return conflict;
+      if (intent.proposal === null) {
+        return {
+          ok: false,
+          problems: ["还没有可修改的研究方向"],
+          guidance: "先等助手提出一个研究方向（推荐题目 / 目的 / 范围），再在此基础上修改。",
+        };
+      }
+      const reading = readDirection(input.patch, { at: isoNow(), source: "user", previous: intent.proposal });
+      if (!reading.ok) {
+        return { ok: false, problems: reading.problems, guidance: "修改后的方向仍然要给出 topic / purpose / scope / summary。" };
+      }
+      const direction = reading.direction as ResearchDirection;
+      const next = saveIntent({ ...intent, proposal: direction, status: "ready_to_confirm", version: intent.version + 1 });
+      return {
+        ok: true,
+        intent: viewOfIntent(next),
+        direction,
+        note: "已按你的修改更新研究方向；确认之后才会写入研究任务。",
+      };
+    },
+
+    confirmIntentDirection(intentId, input) {
+      const intent = requireIntent(intentId);
+      const conflict = intentVersionConflict(intent, input?.expectedVersion);
+      if (conflict !== undefined) return conflict;
+      if (intent.confirmedAt !== null && intent.confirmedDirection !== null) {
+        return {
+          ok: true,
+          intent: viewOfIntent(intent),
+          direction: intent.confirmedDirection,
+          plan: confirmedBriefFacts(intent.confirmedDirection),
+          openFields: fieldsLeftOpen(intent.confirmedDirection),
+          note: "研究方向此前已经确认，无需重复确认。",
+        };
+      }
+      let direction = intent.proposal;
+      if (input?.direction !== undefined) {
+        // A confirmation may carry the user's final wording. It is read with
+        // the same normalizer the proposal went through, so what is confirmed
+        // is a direction, not an arbitrary object.
+        const reading = readDirection(input.direction, { at: isoNow(), source: "user", previous: intent.proposal });
+        if (!reading.ok) {
+          return { ok: false, problems: reading.problems, guidance: "确认时给出的方向仍然要包含 topic / purpose / scope / summary。" };
+        }
+        direction = reading.direction;
+      }
+      if (direction === null) {
+        return {
+          ok: false,
+          problems: ["还没有可以确认的研究方向"],
+          guidance: "请先让助手提出研究方向（推荐题目、研究目的、大致范围），用户在看过之后才能确认；系统不会替用户决定研究主题。",
+        };
+      }
+      const at = isoNow();
+      const confirmed: ResearchDirection = { ...direction, at };
+      const next = saveIntent({
+        ...intent,
+        proposal: confirmed,
+        confirmedDirection: confirmed,
+        confirmedAt: at,
+        status: "confirmed",
+        version: intent.version + 1,
+      });
+      const plan = confirmedBriefFacts(confirmed);
+      const open = fieldsLeftOpen(confirmed);
+      return {
+        ok: true,
+        intent: viewOfIntent(next),
+        direction: confirmed,
+        plan,
+        openFields: open,
+        note: [
+          `已确认研究方向：${confirmed.topic}。`,
+          open.length === 0
+            ? "简报的关键字段都已经由这次确认定下。"
+            : `简报里还有 ${String(open.length)} 项没有确定（${open.join("、")}），接下来的引导只会问这些。`,
+        ].join(""),
+      };
+    },
+
+    bindIntentToTask(intentId, taskId) {
+      const intent = requireIntent(intentId);
+      const next = saveIntent({ ...intent, taskId });
+      return viewOfIntent(next);
+    },
+
+    // ------------------------------------------------------------ documents --
+
+    uploadDocument: (input) => uploadDocumentImpl(input),
+
+    documentViewOf: (documentId) => {
+      const document = repo.getDocument(documentId);
+      return document === undefined ? undefined : documentViewOfStored(document);
+    },
+
+    documentTextOf: (documentId) => repo.getDocument(documentId),
+
+    documentsOf: (scope) => documentsFor(scope).map(documentViewOfStored),
+
+    documentContextOf: (scope, maxChars) =>
+      documentContextImpl(scope, maxChars ?? MAX_DOCUMENT_PREVIEW_CHARS, (maxChars ?? MAX_DOCUMENT_PREVIEW_CHARS) * 4),
+
+    readDocument(input) {
+      const document = repo.getDocument(input.documentId);
+      if (document === undefined) {
+        return { ok: false, problems: [`没有找到文档：${input.documentId}`], guidance: "请使用上传或列表返回的 documentId。" };
+      }
+      if (document.sessionId !== input.sessionId) {
+        return { ok: false, problems: ["这份文档不属于当前会话"], guidance: "只能读取上传到本会话的文档。" };
+      }
+      const parsed = parseDocument(document.markdown);
+      return {
+        ...readDocumentText({
+          documentId: document.id,
+          filename: document.originalFilename,
+          title: document.title,
+          parsed,
+          request: input.request,
+          conversion: document.conversion,
+        }),
+        ok: true,
+      };
+    },
+
+    deleteDocument(documentId, input) {
+      const document = repo.getDocument(documentId);
+      if (document === undefined) {
+        return { ok: false, problems: [`没有找到文档：${documentId}`], guidance: "它可能已经被删除。" };
+      }
+      if (input?.sessionId !== undefined && input.sessionId.trim().length > 0 && input.sessionId.trim() !== document.sessionId) {
+        return { ok: false, problems: ["这份文档不属于该会话"], guidance: "请从上传它的那个会话里操作。" };
+      }
+      repo.deleteDocument(documentId);
+      // Saved reads, evidence and reports are not touched: the document was the
+      // source of a *read*, and a read is a record of what was really obtained.
+      return {
+        ok: true,
+        documentId,
+        note:
+          document.linkedSourceId === null
+            ? `已从文档库移除「${document.originalFilename}」。`
+            : `已从文档库移除「${document.originalFilename}」。它已经成为来源 ${document.linkedSourceId}：已保存的读取快照与证据保留不变，但重新读取需要重新上传这份文档。`,
+      };
+    },
+
+    setDocumentUsage(documentId, usage) {
+      const document = repo.getDocument(documentId);
+      if (document === undefined) {
+        return { ok: false, problems: [`没有找到文档：${documentId}`], guidance: "它可能已经被删除。" };
+      }
+      const reading = readDocumentUsage(usage, document.usage);
+      if (reading.problem.length > 0) {
+        return { ok: false, problems: [reading.problem], guidance: "用途只能是 intent_context / research_source，至少一个。" };
+      }
+      const next: StoredDocument = {
+        ...document,
+        usage: reading.usage,
+        updatedAt: isoNow(),
+        note: `${documentSummaryLine({ filename: document.originalFilename, sizeBytes: document.sizeBytes, origin: document.origin, conversion: document.conversion })}；用途：${documentUsageLine(reading.usage)}`,
+      };
+      repo.updateDocument(next);
+      return {
+        ok: true,
+        document: documentViewOfStored(next),
+        duplicate: false,
+        sessionId: document.sessionId,
+        taskId: document.taskId,
+        note: `已把「${document.originalFilename}」的用途设为：${documentUsageLine(reading.usage)}。`,
+      };
+    },
+
+    linkDocumentToTask(documentId, taskId, input) {
+      const document = repo.getDocument(documentId);
+      if (document === undefined) {
+        return { ok: false, problems: [`没有找到文档：${documentId}`], guidance: "它可能已经被删除。" };
+      }
+      const task = repo.getTask(taskId);
+      if (task === undefined) {
+        return { ok: false, problems: [`没有找到研究任务：${taskId}`], guidance: "请确认 taskId。" };
+      }
+      if (task.sessionId !== document.sessionId) {
+        return { ok: false, problems: ["这份文档与目标任务不属于同一个会话"], guidance: "文档只能关联到所属会话的研究任务。" };
+      }
+      if (input?.sessionId !== undefined && input.sessionId.trim().length > 0 && input.sessionId.trim() !== document.sessionId) {
+        return { ok: false, problems: ["这份文档不属于该会话"], guidance: "请从上传它的那个会话里操作。" };
+      }
+      const next: StoredDocument = { ...document, taskId: task.id, updatedAt: isoNow() };
+      repo.updateDocument(next);
+      const intent = repo.intentForSession(document.sessionId);
+      if (intent !== null && intent !== undefined) saveIntent({ ...intent, taskId: task.id });
+      return {
+        ok: true,
+        document: documentViewOfStored(next),
+        duplicate: false,
+        sessionId: document.sessionId,
+        taskId: task.id,
+        note: `「${document.originalFilename}」已关联到研究任务；它仍然需要被指定为研究材料并真实读取后才会产生证据。`,
+      };
+    },
+
+    promoteDocumentToSource: (documentId, input) =>
+      promoteDocumentImpl(documentId, { taskId: input.taskId, ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }) }),
 
     // ------------------------------------------------------------- the brief --
 
@@ -2444,31 +3700,52 @@ export function createResearchService(options: ResearchServiceOptions): Research
       let note = "";
 
       if (snapshot === undefined) {
-        const refusal = budgetRefusal(task, "read", "");
+        // A user's own document is read from the library, not from the network:
+        // the text the user supplied *is* the material, and it is already saved
+        // here. That path spends nothing — no fetch happened, and the discovery
+        // budget exists to bound what the product goes looking for, not what the
+        // user handed it.
+        const linkedDocument = source.document ?? null;
+        const userDocument = linkedDocument === null ? undefined : repo.getDocument(linkedDocument.documentId);
+        if (linkedDocument !== null && userDocument === undefined) {
+          return {
+            ok: false,
+            problems: [`这份来源来自用户上传的文档，但该文档已从文档库移除（${linkedDocument.filename}）`],
+            guidance: "已保存的读取快照与证据仍然保留；要重新读取正文，请让用户重新上传这份文档。",
+          };
+        }
+        const refusal = userDocument === undefined ? budgetRefusal(task, "read", "") : undefined;
         if (refusal !== undefined) return refusal;
 
         const grant = userActionOf(task);
-        recordActivity(task.id, "read_started", "info", `开始读取：${source.title}`, {
-          provider: source.discovery.provider,
-        });
+        recordActivity(
+          task.id,
+          "read_started",
+          "info",
+          userDocument === undefined ? `开始读取：${source.title}` : `开始读取用户提供的文档：${source.title}`,
+          { provider: source.discovery.provider },
+        );
         // What discovery already knows about this work travels with the read:
         // when nothing can be fetched, the provider's own abstract is still a
         // real — and partial — read, and the reader says which of the two
         // happened instead of reporting a bare failure.
-        const outcome = await readImpl(
-          {
-            url: source.url,
-            metadata: {
-              provider: source.discovery.provider === "openalex" ? "openalex" : "arxiv",
-              workUrl: source.discovery.requestUrl ?? null,
-              title: source.title,
-              abstract: source.abstract,
-              doi: source.doi,
-            },
-          },
-          input.signal === undefined ? {} : { signal: input.signal },
-        );
-        if (grant !== undefined) spend(grant, "reads");
+        const outcome =
+          userDocument === undefined
+            ? await readImpl(
+                {
+                  url: source.url,
+                  metadata: {
+                    provider: source.discovery.provider === "openalex" ? "openalex" : "arxiv",
+                    workUrl: source.discovery.requestUrl ?? null,
+                    title: source.title,
+                    abstract: source.abstract,
+                    doi: source.doi,
+                  },
+                },
+                input.signal === undefined ? {} : { signal: input.signal },
+              )
+            : documentReadOutcome(userDocument);
+        if (userDocument === undefined && grant !== undefined) spend(grant, "reads");
         if (outcome.status === "failed" || outcome.scope === null) {
           repo.updateSource({
             ...source,
@@ -2480,7 +3757,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
             retrievalNote: outcome.note,
             failure: outcome.failure,
           });
-          spendOnTask(task.id, "reads");
+          if (userDocument === undefined) spendOnTask(task.id, "reads");
           recordActivity(task.id, "read_failed", "warn", `读取失败：${source.title}（${outcome.failure ?? outcome.note}）`, {
             provider: source.discovery.provider,
           });
@@ -2516,7 +3793,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
           failure: null,
           snapshotId: snapshot.id,
         });
-        spendOnTask(task.id, "reads");
+        if (userDocument === undefined) spendOnTask(task.id, "reads");
         note = outcome.note;
         recordActivity(
           task.id,
@@ -2524,7 +3801,9 @@ export function createResearchService(options: ResearchServiceOptions): Research
           outcome.scope === "abstract" ? "warn" : "info",
           outcome.scope === "abstract"
             ? `读取完成（摘要级）：${snapshot.title}`
-            : `读取完成（${scopeLabel(outcome.scope)}）：${snapshot.title}`,
+            : userDocument === undefined
+              ? `读取完成（${scopeLabel(outcome.scope)}）：${snapshot.title}`
+              : `读取完成（用户提供的文档，完整文本）：${snapshot.title}`,
           { provider: source.discovery.provider },
         );
       } else {

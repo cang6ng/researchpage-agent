@@ -28,6 +28,10 @@ import type {
 } from "@every-dagent/plugin-research";
 import {
   DEFAULT_BUDGET,
+  MAX_DOCUMENT_BYTES,
+  MAX_DOCUMENTS_PER_SESSION,
+  UNTRUSTED_DOCUMENT_NOTE,
+  markdownNameFor,
   USER_RESEARCH_BUDGET,
   buildCitations,
   findPdfBrowser,
@@ -41,6 +45,15 @@ import { presentationOf, researchProgressOf } from "./presentation.js";
 import type { ResearchRunner } from "./runner.js";
 
 const MAX_BODY_BYTES = 32 * 1024;
+
+/**
+ * The largest body a document upload may carry.
+ *
+ * It is the library's own file limit plus room for the JSON envelope, so the
+ * library — not the transport — is what decides whether a file is too large,
+ * and the user gets the reason rather than a dropped connection.
+ */
+const MAX_UPLOAD_BYTES = MAX_DOCUMENT_BYTES + 64 * 1024;
 
 export interface ResearchRoutesOptions {
   readonly service: ResearchService;
@@ -82,32 +95,59 @@ function sendText(response: ServerResponse, status: number, value: string, type:
 
 function readBody(request: IncomingMessage): Promise<unknown> {
   return new Promise((resolve) => {
+    readBytes(request, MAX_BODY_BYTES)
+      .then((bytes) => {
+        if (bytes === undefined) {
+          resolve(undefined);
+          return;
+        }
+        const text = bytes.toString("utf8");
+        if (text.trim().length === 0) {
+          resolve({});
+          return;
+        }
+        try {
+          resolve(JSON.parse(text) as unknown);
+        } catch {
+          resolve(undefined);
+        }
+      })
+      .catch(() => resolve(undefined));
+  });
+}
+
+/**
+ * Reads a request body up to a limit, as bytes.
+ *
+ * Bytes rather than text, because an upload has to be checked for being UTF-8
+ * at all: decoding first and validating afterwards can only ever see the
+ * replacement characters, never the fact that the file was not text.
+ */
+function readBytes(request: IncomingMessage, limit: number): Promise<Buffer | undefined> {
+  return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let total = 0;
+    let overflow = false;
+    let done = false;
+    const finish = (value: Buffer | undefined): void => {
+      if (done) return;
+      done = true;
+      resolve(value);
+    };
     request.on("data", (chunk: Buffer) => {
       total += chunk.byteLength;
-      if (total > MAX_BODY_BYTES) {
-        request.destroy();
-        resolve(undefined);
+      if (total > limit) {
+        // The body is refused, but it is drained rather than dropped: killing
+        // the socket would leave a caller with a connection error instead of
+        // the sentence that says the file is too large.
+        overflow = true;
+        chunks.length = 0;
         return;
       }
       chunks.push(chunk);
     });
-    request.on("end", () => {
-      const text = Buffer.concat(chunks).toString("utf8");
-      if (text.trim().length === 0) {
-        resolve({});
-        return;
-      }
-      try {
-        resolve(JSON.parse(text) as unknown);
-      } catch {
-        resolve(undefined);
-      }
-    });
-    request.on("error", () => {
-      resolve(undefined);
-    });
+    request.on("end", () => finish(overflow ? undefined : Buffer.concat(chunks)));
+    request.on("error", () => finish(undefined));
   });
 }
 
@@ -319,6 +359,40 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
     // structured editor and the guided assistant write to, so a page that polls
     // one endpoint sees both ways of working on it.
     brief: service.briefOf(taskId),
+    /**
+     * The documents the user attached to this project, and where the direction
+     * came from.
+     *
+     * A document is not evidence: it is material the user supplied, and the
+     * bundle says which ones they marked as research material. The intent link
+     * is what makes「这个题目是用户确认过的」readable from the project itself.
+     */
+    documents: service.documentsOf({ taskId }).map((document) => ({
+      documentId: document.documentId,
+      filename: document.originalFilename,
+      title: document.title,
+      sizeBytes: document.sizeBytes,
+      origin: document.origin,
+      conversionProvider: document.conversionProvider,
+      usage: document.usage,
+      status: document.status,
+      linkedSourceId: document.linkedSourceId,
+      chars: document.chars,
+      outline: document.outline.map((heading) => `${"#".repeat(heading.level)} ${heading.text}`),
+      createdAt: document.createdAt,
+    })),
+    intent: (() => {
+      const link = task.intent ?? null;
+      if (link === null) return null;
+      const exploration = service.intentForSession(task.sessionId);
+      return {
+        intentId: link.intentId,
+        seedTopic: link.seedTopic,
+        confirmedAt: link.confirmedAt,
+        direction: link.direction,
+        status: exploration?.status ?? null,
+      };
+    })(),
     currentReportId: task.currentReportId,
     currentReportHash: current === undefined ? null : service.contentHashOf(taskId),
     currentReportFrozen: current !== undefined && revisions.some((revision) => revision.reportId === current.id),
@@ -483,8 +557,7 @@ export function createResearchRouter(
 
   const handle = async ({ request, response }: Deferred, path: string, method: string): Promise<void> => {
     // GET /api/research/tasks — the list a reader reopens from.
-    if (path === "/api/research/tasks" && method === "GET") {
-      const tasks = service.listTasks().map((task) => ({
+    if (path === "/api/research/tasks" && method === "GET") {      const tasks = service.listTasks().map((task) => ({
         id: task.id,
         sessionId: task.sessionId,
         topic: task.topic,
@@ -497,7 +570,14 @@ export function createResearchRouter(
       return;
     }
 
-    // POST /api/research/tasks {topic} — a new research task and its card stage.
+    // POST /api/research/tasks {topic} — the legacy card entry.
+    //
+    // It is kept because old pages and old scripts use it, and it says what it
+    // is: this path does *not* go through Intent Discovery, so nobody confirmed
+    // a research direction. The product path is POST /api/research/intents
+    // followed by the user's confirmation; a session that has an exploration in
+    // progress cannot build a card here or anywhere else, because
+    // `service.proposeTask` refuses it by name.
     if (path === "/api/research/tasks" && method === "POST") {
       const body = asRecord(await readBody(request));
       const topic = typeof body["topic"] === "string" ? body["topic"].trim() : "";
@@ -510,8 +590,475 @@ export function createResearchRouter(
       // The card stage creates the task itself (propose_task binds it to the
       // session), so the task id is known as soon as the stage has run.
       runner.startCard(sessionId, topic);
-      log(`[api] card stage started for session ${sessionId}`);
-      sendJson(response, 202, { sessionId, pending: true });
+      log(`[api] legacy card stage started for session ${sessionId}（未经过研究方向确认）`);
+      sendJson(response, 202, {
+        sessionId,
+        pending: true,
+        intentDiscovery: "skipped",
+        note: "这是兼容入口：本次没有经过研究方向确认（Intent Discovery），模型会直接提出研究题目。正式流程请用 POST /api/research/intents。",
+      });
+      return;
+    }
+
+    // ------------------------------------------------- intent discovery --
+    // POST /api/research/intents {seedTopic, documents?} — start an exploration.
+    // The documents are saved before the first turn runs, so the first question
+    // is asked about files that are already in the library.
+    if (path === "/api/research/intents" && method === "POST") {
+      const body = asRecord(await readBody(request));
+      const docs = Array.isArray(body["documents"]) ? (body["documents"] as unknown[]) : [];
+      const sessionId = await routeOptions.createSession();
+      const created = service.createIntent(sessionId, {
+        seedTopic: body["seedTopic"],
+        documents: docs.map((entry) => {
+          const record = asRecord(entry);
+          return {
+            filename: record["filename"],
+            content: {
+              ...(typeof record["content"] === "string" ? { text: record["content"] } : {}),
+              ...(typeof record["contentBase64"] === "string"
+                ? { bytes: new Uint8Array(Buffer.from(record["contentBase64"], "base64")) }
+                : {}),
+            },
+          };
+        }),
+      });
+      if (created.ok !== true) {
+        sendJson(response, 400, { error: created.problems.join("；"), problems: created.problems, guidance: created.guidance });
+        return;
+      }
+      runner.startIntent(sessionId, created.intent.intentId);
+      log(`[api] intent exploration ${created.intent.intentId} started for session ${sessionId}`);
+      sendJson(response, 202, {
+        ok: true,
+        created: created.created,
+        intentId: created.intent.intentId,
+        sessionId,
+        status: created.intent.status,
+        documents: created.intent.documents,
+        note: created.note,
+      });
+      return;
+    }
+
+    // GET /api/research/sessions/:sessionId/intent — the exploration of a session.
+    const sessionIntentMatch = /^\/api\/research\/sessions\/([^/]+)\/intent$/.exec(path);
+    if (sessionIntentMatch !== null && method === "GET") {
+      const sessionId = sessionIntentMatch[1] ?? "";
+      const intent = service.intentForSession(sessionId);
+      sendJson(response, 200, {
+        intent: intent ?? null,
+        busy: intent === undefined ? false : runner.hasIntentWork(intent.intentId),
+      });
+      return;
+    }
+
+    const intentMatch = /^\/api\/research\/intents\/([^/]+)$/.exec(path);
+    if (intentMatch !== null && method === "GET") {
+      const intent = service.intentViewOf(intentMatch[1] ?? "");
+      if (intent === undefined) {
+        sendJson(response, 404, { error: "意图探索不存在" });
+        return;
+      }
+      sendJson(response, 200, { intent, busy: runner.hasIntentWork(intent.intentId) });
+      return;
+    }
+
+    // POST /api/research/intents/:id/messages {text, documentIds?} — one answer.
+    const intentMessageMatch = /^\/api\/research\/intents\/([^/]+)\/messages$/.exec(path);
+    if (intentMessageMatch !== null && method === "POST") {
+      const intentId = intentMessageMatch[1] ?? "";
+      const existing = service.intentViewOf(intentId);
+      if (existing === undefined) {
+        sendJson(response, 404, { error: "意图探索不存在" });
+        return;
+      }
+      if (runner.hasIntentWork(intentId)) {
+        sendJson(response, 409, {
+          error: "这段对话正在处理上一轮内容",
+          problems: ["这段对话正在处理上一轮内容"],
+          guidance: "请等待当前一轮结束后再提交下一条消息。",
+          reason: "run_in_progress",
+        });
+        return;
+      }
+      const body = asRecord(await readBody(request));
+      const documentIds = Array.isArray(body["documentIds"])
+        ? (body["documentIds"] as unknown[]).filter((id): id is string => typeof id === "string")
+        : [];
+      const result = service.submitIntentMessage(intentId, {
+        text: body["text"],
+        ...(documentIds.length === 0 ? {} : { documentIds }),
+        ...(typeof body["expectedVersion"] === "number" ? { expectedVersion: body["expectedVersion"] } : {}),
+      });
+      if (result.ok !== true) {
+        const stale = "stale" in result && result.stale === true;
+        // A message to a conversation that has been confirmed is refused with a
+        // conflict, like every other write aimed at a state that has moved on.
+        const conflict = stale || ("conflict" in result && result.conflict === true);
+        sendJson(response, conflict ? 409 : 400, {
+          error: result.problems.join("；"),
+          problems: result.problems,
+          guidance: result.guidance,
+          ...(stale ? { stale: true, intent: (result as { intent: unknown }).intent } : {}),
+        });
+        return;
+      }
+      runner.startIntent(existing.sessionId, intentId);
+      sendJson(response, 202, { ok: true, intent: result.intent, started: true, note: result.note });
+      return;
+    }
+
+    // POST /api/research/intents/:id/direction {patch} — the user's own edit of
+    // the direction on the table. It stays a proposal; only /confirm confirms.
+    const intentDirectionMatch = /^\/api\/research\/intents\/([^/]+)\/direction$/.exec(path);
+    if (intentDirectionMatch !== null && method === "POST") {
+      const intentId = intentDirectionMatch[1] ?? "";
+      if (service.intentViewOf(intentId) === undefined) {
+        sendJson(response, 404, { error: "意图探索不存在" });
+        return;
+      }
+      const body = asRecord(await readBody(request));
+      const patch = body["direction"] !== undefined ? body["direction"] : body;
+      const result = service.editIntentDirection(intentId, {
+        patch,
+        ...(typeof body["expectedVersion"] === "number" ? { expectedVersion: body["expectedVersion"] } : {}),
+      });
+      if (result.ok !== true) {
+        const stale = "stale" in result && result.stale === true;
+        sendJson(response, stale ? 409 : 400, {
+          error: result.problems.join("；"),
+          problems: result.problems,
+          guidance: result.guidance,
+          ...(stale ? { stale: true, intent: (result as { intent: unknown }).intent } : {}),
+        });
+        return;
+      }
+      sendJson(response, 200, { ok: true, intent: result.intent, direction: result.direction, note: result.note });
+      return;
+    }
+
+    // POST /api/research/intents/:id/confirm — the user's confirmation, and the
+    // only way a research direction becomes official. No tool can call this.
+    const intentConfirmMatch = /^\/api\/research\/intents\/([^/]+)\/confirm$/.exec(path);
+    if (intentConfirmMatch !== null && method === "POST") {
+      const intentId = intentConfirmMatch[1] ?? "";
+      const existing = service.intentViewOf(intentId);
+      if (existing === undefined) {
+        sendJson(response, 404, { error: "意图探索不存在" });
+        return;
+      }
+      const body = asRecord(await readBody(request));
+      const result = service.confirmIntentDirection(intentId, {
+        ...(typeof body["expectedVersion"] === "number" ? { expectedVersion: body["expectedVersion"] } : {}),
+        ...(body["direction"] === undefined ? {} : { direction: body["direction"] }),
+      });
+      if (result.ok !== true) {
+        const stale = "stale" in result && result.stale === true;
+        sendJson(response, stale ? 409 : 400, {
+          error: result.problems.join("；"),
+          problems: result.problems,
+          guidance: result.guidance,
+          ...(stale ? { stale: true, intent: (result as { intent: unknown }).intent } : {}),
+        });
+        return;
+      }
+      // The confirmed direction is what the card is built from; the card stage
+      // creates the task, so the task id is known once it has run.
+      //
+      // The card is queued even when the turn that proposed the direction has
+      // not finished settling: stages run one at a time, so it starts right
+      // after — and a confirmation that silently did nothing because it arrived
+      // a moment too early would be the worst version of this feature. What is
+      // checked instead is whether *this* call is the one that confirmed it, so
+      // confirming twice does not build two cards.
+      if (existing.status !== "confirmed" && result.intent.taskId === null) {
+        runner.startCard(result.intent.sessionId, result.intent.seedTopic);
+        log(`[api] card stage started from confirmed direction ${intentId}`);
+      }
+      sendJson(response, 202, {
+        ok: true,
+        intentId,
+        sessionId: result.intent.sessionId,
+        direction: result.direction,
+        openFields: result.openFields,
+        taskId: result.intent.taskId,
+        started: "card",
+        confirmQuestion: result.intent.confirmQuestion,
+        note: result.note,
+      });
+      return;
+    }
+
+    // ------------------------------------------------------------ documents --
+    // POST /api/research/documents — one Markdown file into the library.
+    // Accepts a JSON envelope ({filename, content} or {filename, contentBase64})
+    // and a raw body with the filename in the query string.
+    if (path === "/api/research/documents" && method === "POST") {
+      const query = new URLSearchParams((request.url ?? "").split("?")[1] ?? "");
+      const contentType = (request.headers["content-type"] ?? "").toLowerCase();
+      const isJson = contentType.includes("application/json") || contentType.startsWith("{");
+      let upload: Parameters<typeof service.uploadDocument>[0];
+      if (isJson) {
+        const body = asRecord(await readBody(request));
+        // Absent means absent: `asRecord` answers an empty object for anything
+        // that is not one, so the conversion has to be tested before it is read.
+        const conversionBody = body["conversion"];
+        const conversion = conversionBody === undefined ? undefined : asRecord(conversionBody);
+        upload = {
+          ...(typeof body["sessionId"] === "string" ? { sessionId: body["sessionId"] } : {}),
+          ...(typeof body["intentId"] === "string" ? { intentId: body["intentId"] } : {}),
+          ...(typeof body["taskId"] === "string" ? { taskId: body["taskId"] } : {}),
+          filename: body["filename"],
+          content: {
+            ...(typeof body["content"] === "string" ? { text: body["content"] } : {}),
+            ...(typeof body["contentBase64"] === "string"
+              ? { bytes: new Uint8Array(Buffer.from(body["contentBase64"], "base64")) }
+              : {}),
+          },
+          ...(body["usage"] === undefined ? {} : { usage: body["usage"] as never }),
+          ...(conversion === undefined
+            ? {}
+            : {
+                conversion: {
+                  provider: conversion["provider"],
+                  version: conversion["version"],
+                  originalFilename: conversion["originalFilename"],
+                  originalFormat: conversion["originalFormat"],
+                  status: conversion["status"],
+                  pageMap: conversion["pageMap"],
+                  sourceRef: conversion["sourceRef"],
+                  convertedAt: conversion["convertedAt"],
+                },
+              }),
+        };
+      } else {
+        const bytes = await readBytes(request, MAX_UPLOAD_BYTES);
+        if (bytes === undefined) {
+          sendJson(response, 413, {
+            error: `文件过大（单文件上限 ${MAX_DOCUMENT_BYTES} 字节）`,
+            problems: [`文件过大（单文件上限 ${MAX_DOCUMENT_BYTES} 字节）`],
+            guidance: "请拆分或压缩这份 Markdown 后再上传。",
+          });
+          return;
+        }
+        upload = {
+          ...(query.get("sessionId") === null ? {} : { sessionId: query.get("sessionId") as string }),
+          ...(query.get("intentId") === null ? {} : { intentId: query.get("intentId") as string }),
+          ...(query.get("taskId") === null ? {} : { taskId: query.get("taskId") as string }),
+          filename: query.get("filename"),
+          content: { bytes },
+        };
+      }
+      const result = service.uploadDocument(upload);
+      if (result.ok !== true) {
+        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        return;
+      }
+      sendJson(response, 201, {
+        ok: true,
+        document: result.document,
+        duplicate: result.duplicate,
+        sessionId: result.sessionId,
+        taskId: result.taskId,
+        limits: { maxBytes: MAX_DOCUMENT_BYTES, maxPerSession: MAX_DOCUMENTS_PER_SESSION },
+        note: result.note,
+      });
+      return;
+    }
+
+    // POST /api/research/documents/import — the converter contract (3.7C).
+    // MinerU (or any other converter) hands over normalized Markdown plus the
+    // provenance of the file it came from, and it lands in the same library as
+    // a direct upload: same persistence, same reading, same limits.
+    if (path === "/api/research/documents/import" && method === "POST") {
+      const body = asRecord(await readBody(request));
+      const conversion = asRecord(body["conversion"]);
+      const originalFilename = typeof body["originalFilename"] === "string" ? body["originalFilename"] : "";
+      const result = service.uploadDocument({
+        ...(typeof body["sessionId"] === "string" ? { sessionId: body["sessionId"] } : {}),
+        ...(typeof body["intentId"] === "string" ? { intentId: body["intentId"] } : {}),
+        ...(typeof body["taskId"] === "string" ? { taskId: body["taskId"] } : {}),
+        filename: typeof body["filename"] === "string" && body["filename"].trim().length > 0
+          ? body["filename"]
+          : markdownNameFor(originalFilename),
+        content: {
+          ...(typeof body["markdown"] === "string" ? { text: body["markdown"] } : {}),
+          ...(typeof body["markdownBase64"] === "string"
+            ? { bytes: new Uint8Array(Buffer.from(body["markdownBase64"], "base64")) }
+            : {}),
+        },
+        ...(body["usage"] === undefined ? {} : { usage: body["usage"] as never }),
+        conversion: {
+          provider: conversion?.["provider"] ?? body["converter"],
+          version: conversion?.["version"],
+          originalFilename: conversion?.["originalFilename"] ?? originalFilename,
+          originalFormat: conversion?.["originalFormat"] ?? body["originalFormat"],
+          status: conversion?.["status"] ?? body["conversionStatus"],
+          pageMap: conversion?.["pageMap"] ?? body["pageMap"],
+          sourceRef: conversion?.["sourceRef"],
+          convertedAt: conversion?.["convertedAt"],
+        },
+      });
+      if (result.ok !== true) {
+        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        return;
+      }
+      sendJson(response, 201, {
+        ok: true,
+        document: result.document,
+        duplicate: result.duplicate,
+        sessionId: result.sessionId,
+        taskId: result.taskId,
+        note: result.note,
+      });
+      return;
+    }
+
+    // GET /api/research/documents?sessionId=|intentId=|taskId= — the library.
+    if (path === "/api/research/documents" && method === "GET") {
+      const query = new URLSearchParams((request.url ?? "").split("?")[1] ?? "");
+      const intentId = query.get("intentId");
+      const intent = intentId === null ? undefined : service.intentViewOf(intentId);
+      if (intentId !== null && intent === undefined) {
+        sendJson(response, 404, { error: "意图探索不存在" });
+        return;
+      }
+      const documents =
+        intent === undefined
+          ? service.documentsOf({
+              ...(query.get("sessionId") === null ? {} : { sessionId: query.get("sessionId") as string }),
+              ...(query.get("taskId") === null ? {} : { taskId: query.get("taskId") as string }),
+            })
+          : intent.documents;
+      sendJson(response, 200, { documents });
+      return;
+    }
+
+    // GET /api/research/documents/:id — one document, with an outline.
+    const documentIdMatch = /^\/api\/research\/documents\/([^/]+)$/.exec(path);
+    if (documentIdMatch !== null && method === "GET") {
+      const document = service.documentViewOf(documentIdMatch[1] ?? "");
+      if (document === undefined) {
+        sendJson(response, 404, { error: "文档不存在" });
+        return;
+      }
+      sendJson(response, 200, { document, untrusted: UNTRUSTED_DOCUMENT_NOTE });
+      return;
+    }
+
+    // GET /api/research/documents/:id/content — the saved Markdown itself.
+    const documentContentMatch = /^\/api\/research\/documents\/([^/]+)\/content$/.exec(path);
+    if (documentContentMatch !== null && method === "GET") {
+      const document = service.documentTextOf(documentContentMatch[1] ?? "");
+      if (document === undefined) {
+        sendJson(response, 404, { error: "文档不存在" });
+        return;
+      }
+      sendText(response, 200, document.markdown, "text/markdown; charset=utf-8");
+      return;
+    }
+
+    // POST /api/research/documents/:id/read — a bounded, located read.
+    const documentReadMatch = /^\/api\/research\/documents\/([^/]+)\/read$/.exec(path);
+    if (documentReadMatch !== null && method === "POST") {
+      const documentId = documentReadMatch[1] ?? "";
+      const existing = service.documentViewOf(documentId);
+      if (existing === undefined) {
+        sendJson(response, 404, { error: "文档不存在" });
+        return;
+      }
+      const body = asRecord(await readBody(request));
+      const result = service.readDocument({
+        sessionId: existing.sessionId,
+        documentId,
+        request: {
+          ...(typeof body["question"] === "string" ? { question: body["question"] } : {}),
+          ...(Array.isArray(body["terms"]) ? { terms: (body["terms"] as unknown[]).filter((term): term is string => typeof term === "string") } : {}),
+          ...(typeof body["sectionIndex"] === "number" ? { sectionIndex: body["sectionIndex"] } : {}),
+          ...(typeof body["paragraphIndex"] === "number" ? { paragraphIndex: body["paragraphIndex"] } : {}),
+          ...(typeof body["maxChars"] === "number" ? { maxChars: body["maxChars"] } : {}),
+        },
+      });
+      if (result.ok !== true) {
+        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        return;
+      }
+      sendJson(response, 200, { ...result, untrusted: UNTRUSTED_DOCUMENT_NOTE });
+      return;
+    }
+
+    // PATCH /api/research/documents/:id {usage} — what this document is for.
+    if (documentIdMatch !== null && method === "PATCH") {
+      const body = asRecord(await readBody(request));
+      const result = service.setDocumentUsage(documentIdMatch[1] ?? "", body["usage"]);
+      if (result.ok !== true) {
+        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        return;
+      }
+      sendJson(response, 200, { ok: true, document: result.document, note: result.note });
+      return;
+    }
+
+    // DELETE /api/research/documents/:id — remove it from the library.
+    if (documentIdMatch !== null && method === "DELETE") {
+      const query = new URLSearchParams((request.url ?? "").split("?")[1] ?? "");
+      const result = service.deleteDocument(documentIdMatch[1] ?? "", {
+        ...(query.get("sessionId") === null ? {} : { sessionId: query.get("sessionId") as string }),
+      });
+      if (result.ok !== true) {
+        sendJson(response, 404, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        return;
+      }
+      sendJson(response, 200, { ok: true, documentId: result.documentId, note: result.note });
+      return;
+    }
+
+    // POST /api/research/documents/:id/link {taskId} — attach it to a task.
+    const documentLinkMatch = /^\/api\/research\/documents\/([^/]+)\/link$/.exec(path);
+    if (documentLinkMatch !== null && method === "POST") {
+      const body = asRecord(await readBody(request));
+      const taskId = typeof body["taskId"] === "string" ? body["taskId"].trim() : "";
+      if (taskId.length === 0) {
+        sendJson(response, 400, { error: "缺少 taskId" });
+        return;
+      }
+      const result = service.linkDocumentToTask(documentLinkMatch[1] ?? "", taskId);
+      if (result.ok !== true) {
+        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        return;
+      }
+      sendJson(response, 200, { ok: true, document: result.document, taskId: result.taskId, note: result.note });
+      return;
+    }
+
+    // POST /api/research/documents/:id/source {taskId} — into the Source system.
+    const documentSourceMatch = /^\/api\/research\/documents\/([^/]+)\/source$/.exec(path);
+    if (documentSourceMatch !== null && method === "POST") {
+      const body = asRecord(await readBody(request));
+      const taskId = typeof body["taskId"] === "string" ? body["taskId"].trim() : "";
+      if (taskId.length === 0) {
+        sendJson(response, 400, { error: "缺少 taskId" });
+        return;
+      }
+      const result = service.promoteDocumentToSource(documentSourceMatch[1] ?? "", { taskId });
+      if (result.ok !== true) {
+        sendJson(response, 400, { error: result.problems.join("；"), problems: result.problems, guidance: result.guidance });
+        return;
+      }
+      sendJson(response, 201, {
+        ok: true,
+        created: result.created,
+        source: {
+          sourceId: result.source.id,
+          title: result.source.title,
+          role: result.source.role ?? null,
+          url: result.source.url,
+          readStatus: result.source.readStatus,
+          document: result.source.document ?? null,
+        },
+        note: result.note,
+      });
       return;
     }
 

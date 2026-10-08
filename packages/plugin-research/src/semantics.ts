@@ -24,17 +24,19 @@ export type AssistantIntent = "ask" | "research" | "edit";
 /**
  * Every intent a run can be started under.
  *
- * `draft`, `card` and `guide` are the program's own authorizations: the stage
- * that produces the first research card, the stage that writes the first
- * report, and the stage that writes the next guided question about the brief.
- * They exist so that "the agent may write a report" is never an ambient
- * permission — only the report stage holds it, and only the guide stage may
- * change the brief's guided record.
+ * `draft`, `card`, `guide` and `intent` are the program's own authorizations:
+ * the stage that produces the first research card, the stage that writes the
+ * first report, the stage that writes the next guided question about the brief,
+ * and the stage that explores what the user actually wants before a card
+ * exists. They exist so that "the agent may write a report" is never an ambient
+ * permission — only the report stage holds it, only the guide stage may change
+ * the brief's guided record, and only the intent stage may add turns to the
+ * conversation that precedes a task.
  */
-export type ActionIntent = AssistantIntent | "draft" | "card" | "guide";
+export type ActionIntent = AssistantIntent | "draft" | "card" | "guide" | "intent";
 
 /** What a grant lets its run do. Nothing else in the product is writable. */
-export type ActionCapability = "card" | "brief" | "research" | "report" | "proposal";
+export type ActionCapability = "card" | "brief" | "research" | "report" | "proposal" | "intent";
 
 export interface GrantBudget {
   readonly maxSearches: number;
@@ -102,6 +104,7 @@ const INTENT_CAPABILITIES: Readonly<Record<ActionIntent, readonly ActionCapabili
   draft: ["report"],
   card: ["card"],
   guide: ["brief"],
+  intent: ["intent"],
 });
 
 /**
@@ -141,6 +144,7 @@ const SCOPE_TEXT: Readonly<Record<ActionIntent, string>> = Object.freeze({
   draft: "撰写并保存本任务的报告版本",
   card: "建立研究任务卡",
   guide: "针对研究简报草稿生成下一个引导问题",
+  intent: "与用户一起把种子主题探索成可确认的研究方向；不能建立任务卡、不能确认方向、不能检索",
 });
 
 /** The default research budget a grant carries: the task's own limits apply too. */

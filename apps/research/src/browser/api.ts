@@ -113,7 +113,7 @@ export type RunOutcomeView =
 
 export interface RunView {
   readonly runId: string | null;
-  readonly stage: "card" | "guide" | "research" | "gap" | "report" | "synthesis" | "ask" | "edit" | "followup";
+  readonly stage: "intent" | "card" | "guide" | "research" | "gap" | "report" | "synthesis" | "ask" | "edit" | "followup";
   readonly status: "running" | "completed" | "failed" | "interrupted";
   readonly note: string;
   readonly startedAt: string;
