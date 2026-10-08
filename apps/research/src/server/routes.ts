@@ -43,7 +43,9 @@ import {
   needsAttention,
   reportContentOf,
 } from "@every-dagent/plugin-research";
+import type { ConversionManager, ConversionProblem } from "./conversions.js";
 import { exportRevisionPdf, exportTaskReportPdf, renderHtmlOf, revisionHtmlOf } from "./export.js";
+import { MINERU_FLASH_MAX_BYTES, MINERU_FLASH_MAX_PAGES } from "./mineru.js";
 import { presentationOf, researchProgressOf } from "./presentation.js";
 import type { ResearchRunner } from "./runner.js";
 
@@ -71,9 +73,21 @@ const MAX_UPLOAD_BYTES = MAX_DOCUMENT_BYTES;
  */
 const MAX_UPLOAD_JSON_BYTES = MAX_DOCUMENT_BYTES * 2 + 64 * 1024;
 
+/**
+ * The largest raw body a PDF/DOCX upload may carry.
+ *
+ * This is MinerU Flash mode's own per-file limit, not a number chosen here: a
+ * bigger file can only be refused by the converter after a round trip, and
+ * pretending otherwise would spend the user's time to learn what the tool
+ * already documents.
+ */
+const MAX_CONVERSION_UPLOAD_BYTES = MINERU_FLASH_MAX_BYTES;
+
 export interface ResearchRoutesOptions {
   readonly service: ResearchService;
   readonly runner: ResearchRunner;
+  /** PDF/DOCX → Markdown, as jobs. */
+  readonly conversions: ConversionManager;
   /** Creates one host session for a new research task. */
   readonly createSession: () => Promise<string>;
   readonly reportDir: string;
@@ -290,6 +304,53 @@ function sendRefusal(response: ServerResponse, refusal: Refusal): void {
 /** A list the caller is entitled to; a refusal is never presented as a list. */
 function rowsOf<T>(value: readonly T[] | Refusal): readonly T[] {
   return "ok" in value ? [] : value;
+}
+
+/** Whether a refusal came from the library (its own status map) or this layer. */
+function isRefusal(value: Refusal | ConversionProblem): value is Refusal {
+  return "kind" in value === false;
+}
+
+/**
+ * Answers a conversion-level refusal.
+ *
+ * These are the problems of this file's own layer — an unsupported format, a
+ * missing consent, a job that is gone — and each one has a status that says
+ * what to do next: 429 means wait, 415 means stop trying this file, 409 means
+ * the request was fine but is not applicable to the state the job is in.
+ */
+function sendConversionProblem(response: ServerResponse, refusal: ConversionProblem): void {
+  const status =
+    refusal.kind === "job_not_found"
+      ? 404
+      : refusal.kind === "job_cross_session"
+        ? 403
+        : refusal.kind === "unsupported_format"
+          ? 415
+          : refusal.kind === "file_too_large"
+            ? 413
+            : refusal.kind === "busy"
+              ? 429
+              : refusal.kind === "service_unavailable"
+                ? 503
+                : refusal.kind === "job_not_retryable" || refusal.kind === "file_gone"
+                  ? 409
+                  : 400;
+  sendJson(response, status, {
+    error: refusal.problems.join("；"),
+    problems: refusal.problems,
+    guidance: refusal.guidance,
+    code: refusal.kind,
+  });
+}
+
+/** The usages a conversion request asked for, as the library names them. */
+function parseUsage(raw: string | null): readonly ("intent_context" | "research_source")[] {
+  const values = (raw ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry): entry is "intent_context" | "research_source" => entry === "intent_context" || entry === "research_source");
+  return values.length === 0 ? ["intent_context"] : values;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -690,7 +751,7 @@ export function createResearchRouter(
   busyState: () => boolean = () => false,
 ): (request: IncomingMessage, response: ServerResponse) => boolean {
   pendingTopics = new Map();
-  const { service, runner } = routeOptions;
+  const { service, runner, conversions } = routeOptions;
   const log = routeOptions.log ?? ((): void => undefined);
 
   const taskIdOf = (path: string, suffix = ""): string | undefined => {
@@ -1104,6 +1165,131 @@ export function createResearchRouter(
           result.document.conversion === null
             ? result.note
             : `${result.note} 这份转换记录由调用方自报，可信等级为 client_claimed（未经过服务端核验）；真正的可信转换只能由服务端的转换适配器写入。`,
+      });
+      return;
+    }
+
+    // ------------------------------------------------------ conversions (3.7C) --
+    // POST /api/research/documents/convert — a PDF/DOCX becomes a document.
+    //
+    // The body *is* the file, and the metadata travels beside it: a filename, a
+    // usage, the session this belongs to, and the user's own consent to send the
+    // file to MinerU. It is a job rather than a request because the conversion
+    // happens somewhere else and takes tens of seconds — the caller gets a job
+    // id and asks about it, and the browser never talks to MinerU itself.
+    if (path === "/api/research/documents/convert" && method === "POST") {
+      const query = new URLSearchParams((request.url ?? "").split("?")[1] ?? "");
+      // What the file *is* comes before whose file it is, for the same reason it
+      // does on every other upload path: a body that is too large is a different
+      // answer from a missing session, and the caller deserves the right one.
+      const reading = await readBytes(request, MAX_CONVERSION_UPLOAD_BYTES);
+      if (reading.ok !== true) {
+        sendJson(response, 413, {
+          error:
+            reading.reason === "too_large"
+              ? `文件过大（单文件上限 ${String(Math.round(MAX_CONVERSION_UPLOAD_BYTES / 1024 / 1024))} MB，MinerU Flash 模式的限制）`
+              : "请求体读取失败",
+          problems: [reading.reason === "too_large" ? "文件超过 Flash 模式的大小上限" : "请求体读取失败"],
+          code: reading.reason === "too_large" ? "conversion_file_too_large" : "conversion_file_invalid",
+          guidance: reading.reason === "too_large" ? "请压缩或拆分这份文件后再上传。" : "请重新发起这次上传。",
+        });
+        return;
+      }
+      const declared = documentScopeOf(request);
+      const scope = service.resolveDocumentScope(declared);
+      if (scope.ok !== true) {
+        sendRefusal(response, scope);
+        return;
+      }
+      const created = conversions.submit({
+        // The importer re-checks exactly what the caller declared, so the job
+        // cannot be created under one session and imported into another.
+        declarations: declared.declared ?? [],
+        sessionId: scope.sessionId,
+        taskId: scope.taskId,
+        filename: query.get("filename"),
+        bytes: reading.bytes,
+        usage: parseUsage(query.get("usage")),
+        consent: query.get("consent"),
+      });
+      if (created.ok !== true) {
+        if (isRefusal(created)) {
+          sendRefusal(response, created);
+          return;
+        }
+        sendConversionProblem(response, created);
+        return;
+      }
+      sendJson(response, 202, {
+        ok: true,
+        job: created.job,
+        note: "转换已排队：文件已保存到服务端受控目录，随后会通过官方的 mineru-open-mcp（stdio）调用 MinerU。转换期间请用这个 jobId 查询状态。",
+      });
+      return;
+    }
+
+    // GET /api/research/documents/convert/:jobId — where the conversion got to.
+    const convertJobMatch = /^\/api\/research\/documents\/convert\/([^/]+)$/.exec(path);
+    if (convertJobMatch !== null && method === "GET") {
+      const viewed = conversions.view(convertJobMatch[1] ?? "", documentScopeOf(request));
+      if (viewed.ok !== true) {
+        if (isRefusal(viewed)) {
+          sendRefusal(response, viewed);
+          return;
+        }
+        sendConversionProblem(response, viewed);
+        return;
+      }
+      sendJson(response, 200, { ok: true, job: viewed.job });
+      return;
+    }
+
+    // POST /api/research/documents/convert/:jobId/retry — try a failed one again.
+    const convertRetryMatch = /^\/api\/research\/documents\/convert\/([^/]+)\/retry$/.exec(path);
+    if (convertRetryMatch !== null && method === "POST") {
+      const body = asRecord(await readBody(request));
+      const retried = conversions.retry(convertRetryMatch[1] ?? "", documentScopeOf(request, body));
+      if (retried.ok !== true) {
+        if (isRefusal(retried)) {
+          sendRefusal(response, retried);
+          return;
+        }
+        sendConversionProblem(response, retried);
+        return;
+      }
+      sendJson(response, 202, { ok: true, job: retried.job, note: "已重新排队：这次转换会再次调用 MinerU。" });
+      return;
+    }
+
+    // GET /api/research/mineru — is the converter actually reachable?
+    //
+    // It answers with what the MCP server itself said (its name, version and
+    // tools), not with a guess from「uvx 在不在」. Asked by the workspace before
+    // it offers a conversion, and by anyone verifying this integration.
+    if (path === "/api/research/mineru" && method === "GET") {
+      const status = await conversions.readiness();
+      sendJson(response, status.ok ? 200 : 503, {
+        ok: status.ok,
+        mineru: {
+          transport: status.transport,
+          command: status.command,
+          package: status.package,
+          mode: status.mode,
+          server: status.server,
+          tools: status.tools,
+          parseDocuments: status.parseDocuments,
+          durationMs: status.durationMs,
+        },
+        limits: {
+          maxBytes: MINERU_FLASH_MAX_BYTES,
+          maxPages: MINERU_FLASH_MAX_PAGES,
+          formats: ["pdf", "docx"],
+          // The product must not be described as local parsing: this is a
+          // third-party service and the file leaves the machine.
+          online: true,
+          dataHandling: "文件会上传到 MinerU 的在线服务（mineru.net）解析；需要用户明确同意才会发起。",
+        },
+        problem: status.problem,
       });
       return;
     }

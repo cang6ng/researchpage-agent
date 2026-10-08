@@ -33,7 +33,9 @@ import { startShellServer, type ShellServer } from "@every-dagent/web/shell";
 
 import { createChannelPair } from "./channel.js";
 import { createResearchContextBuilder } from "./context-builder.js";
+import { createConversionManager, type ConversionManager } from "./conversions.js";
 import { exportTaskReportPdf } from "./export.js";
+import { mineruSettingsFrom } from "./mineru.js";
 import { createResearchRouter } from "./routes.js";
 import { createResearchRunner, type ResearchRunner } from "./runner.js";
 
@@ -71,6 +73,21 @@ export interface ResearchAppOptions {
   readonly address?: string;
   readonly port?: number;
   readonly browserPath?: string;
+  /**
+   * The converter's command line, when the caller names one.
+   *
+   * Read from the environment by default (`MINERU_MCP_COMMAND`,
+   * `MINERU_MCP_PACKAGE`, `MINERU_API_TOKEN`); a caller that supplies it here
+   * replaces those for this instance, which is how a test drives the same
+   * adapter against a server it controls.
+   */
+  readonly mineru?: {
+    readonly command?: string | null | undefined;
+    readonly args?: readonly string[] | undefined;
+    readonly packageSpec?: string | undefined;
+    readonly token?: string | undefined;
+    readonly callTimeoutMs?: number | undefined;
+  };
   readonly log?: (message: string) => void;
 }
 
@@ -82,6 +99,8 @@ export interface ResearchApp {
   readonly client: Client;
   readonly service: ResearchService;
   readonly runner: ResearchRunner;
+  /** The PDF/DOCX converter's job manager, as the routes and tests use it. */
+  readonly conversions: ConversionManager;
   readonly repository: ResearchRepository;
   close(): Promise<void>;
 }
@@ -220,10 +239,26 @@ export async function startResearchApp(options: ResearchAppOptions): Promise<Res
   });
   runner.reconcileInterrupted();
 
+  // The converter: MinerU's official MCP server, started per conversion by
+  // `uvx`, driven from this process. Its credential is read from the
+  // environment here and handed to the child process only — it never reaches a
+  // route, a record or a log line.
+  const mineru = mineruSettingsFrom(process.env, options.mineru ?? {});
+  const conversions = createConversionManager({
+    service,
+    settings: mineru,
+    workRoot: join(options.dataDir, "conversions"),
+    log,
+  });
+  log(
+    `[app] mineru: ${mineru.command === null ? "uvx 未找到（转换不可用）" : `uvx ${mineru.packageSpec}（${mineru.token === undefined ? "Flash 模式" : "已配置 API Token"}）`}`,
+  );
+
   const router = createResearchRouter(
     {
       service,
       runner,
+      conversions,
       createSession: async () => {
         const created = await client.sessions.create();
         return created.session.sessionId;
@@ -260,10 +295,14 @@ export async function startResearchApp(options: ResearchAppOptions): Promise<Res
     client,
     service,
     runner,
+    conversions,
     repository,
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
+      // Conversions first: a running one holds a child process and a work
+      // directory, and both have to be gone before the store is closed under it.
+      await conversions.shutdown();
       await runner.shutdown();
       await shell.close();
       client.disconnect();

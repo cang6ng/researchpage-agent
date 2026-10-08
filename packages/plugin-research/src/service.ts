@@ -898,6 +898,18 @@ export interface ResearchService {
   /** The library of one session the caller named. */
   documentsOf(scope: DocumentAccessRef): readonly DocumentView[] | Refusal;
   /**
+   * Which session a caller is acting for, resolved from every id it named.
+   *
+   * The document operations resolve this themselves per call; a caller that
+   * needs the answer *before* it has a document asks here. The conversion path
+   * is that caller: a job exists while the Markdown does not, and the job has to
+   * be bound to exactly the session the later import will be checked against —
+   * under the same cross-validation of conflicting claims, so that a request
+   * naming one session in the query and another in the body is refused before a
+   * file is read rather than after.
+   */
+  resolveDocumentScope(ref: DocumentAccessRef): { readonly ok: true; readonly sessionId: string; readonly taskId: string | null } | Refusal;
+  /**
    * The bounded context of documents, for a prompt or a panel.
    *
    * It is the only way document text reaches a model: an outline, a truncated
@@ -3373,6 +3385,15 @@ export function createResearchService(options: ResearchServiceOptions): Research
           ? { taskId: resolved.taskId }
           : {}),
       }).map(documentViewOfStored);
+    },
+
+    resolveDocumentScope(ref) {
+      const resolved = resolveDocumentScope(ref);
+      if (resolved.ok !== true) {
+        const missing = resolved.problems.some((problem) => problem.includes("缺少会话信息"));
+        return { ...resolved, ...(missing ? { code: "document_scope_missing" as const } : {}) };
+      }
+      return { ok: true, sessionId: resolved.sessionId, taskId: resolved.taskId };
     },
 
     documentContextOf: (scope, maxChars) =>

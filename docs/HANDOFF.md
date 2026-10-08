@@ -10,6 +10,8 @@
 
 ## Current Status（2026-10-08）
 
+- **Step 3.7C（Real MinerU MCP Conversion）已完成**：PDF 与 DOCX 现在真的能被转成 Markdown 进入文档库——服务端按需启动官方的 `mineru-open-mcp`（stdio，`uvx --from mineru-open-mcp==1.0.22`），调用 `parse_documents`，把真实返回的 Markdown 交给 `service.importConvertedDocument`（`conversion.trust = server_verified`）。真实验收：PDF 7.99 s / 804 字、DOCX 16.16 s / 665 字、一份真实 arXiv 论文（353 KB / 6 页）16.19 s / 9 148 字，全部落到文档库并可由 `read_document` 读取、`research_source` → Source → Snapshot → Evidence；一份 25 页 PDF 被 MinerU 以「page count exceeds API limit (20 pages)」拒绝，产品如实报 `flash_page_limit`。未改 Agent Core / Host / Protocol / Client、3.7A Fallback、3.7B Intent Discovery 与 provenance / Claim Contract、Report Renderer 与界面。见下「Step 3.7C」。**本轮未 Push。**
+
 - **Step 3.7B F4 短文档回归修复（Full-first / Partial-fallback）已完成**：第四次复核确认字符预算硬上限本身成立，但指出严格化带来的反向伤害——预算先为「截断说明」留位，再问要不要截断，于是「40 字正文 + 一个标题」的文档在 `maxChars=100` 时返回 38 / 35 / 34 字（默认 / 关键词 / 章节策略）并标成 `partial`，而完整结果只需 58 字。本轮只改这一个决策点：四种策略现在先算「完整答案真实需要多少字」（正文 + 目录 + 完整状态下真正会写的那句话），放得下就整篇返回、`scope=full`、不写任何截断说明；放不下才回到截断记账，并且说明不得贵过它解释的正文（不超过剩余空间的一半）。实测：`maxChars=100` 四种策略都返回全部 40 字且 `scope=full`；`58` 字（真实成本）恰好完整、`57` 字转为 partial；`0/1/10/30` 仍严格不超预算；长文档 100/200 的硬上限、partial 与原文定位均无回归；真实 runner 指令里短文整篇到达模型且不可信声明只出现一次。未放宽任何断言、未重新引入 `Math.max(200, maxChars)`。见下「Step 3.7B F4 短文档回归修复」。
 
 - **Step 3.7B F4 最终修复（`maxChars` 硬上限）已完成**：第三次复核只盯一件事——上一轮对 F4 的修复不彻底：`readDocument` 把预算强制抬高到 200（`maxChars=100` 的读取实际返回 170–199 字）、Context 块在预览之外追加了 100 字的不可信声明（`maxChars=100/200` 的块实际 200/301 字），而当时的测试断言没有覆盖这两处。本轮把口径收紧为「整份回答（正文 + 目录 + 截断提示 + 其它说明 + 分隔符）≤ 调用方给的 `maxChars`」：取消一切下限强制扩容，四种读取策略与预览 / Context 统一按「目录 → 回答自身的句子 → 正文」记账，句子放不下就用短语或整句省略（信息由 `scope` / `truncated` / `complete` / `outlineTruncated` 承载），Context 的不可信声明计入同一份 share。10 万字标题 + 10.8 万字正文实测：`maxChars=100` 时 Preview 99 / Context 99 / 四种读取 68–97 字，`maxChars=200` 时 Preview 199 / Context 200 / 读取 169–198 字（修复前为 174 / 200 / 301），原文定位与 `scope=partial` 语义不变。未改 F1/F2/F3/F5/F6、未重构文档库、未动前端 / Agent Core / Host / Protocol / Client、未进 MinerU。见下「Step 3.7B F4 最终修复」。
@@ -43,6 +45,88 @@
 - **Vertical Product 可真实演示**：Topic → Task Card → 确认 → 真实检索/读取 → Evidence Matrix → 缺口定向补查（≤2 轮）→ 结构化报告 → HTML 预览 → PDF 下载 → 刷新重开。
 - **Step 1（Research Editing Semantics）已完成**：Ask / Research / Edit 三种正式意图由应用签发 Action Grant 约束；Edit 产出待接受 Proposal；报告版本可冻结、导出只读冻结依赖包；矩阵状态不再由「有正文片段」直接升级为充分。
 - 真实 Demo 两个主题此前均通过（真实模型 + 真实 arXiv + 真实 Chrome PDF）；Step 2 后又用新版各重跑一次（见「Current Status」与「Step 2 的验证入口」）。
+
+## Step 3.7C 新增（本次工作产物）
+
+本轮只做一件事：**把官方的 MinerU MCP 真正接进产品**——PDF / DOCX → `mineru-open-mcp`（stdio）→ Markdown → 既有文档库。没有改 Agent Core / Host / Protocol / Client，没有改 3.7A 的 Fallback、3.7B 的 Intent Discovery 与 provenance / Claim Contract，没有动 Report Renderer 与任何界面（前端按钮属于 3.7D）。
+
+### 官方 MCP：装了什么、怎么起、工具到底是什么样
+
+- **包与版本**：`uvx --from mineru-open-mcp==1.0.22 mineru-open-mcp`（PyPI 上的 `mineru-open-mcp` 1.0.22，官方仓库 `opendatalab/MinerU-Ecosystem/mcp`）。版本在代码里**钉住**（`MINERU_PACKAGE`），因为工具参数、返回结构与错误行为都是按这一版写死的；`MINERU_MCP_PACKAGE` 可换，`MINERU_MCP_COMMAND` 可整条替换启动命令。每次转换启动一个 MCP 子进程（stdio），由 Node 服务端管理生命周期，转换结束即关闭。
+- **`tools/list` 的真实结果**（实测）：`parse_documents`、`get_ocr_languages`；服务端自报 `MinerU — SOTA PDF & Document Parser for AI Workflows`，版本 `4.0.11`。`parse_documents` 的实际参数：`file_sources`（必填，字符串路径/URL 或 `{source, pages}`）、`enable_ocr`、`language`（缺省 `ch`）、`model`、`output_dir`，`additionalProperties: false`。
+- **真实返回结构**（实测，不是猜的）：`{status: "success"|"partial_success"|"error", results: [{filename, status, content?, content_chars?, truncated?, extract_path?, error?}], summary, message}`。单文件调用**内联返回** Markdown；超过 20 000 字符时把完整 Markdown 写到 `output_dir/<stem>.md`，内联只给前 20 000 字符并带 `truncated: true` 与 `extract_path`。适配器因此有两条取值路径：内联（`truncated !== true`）与受控目录里的文件（`truncated === true` 或内联为空时）。
+- **失败为什么只有一句话**：`mineru-open-mcp` 把 SDK 异常吞掉后统一回「Document processing failed. Check server logs for details.」，只有**超过页数/大小上限**这类服务端拒绝会把原因写在 `results[].error` 里（实测文案：`file page count exceeds API limit (20 pages), please input page_range to specify the page range`），其余原因只出现在它自己的 stderr 上。适配器同时读这两处（工具自己的那句话 + 被扣留的 stderr 尾巴），按已知规则分类；**认不出来的一律回 `conversion_failed` 并原文附上，不猜原因**。三种「没有结果」彼此可分：调用方中止（`conversion_cancelled`）、超过本次调用自己的超时（`conversion_timeout`，并写明秒数）、连接真的断了（`mcp_disconnected`）。
+
+### 转换是一条真实链路（`mineru.ts` / `conversions.ts` / `routes.ts`）
+
+- **上传**：`POST /api/research/documents/convert?filename=&sessionId|intentId|taskId=&usage=&consent=`，body 就是二进制文件。扩展名只接受 `.pdf` / `.docx`，并且校验**内容**（PDF 必须以 `%PDF-` 开头；DOCX 必须是 ZIP 且含 `word/document.xml`），大小上限是 Flash 的 10 MB（传输层与转换层各判一次，超限 413 `conversion_file_too_large`）。文件名必须是纯文件名（路径、盘符、控制字符、`~` 一律拒绝），**服务端从不使用客户端给的路径**：源文件写到 `<dataDir>/conversions/<jobId>/source.<format>`，真正传给 MCP 的是这个绝对路径（离线 fixture 里由测试 MCP 回显验证过）。
+- **同意是用户给的**：请求里必须带 `consent: "third_party_upload"`，否则 400 `conversion_required`（实测：把转换器命令换成一个不存在的程序，缺同意时收到的仍是同意拒绝而不是启动失败——同意检查发生在任何进程启动之前）。缺省值、环境变量、模型都不能代替它。响应与文档记录都写明「文件会上传到 MinerU 的在线服务（mineru.net）解析」，不把在线解析说成本地解析。
+- **任务而不是请求**：`queued → converting → importing → succeeded | failed`，同时只跑 1 个（Flash 有频率限制），队列上限 4（再多回 429 `busy`），单任务最多 3 次尝试，单次调用超时 360 s（比 SDK 自己的 300 s 轮询超时更长，好让服务端先给出超时原因），`MINERU_TIMEOUT_MS` 可调。查询 `GET /api/research/documents/convert/:jobId`（跨会话 403，无会话 400，未知/进程重启后 404 并说明任务只活在进程内），失败可 `POST .../retry`（受控：状态必须是 failed、次数没到上限、源文件还在，否则 409 `job_not_retryable`）。
+- **工作目录的生命周期**：成功 → 整个目录删除；失败 → 删除转换器写下的产物，**只在还能重试时保留源文件**（最多 8 个失败任务，更早的被淘汰），进程关闭时全部删除。这是本轮对「失败也要清理」唯一的有意例外，因为重试需要那份字节；重试若不可能（次数用尽/文件已被清理/进程重启），接口如实说 `retryable: false` 或 `file_gone`，而不是给一个只会道歉的按钮。
+- **进入文档库的路径只有一条**：转换结果交给 `service.importConvertedDocument(input)`（进程内、HTTP 不可达），因此 `conversion.trust = server_verified`；`provider=mineru`、`version=1.0.22`、`originalFilename`、`originalFormat`、`status=succeeded`、`convertedAt`（服务端自己的时间）、`sourceRef=mineru-open-mcp parse_documents job=<jobId>`。公开的 `POST /documents/import` 依旧只写 `client_claimed`，一个字都没放松。
+- **页码仍然不伪造**：Flash 的 `parse_documents` 只回 Markdown，没有任何分页信息，所以本轮**一律不写 pageMap**（`pageMap: null`），读取时每个片段 `page` 都是 `null`。没有按段落顺序推算页码。
+
+### 环境：代理、凭据与 Windows
+
+- **凭据只在服务端**：`MINERU_API_TOKEN` 由服务端进程读取，只传给 MCP 子进程（`mineruChildEnvironment` 用的是 SDK 的 `getDefaultEnvironment()` 白名单 + 我们显式加的几个变量），**不进 HTTP 响应、不进文档记录、不进日志、不进 Git**；`GET /api/research/mineru` 只暴露 `mode: "flash" | "token"`。失败详情在离开进程前会做一次 token 抹除并截断到 2 000 字符。
+- **代理是本机实测出来的坑**：Python 的 httpx 会连同 Windows 注册表里的系统代理一起使用，而本机那个代理（`127.0.0.1:7897`）**能连上 mineru.net、却把 Markdown 下载打断**（`httpx.ConnectError: EOF occurred in violation of protocol`，真实失败一次）。同一时刻直连 `mineru.net` 与 `cdn-mineru.openxlab.org.cn` 都正常。因此子进程默认**禁用代理**（`NO_PROXY=*`，httpx 会因此连注册表代理一起忽略），需要代理的机器用 `MINERU_MCP_PROXY` 显式指定——这是唯一一种会相信代理的情况。
+- **Windows 使用说明**见 [MINERU_WINDOWS.md](./MINERU_WINDOWS.md)（uv/uvx 准备、启动命令、Flash 模式、可选 Token、如何验证连接与真实转换、第三方传输说明）。
+
+### API 一览（本轮新增）
+
+| 方法与路径 | 作用 |
+| --- | --- |
+| `POST /api/research/documents/convert?filename=&sessionId\|intentId\|taskId=&usage=&consent=third_party_upload` | 二进制 PDF/DOCX → 转换任务（202 + `job`）；缺同意 400、格式不支持 415、内容与扩展名不符 400、超限 413、排队满 429 |
+| `GET /api/research/documents/convert/:jobId?sessionId=…` | 任务状态：`queued/converting/importing/succeeded/failed`、`document.documentId`、`conversion.trust`、`toolCall`（真实工具、耗时、字数、是否从文件读取）、`failure`、`retryable`、`limits` |
+| `POST /api/research/documents/convert/:jobId/retry` | 受控重试（失败且未超次数）；否则 409 |
+| `GET /api/research/mineru` | 转换器是否真的可用：MCP 服务名/版本、`tools`、`parseDocuments`、`mode`、Flash 限制与「在线解析、会上传第三方」的说明 |
+
+### 后端改动清单
+
+| 位置 | 改动 |
+| --- | --- |
+| `apps/research/src/server/mineru.ts`（新） | `MineruSettings` / `mineruSettingsFrom`（含 `MINERU_MCP_COMMAND` 的整条命令替换）、`findUvx`、`mineruChildEnvironment`（白名单环境 + Token + 代理策略）、`probeMineru`（connect → `tools/list`）、`convertWithMineru`（调用 → 解析真实返回 → 内联/受控文件两条取值路径 → 大小与空内容判定）、`classifyFailure`（工具自己的错误 + stderr 分类）、`readSavedMarkdown`（只读受控目录内、realpath 复核、`.md`、fatal UTF-8、512 KiB 上限） |
+| `apps/research/src/server/conversions.ts`（新） | `createConversionManager`：单车道队列、`MAX_ATTEMPTS=3`、失败后保留源文件的有界策略与淘汰、任务视图、跨会话拒绝、`retry`、`shutdown`（中止在跑的任务并删除所有工作目录）、`readyness` 探测缓存、失败详情的 token 抹除与截断 |
+| `apps/research/src/server/routes.ts` | 四条新路由、`MAX_CONVERSION_UPLOAD_BYTES`、`sendConversionProblem`（kind → 状态码）、`parseUsage`、`isRefusal`，`conversions` 进入 `ResearchRoutesOptions` |
+| `apps/research/src/server/composition.ts` | 读取 MinerU 设置、建立转换管理器（工作目录 `<dataDir>/conversions`）、启动日志说明转换器状态、关闭时先 `conversions.shutdown()`；新增仅供调用方/测试覆盖转换器命令的 `mineru` 选项 |
+| `packages/plugin-research/src/service.ts` | `ResearchService.resolveDocumentScope(ref)`（把既有的作用域交叉验证暴露成一个只读入口，供转换任务在拿到文档之前绑定会话；没有改动验证规则本身） |
+| `apps/research/scripts/*` / `tests/fixtures/conversion/*` | 转换验收材料：`conversion-sample.pdf`（由产品自己的 Chrome 打印机打印）与 `conversion-sample.docx`（python-docx 写的真实 OOXML，含标题、段落与表格），生成方式见 `tests/conversion-fixtures.test.ts`（`RESEARCHPAGE_MAKE_FIXTURES=1` 时才运行） |
+
+未改动：Agent Core / Host / Protocol / Client、3.7A 的 Search Fallback / Retry / Circuit Breaker、3.7B 的 Intent Discovery、文档库的作用域与 provenance 规则、Evidence Truth Contract、Claim Validator、PDF Renderer、Artifact Blueprint、Report Proposal、前端。
+
+### 测试（本轮新增）
+
+- `apps/research/tests/conversion-api.test.ts`（25 例，离线，脚本化 MCP 服务 `tests/helpers/fake-mineru-mcp.mjs`）：缺同意（且**在任何进程启动之前**就拒绝）、格式不支持 415、内容与扩展名不符、路径穿越、超过 Flash 上限 413、缺会话 400、两个作用域冲突 403、**绑定到意图**（上传在任务之前：转换成功即成为该探索的附件）；成功链路（任务状态、真实工具调用记录、`server_verified`、`pageMap` 为 null、文档进入同一库、无页码读取、工作目录被删除、任务跨会话 403/无会话 400/未知 404、`GET /mineru` 的 readiness）；**转换器拒绝**：页数上限（原因只写在工具自己的 error 里）、认不出原因时如实回 `conversion_failed`、限流、网络、空 Markdown、超过文档库上限（`document_too_large`，且没有留下半份文档）、`extract_path` 在受控目录外（`output_outside_workdir`）、没有 uvx（`mcp_not_installed`）、服务没有 `parse_documents`（`mcp_tools_missing`）、握手前就退出（`mcp_handshake_failed`，带它自己的临终信息）、**超时与断连是两种答案**（12 秒超时 → `conversion_timeout` 并写明秒数，而不是「连接中断」）、先失败后成功的有界重试与次数用尽 409、跨会话重试 403、单车道队列（第二个任务在排队）；以及「转换后的文档和普通文档一样」：`read_document` 工具（带不可信声明、预算 400 内、页码 null、跨会话读取被拒）、转成来源后 `role=user-provided`、快照正文就是转换文本、每条 excerpt 都是快照的子串。
+- `apps/research/tests/conversion-smoke.test.ts`（7 例，**真实 MinerU**，`RESEARCHPAGE_REAL_MINERU=1` 时才跑）：readiness（服务名/版本/工具/mode/在线声明）、真实 PDF、真实 DOCX、真实 arXiv 论文（可选 `RESEARCHPAGE_SMOKE_EXTRA_PDF`）、真实 25 页 PDF 触发 Flash 页数上限、`read_document` 读取转换后的文档、转换 → 来源 → 快照/证据。
+
+### 实测（2026-10-08，Flash 模式，无 Token）
+
+同一次完整验收的记录（`documentId` 属于那一次运行：每次运行都会新建数据目录）。同一个材料在一小时内重复跑过一次，工具调用耗时在 6.7–15.0 s 之间波动（服务端排队影响），结论不变。
+
+| 材料 | 大小 | 工具调用 | 任务总耗时 | Markdown | documentId | 结果 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `conversion-sample.pdf`（Chrome 打印，中文/英文 + 表格） | 88 023 B | 6 946 ms | 7 990 ms | 804 字 | `doc_f3d434da9c144a0a` | succeeded |
+| `conversion-sample.docx`（python-docx，标题/段落/表格） | 37 303 B | 15 023 ms | 16 156 ms | 665 字 | `doc_8eb9183ff22571e4` | succeeded |
+| 真实 arXiv 论文 `lora.pdf`（6 页） | 352 913 B | — | 16 190 ms | 9 148 字 | `doc_e7d405edf4c47e80` | succeeded |
+| 25 页 PDF（超过 Flash 20 页上限） | 94 638 B | 2 622 ms | 3 765 ms | — | — | failed / `flash_page_limit` |
+
+- `read_document` 读取转换后的 PDF：预算 1 200 字，返回 722 字、`scope=partial`、4 个片段，每个 `page` 都是 `null`。
+- 转换 → `research_source` → Source：`role=user-provided`；`read_source` 后快照 728 字、2 条证据，每条 excerpt 都是快照的精确子串（`task_56434529ddb76c2e`）。
+- 转换后的 Markdown 保留了 MinerU 的原始形态（`#`/`##` 标题、`<table>…</table>` 表格），产品原样保存，不做二次改写。
+
+### 已知边界与诚实说明
+
+- **转换任务只活在进程内**：任务记录不落库（重启后 `job_not_found`，并给出「重新上传」的说明），已经进入文档库的文档不受影响。真正持久的事实是文档与它的 `conversion` 记录。
+- **活动的记录方式**：项目活动日志（`ResearchActivityEvent`）的词汇表是研究阶段的事件（检索、读取、评估…），本轮没有往里加转换类事件——那会牵到 presentation 层（3.7D 的界面词汇），而转换发生在一个还没有任务卡的阶段（意图探索）。转换的可见记录是**任务视图**（状态、真实工具调用、耗时、字数、失败原因）与**文档记录**（`conversion` 元信息）；服务端日志另外打印一行摘要。
+- **失败后保留源文件是有意的例外**：只在还能重试且未超过 8 个失败任务时保留，成功/淘汰/关闭都会删除；见上「工作目录的生命周期」。
+- **没有 pageMap**：Flash 的 `parse_documents` 不返回分页信息，因此没有页码可给；这比给一个按段落猜出来的页码安全。带 Token 的精确模式若将来返回分页信息，需要先确认其坐标含义再接入。
+- **图片不承诺可显示**：MinerU 的 Markdown 里保留图片链接，但资源没有被保存和关联，产品不承诺图片能显示，也没有编造图片路径或 OCR 置信度。
+- **HTML 未开放**：本轮只支持 PDF / DOCX，`.html` 明确回 415；官方文档提到 `model: "html"` 是针对网页 URL 的，本轮没有实测，因此不作为承诺。
+- **没有认证系统**：转换任务与文档一样，`sessionId` 就是 bearer capability；本轮保证的是作用域一致（跨会话任务不可查、不可重试、不可导入）。
+
+### Next Action
+
+**STEP 3.7D — 前端接入（GLM）**。后端已经就绪：`GET /api/research/mineru` 回答转换器是否可用与限制，`POST /api/research/documents/convert` 接收文件并返回 jobId，`GET /api/research/documents/convert/:jobId` 给状态与 documentId。前端需要做的是：上传入口（**必须显示「文件会上传到 MinerU 在线服务解析」并让用户明确同意**，同意与否由用户点击决定）、任务进度与失败原因、失败后的重试按钮（`retryable === false` 时不要显示）。不要在前端直连 MinerU，也不要让模型替用户同意。
 
 ## Step 3.7B Repair（独立复核的六项修复）
 
