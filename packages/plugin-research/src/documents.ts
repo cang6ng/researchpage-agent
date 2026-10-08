@@ -494,23 +494,54 @@ export interface DocumentOutlineReading {
   readonly truncated: boolean;
 }
 
+/** The fewest characters a clipped label is still worth showing as. */
+const MIN_CLIPPED_HEADING_CHARS = 8;
+
+/**
+ * One heading, shortened to what the budget can hold.
+ *
+ * Only the label is shortened, and only for the entry that would otherwise take
+ * the whole budget — its ranges still point at the heading's own line in the
+ * stored Markdown, exactly as they do for a label the parse already clipped at
+ * its own limit. `null` means the room left is not enough for a label at all, and
+ * the entry is left out rather than shown as a bare ellipsis.
+ */
+function clipHeading(heading: DocumentHeading, maxChars: number): DocumentHeading | null {
+  const room = maxChars - heading.level - 1;
+  if (room < MIN_CLIPPED_HEADING_CHARS) return null;
+  if (heading.text.length <= room) return heading;
+  return { ...heading, text: `${heading.text.slice(0, room - 1)}…` };
+}
+
 /**
  * Bounds an outline by the characters it costs.
  *
- * The first heading is always kept, so a document whose single label is longer
- * than the whole budget still answers「它有什么章节」with its first one; after
- * that, an entry is only added when it fits. `total` travels with the list
- * because「共 2 个标题」and「共 2000 个标题（只列出前 12 个）」are different
- * statements, and a reader may only make the true one.
+ * Every entry obeys the budget, the first one included: a document whose single
+ * label is 100 000 characters long must not be able to answer a 200-character
+ * preview with 203 characters of table of contents. The first entry gets the room
+ * that is left rather than a free pass — a clipped label still says which section
+ * it is — and when there is no room even for that, it is left out. `total`
+ * travels with the list because「共 2 个标题」and「共 2000 个标题（只列出前 12 个）」
+ * are different statements, and a reader may only make the true one.
  */
 export function boundedOutline(outline: readonly DocumentHeading[], maxChars: number): DocumentOutlineReading {
   const headings: DocumentHeading[] = [];
   let chars = 0;
   for (const heading of outline) {
     const cost = outlineEntryChars(heading);
-    if (headings.length > 0 && chars + cost > maxChars) break;
-    headings.push(heading);
-    chars += cost;
+    if (chars + cost <= maxChars) {
+      headings.push(heading);
+      chars += cost;
+      continue;
+    }
+    if (headings.length === 0) {
+      const fitted = clipHeading(heading, maxChars);
+      if (fitted !== null) {
+        headings.push(fitted);
+        chars += outlineEntryChars(fitted);
+      }
+    }
+    break;
   }
   return { headings, chars, total: outline.length, truncated: headings.length < outline.length };
 }
@@ -518,7 +549,59 @@ export function boundedOutline(outline: readonly DocumentHeading[], maxChars: nu
 /** The sentence that keeps a truncated outline from reading as the whole one. */
 export function outlineNote(outline: DocumentOutlineReading): string {
   if (!outline.truncated) return `目录共 ${outline.total} 个标题`;
-  return `目录过长：共 ${outline.total} 个标题，这里只列出前 ${outline.headings.length} 个（其余未列出）`;
+  return outlineSentence(outline.total, outline.headings.length);
+}
+
+/** The truncation sentence, from its two numbers, so its cost can be known before it is written. */
+function outlineSentence(total: number, shown: number): string {
+  return `目录过长：共 ${total} 个标题，这里只列出前 ${shown} 个（其余未列出）`;
+}
+
+/**
+ * The most the truncation sentence can cost for an outline this size.
+ *
+ * Reserved before the outline is bounded: the sentence is part of the answer the
+ * caller asked to be bounded, so the room it needs is taken out of the budget
+ * first. `shown` never exceeds `total`, so the longest form is the one written
+ * with the same number.
+ */
+function outlineSentenceRoom(total: number): number {
+  return outlineSentence(total, total).length;
+}
+
+/** The sentence that says how much of the text this answer carries. */
+function readSentence(readChars: number, totalChars: number, opening: boolean): string {
+  return opening
+    ? `只读取了开头的 ${readChars} 字，共 ${totalChars} 字（部分读取，未读完整篇）`
+    : `只读取了 ${readChars} 字，共 ${totalChars} 字（部分读取，未读完整篇）`;
+}
+
+/** The sentence that says the answer really is the whole text. */
+function wholeSentence(totalChars: number): string {
+  return `已读取全文（${totalChars} 字）`;
+}
+
+/**
+ * The room a read's own sentences need, before any content is fitted.
+ *
+ * Every bounded answer in this file ends with sentences that say what it holds
+ * and what it left out. They are part of the answer — a 400-character preview
+ * that carries 400 characters of text and then appends a sentence about the
+ * outline has answered more than 400 — so their room is paid for first, and it is
+ * computed from counts, never from the document's own text, which is what keeps
+ * it bounded however long the document is.
+ *
+ * The longer of the two wordings is reserved (「只读取了…」rather than「已读取
+ * 全文」), and `readChars` is bounded by the budget itself: slack is safe,
+ * overflow is not.
+ */
+function sentencesRoom(askChars: number, totalChars: number, opening: boolean, outlineTotal: number, outlineFits: boolean): number {
+  const status = readSentence(askChars, totalChars, opening).length;
+  // The sentence about the outline is only paid for when the outline really can
+  // be cut — which is knowable here: it is cut when it does not fit its share,
+  // and with a single heading there is nothing to drop.
+  const outline = outlineTotal > 1 && !outlineFits ? outlineSentenceRoom(outlineTotal) : 0;
+  return status + outline;
 }
 
 /** How much of a document a bounded preview returned, in the product's words. */
@@ -542,11 +625,12 @@ export interface DocumentPreview {
 /**
  * A bounded preview: the opening of the document, its outline, and a count.
  *
- * `maxChars` is the budget for the whole answer — the opening *and* the outline
- * together, exactly as a read's budget is. The outline takes at most a third of
- * it, and what the outline costs is what the text gets less of, so a caller that
- * asks for a small preview gets a small preview however many headings the
- * document has.
+ * `maxChars` is the budget for the whole answer — the opening, the outline, and
+ * the sentences that say what the answer holds — exactly as a read's budget is.
+ * The outline takes at most a third of what the sentences leave, and what the
+ * outline costs is what the text gets less of, so a caller that asks for a small
+ * preview gets a small preview however many headings the document has, and
+ * whatever its labels are made of.
  *
  * `complete` is the field the rest of the product reads, and it is true only
  * when every character of the stored text is in `text`. A preview that was cut
@@ -562,14 +646,21 @@ export function documentPreview(input: {
   /** The characters the outline may cost at most; it is part of the same budget. */
   readonly outlineChars?: number;
 }): DocumentPreview {
-  const maxChars = input.maxChars ?? MAX_DOCUMENT_PREVIEW_CHARS;
+  const maxChars = Math.max(0, input.maxChars ?? MAX_DOCUMENT_PREVIEW_CHARS);
+  const text = input.parsed.text;
+  const outlineCap = input.outlineChars ?? MAX_DOCUMENT_OUTLINE_CHARS;
   // A preview is for the opening of the text: a document whose labels are longer
   // than its prose must not be「read」as a table of contents.
-  const outlineBudget = Math.max(0, Math.min(input.outlineChars ?? MAX_DOCUMENT_OUTLINE_CHARS, Math.floor(maxChars / 3)));
-  const outline = boundedOutline(input.parsed.outline, outlineBudget);
-  // What the outline cost is what the text no longer has: one budget, two parts.
-  const textBudget = Math.max(0, maxChars - outline.chars);
-  const text = input.parsed.text;
+  const share = (room: number): number => Math.min(outlineCap, Math.floor(Math.max(0, room) / 3));
+  const outlineCost = input.parsed.outline.reduce((sum, heading) => sum + outlineEntryChars(heading), 0);
+  const noteRoom = Math.min(
+    maxChars,
+    sentencesRoom(maxChars, text.length, true, input.parsed.outline.length, outlineCost <= share(maxChars)),
+  );
+  const outline = boundedOutline(input.parsed.outline, share(maxChars - noteRoom));
+  // What the outline and the sentences cost is what the text no longer has: one
+  // budget, three parts, and the text is the part that gives way.
+  const textBudget = Math.max(0, maxChars - noteRoom - outline.chars);
   const slice = text.length <= textBudget ? text : text.slice(0, textBudget);
   const complete = slice.length === text.length;
   return {
@@ -585,9 +676,7 @@ export function documentPreview(input: {
     outlineTotal: outline.total,
     outlineTruncated: outline.truncated,
     note: [
-      complete
-        ? `已读取全文（${text.length} 字）`
-        : `只读取了开头的 ${slice.length} 字，共 ${text.length} 字（部分读取，未读完整篇）`,
+      complete ? wholeSentence(text.length) : readSentence(slice.length, text.length, true),
       ...(outline.truncated ? [outlineNote(outline)] : []),
     ].join("；"),
   };
@@ -687,11 +776,12 @@ function sectionOwner(outline: readonly DocumentHeading[], charIndex: number): D
  * field says whether the whole document was returned or only a part of it.
  *
  * The bound is on the *answer*, not on the paragraphs it quotes: `maxChars`
- * covers the fragments and the outline together, and a paragraph longer than
- * what is left is cut at a real position in the user's text (never padded, never
- * merged) and marked `truncated`. That is the whole reason this function exists
- * in the library rather than in the caller: a 100,000-character paragraph must
- * not be able to answer a 400-character request with all of itself.
+ * covers the fragments, the outline and the sentences that explain them together,
+ * and a paragraph longer than what is left is cut at a real position in the
+ * user's text (never padded, never merged) and marked `truncated`. That is the
+ * whole reason this function exists in the library rather than in the caller: a
+ * 100,000-character paragraph must not be able to answer a 400-character request
+ * with all of itself, and neither must a 100,000-character heading.
  */
 export function readDocument(input: {
   readonly documentId: string;
@@ -702,11 +792,17 @@ export function readDocument(input: {
   readonly conversion?: DocumentConversion | null;
 }): DocumentReadResult {
   const conversion = input.conversion ?? null;
-  const maxChars = Math.max(200, input.request.maxChars ?? MAX_DOCUMENT_EXCERPT_CHARS);
-  const outline = boundedOutline(input.parsed.outline, Math.max(0, Math.min(MAX_DOCUMENT_OUTLINE_CHARS, Math.floor(maxChars / 3))));
-  // What is left for the text, once the outline has taken its share of the same
-  // budget. Both are part of the answer the caller asked to be bounded.
-  const textBudget = Math.max(0, maxChars - outline.chars);
+  const asked = Math.max(200, input.request.maxChars ?? MAX_DOCUMENT_EXCERPT_CHARS);
+  const outlineCap = Math.max(0, Math.min(MAX_DOCUMENT_OUTLINE_CHARS, Math.floor(asked / 3)));
+  const outlineCost = input.parsed.outline.reduce((sum, heading) => sum + outlineEntryChars(heading), 0);
+  // The answer's own sentences are paid for first, from counts rather than from
+  // the document's text, so what is left for the fragments and the outline is
+  // known before either is chosen.
+  const noteRoom = Math.min(
+    asked,
+    sentencesRoom(asked, input.parsed.text.length, false, input.parsed.outline.length, outlineCost <= outlineCap),
+  );
+  const outline = boundedOutline(input.parsed.outline, Math.max(0, Math.min(MAX_DOCUMENT_OUTLINE_CHARS, Math.floor((asked - noteRoom) / 3))));
   const paragraphs = input.parsed.paragraphs;
   const base = {
     documentId: input.documentId,
@@ -764,21 +860,29 @@ export function readDocument(input: {
       fragments,
       truncated: !whole,
       note: [
-        whole
-          ? `已读取全文（${input.parsed.text.length} 字）`
-          : `只读取了 ${readChars} 字，共 ${input.parsed.text.length} 字（部分读取，未读完整篇）`,
+        whole ? wholeSentence(input.parsed.text.length) : readSentence(readChars, input.parsed.text.length, false),
         ...(note.length === 0 ? [] : [note]),
         ...(outline.truncated ? [outlineNote(outline)] : []),
       ].join("；"),
     };
   };
 
+  /**
+   * What the fragments may cost, once the outline and the sentences are paid for.
+   *
+   * `strategyRoom` is the room the sentence this strategy writes needs, sized
+   * from the counts the strategy has already settled on — so it is known before
+   * the fit rather than after it, and the answer cannot end up over budget
+   * because a sentence turned out longer than expected.
+   */
+  const contentBudget = (strategyRoom: number): number => Math.max(0, asked - noteRoom - strategyRoom - outline.chars);
+
   /** Paragraphs are added while they fit whole; the first one may be clipped. */
-  const fit = (candidates: readonly Paragraph[], windowOf: (paragraph: Paragraph) => number): readonly DocumentFragment[] => {
+  const fit = (candidates: readonly Paragraph[], windowOf: (paragraph: Paragraph) => number, budget: number): readonly DocumentFragment[] => {
     const kept: DocumentFragment[] = [];
     let used = 0;
     for (const paragraph of candidates) {
-      const remaining = textBudget - used;
+      const remaining = budget - used;
       if (remaining <= 0) break;
       if (paragraph.text.length > remaining) {
         // A paragraph that does not fit is only ever the *first* fragment: it is
@@ -791,7 +895,7 @@ export function readDocument(input: {
       }
       kept.push(fragmentOf(paragraph));
       used += paragraph.text.length;
-      if (used >= textBudget) break;
+      if (used >= budget) break;
     }
     return kept;
   };
@@ -799,7 +903,17 @@ export function readDocument(input: {
   if (input.request.paragraphIndex !== undefined) {
     const paragraph = paragraphs.find((candidate) => candidate.index === input.request.paragraphIndex);
     if (paragraph === undefined) return settle("paragraph", [], "");
-    const fragments = fit([paragraph], () => 0);
+    // The sentence is written from the paragraph and the budget rather than from
+    // the fragment, so its room is exact and its numbers are upper bounds: the
+    // paragraph is longer than the most the text could get, so it will be cut.
+    const most = Math.max(0, asked - noteRoom - outline.chars);
+    const clipped = paragraph.text.length > most;
+    const returned = Math.min(paragraph.text.length, most);
+    const from = sourceOffsetOf(paragraph);
+    const sentenceRoom = clipped
+      ? `这个段落较长（${paragraph.text.length} 字），只返回了它在原文 ${from}–${from + returned} 位置的 ${returned} 字`.length
+      : 0;
+    const fragments = fit([paragraph], () => 0, contentBudget(sentenceRoom));
     const first = fragments[0];
     return settle(
       "paragraph",
@@ -816,13 +930,13 @@ export function readDocument(input: {
     const inside = paragraphs.filter(
       (paragraph) => paragraph.charStart >= heading.charStart && paragraph.charEnd <= Math.max(heading.charEnd, heading.charStart),
     );
-    const fragments = fit(inside.slice(0, MAX_DOCUMENT_FRAGMENTS), () => 0);
+    const offered = inside.slice(0, MAX_DOCUMENT_FRAGMENTS);
+    const sentenceRoom = `这一节有 ${inside.length} 段，本次只返回了前 ${offered.length} 段（受字符上限限制）`.length;
+    const fragments = fit(offered, () => 0, contentBudget(sentenceRoom));
     return settle(
       "section",
       fragments,
-      fragments.length < inside.slice(0, MAX_DOCUMENT_FRAGMENTS).length
-        ? `这一节有 ${inside.length} 段，本次只返回了前 ${fragments.length} 段（受字符上限限制）`
-        : "",
+      fragments.length < offered.length ? `这一节有 ${inside.length} 段，本次只返回了前 ${fragments.length} 段（受字符上限限制）` : "",
     );
   }
 
@@ -879,7 +993,8 @@ export function readDocument(input: {
       spread.push(paragraph);
       if (spread.length >= MAX_DOCUMENT_FRAGMENTS) break;
     }
-    const fragments = fit(spread, () => 0);
+    const sentenceRoom = `本次只返回了 ${spread.length} 段（共 ${paragraphs.length} 段，受字符上限限制）`.length;
+    const fragments = fit(spread, () => 0, contentBudget(sentenceRoom));
     return settle(
       "spread",
       fragments,
@@ -887,7 +1002,8 @@ export function readDocument(input: {
     );
   }
 
-  const fragments = fit(picked, matchWindow);
+  const sentenceRoom = `匹配到 ${picked.length} 段，本次只返回了前 ${picked.length} 段（受字符上限限制）`.length;
+  const fragments = fit(picked, matchWindow, contentBudget(sentenceRoom));
   return settle(
     "match",
     fragments,

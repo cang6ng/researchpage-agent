@@ -10,6 +10,8 @@
 
 ## Current Status（2026-10-08）
 
+- **Step 3.7B 收尾修复（复核剩余三项）已完成**：第二次复核在 3.7B Repair 之后又证实三项，本轮只关这三项——`GET /documents?sessionId=B&intentId=<A 的探索>` 会返回 A 的文档、`POST /documents/<A 的文档>/source?sessionId=B`（body 带 A 的 `taskId`）会成功建立来源（多作用域声明只被读取一项）；10 万字标题让 `maxChars=100/200` 的目录返回 208 字而正文拿到 0 字（`boundedOutline` 的第一条不受预算约束）；`POST /intents` 附带超过 512 KiB 的 Markdown 返回 400 而不是 413（服务层算出的 `document_too_large` 在路由处被丢掉）。分别按「所有入口统一收集全部作用域声明并交叉验证，冲突即 403」/「第一条目录同样遵守预算，且回答自身的句子计入预算」/「用同一个 `sendRefusal` 映射，拒绝不留半成品」修完，并新增 8 个反例测试（Service + 真实 HTTP + 真实任务）。未重写文档库、未改 Intent Discovery、未进 MinerU、未动前端。见下「Step 3.7B 收尾修复」。
+
 - **Step 3.7B Repair（独立复核的六项修复）已完成**：复核证实 3.7B 的文档库有两个 BLOCKER（任意 sessionId 即可读写删别人的文档；`role` 参数可把用户文档标成 official / primary）、三个 MAJOR（客户端可自报 MinerU 转换并获得看似可信的来源记录；单段 10 万字可绕过 `maxChars`、2 000 标题的目录可塞进 Context；JSON 上传被 32 KiB 限制挡住、非法 UTF-8 被静默替换）、一个 MINOR（pageMap 与读取用了两套字符坐标，页码错位），全部按服务层统一作用域校验 / 来源身份锁定 / 转换可信等级与内部可信写入路径 / 读取与目录硬上限 / 统一内容限制与 fatal UTF-8 / Markdown 坐标契约修完，并用 26 个反例测试（Service + 真实工具 + 真实 HTTP + runner）与既有 3.7B 测试一起验证。未改语义、未进 MinerU 开发、未动前端。见下「Step 3.7B Repair」。
 
 - **Step 3.7B（Intent Discovery & Unified Markdown Documents）已完成**：修掉了「用户输入 Transformer → 模型自己指定完整研究题目 → 再让用户补信息」这个错误流程——正式研究主题现在必须由用户在意图探索里确认（`IntentDraft` 是独立持久化的事实来源，`confirmedDirection` 只能由用户动作写入，模型没有任何工具能替用户确认），并且用户在研究全流程都能上传 Markdown（同一套文档库、有界读取、明确区分 Intent Context 与 Research Source，后者走既有 Source → Snapshot → Evidence 通道并保留 `user-provided` 身份）。没有重写 Agent Core / Host / Protocol / Client，没有装 MinerU / MCP，没有解析 PDF / DOCX，没有重做前端（首页与上传按钮属于 GLM 的下一轮；旧 `POST /api/research/tasks` 作为兼容入口保留并自我声明）。见下「Step 3.7B」。
@@ -106,6 +108,47 @@
 - **转换可信等级只有两档**：`client_claimed` / `server_verified`；校验「转换结果与原文一致」需要 3.7C 真的接上 MinerU 之后才能做，本轮不做。
 - **`pageMap` 是转换器的责任**：服务端只验证区间合法，无法判断页码是否与 PDF 真实分页一致；没有映射时一律 `null`。
 
+## Step 3.7B 收尾修复（复核剩余三项）
+
+第二次独立复核在 3.7B Repair 之后又证实三项，本轮只关这三项：作用域冲突未被交叉验证、首条目录突破 `maxChars`、随主题提交的超大附件返回 400 而不是 413。没有重写文档库、没有改 Intent Discovery、没有动 Agent Core / Host / Protocol / Client、没有进 MinerU、没有改前端。
+
+### 1. 冲突作用域必须交叉验证，不能被忽略
+
+- **根因**：`GET /documents` 看到 `intentId` 就短路返回该探索的文档（`?sessionId=B&intentId=<A 的探索>` 于是读到 A 的文档）；`POST /documents/:id/source` 只从 body 取 `taskId`，把 query 里的 `sessionId` 直接丢掉。凡是「多个作用域声明只读其中一项」的入口，冲突声明就被静默忽略。
+- **修复**：HTTP 入口统一由 `documentScopeOf(request, body)` 收集**所有**位置（query 与 JSON body）出现的 `sessionId / intentId / taskId`，作为 `DocumentScopeDeclaration[]` 交给服务层；`resolveDocumentScope` 把**每一条**声明解析成它所属的会话（`intentId` / `taskId` 查库，`sessionId` 按 bearer 取用），任意两条指向不同会话即拒绝（`403 document_scope_conflict`），**不执行其中任何一条**。上传 / 导入 / 列表 / 查看 / 内容 / 读取 / 改用途 / 删除 / 关联 / 转来源全部走这一条路径，路由里不再有「只读一个字段」的分支。
+- **列表语义**：列表按解析后的作用域回答——只带 `intentId` 得到该探索所属会话的文档库，只带 `taskId` 得到该任务的文档；按 `intentId` 短路的旧分支已删除。
+- **边界不变**：仍然没有认证系统，`sessionId` 依旧是 bearer capability；本轮只是让「一个请求只能说一个会话，说了两个就拒绝」，并且从目标文档反推调用者身份这条路径仍然不存在。
+
+### 2. 首条目录同样遵守预算，回答自身的句子也算在预算里
+
+- **根因**：`boundedOutline` 只对**第二条起**的条目做预算检查（`headings.length > 0 && chars + cost > maxChars`），第一条无条件放行——10 万字标题被解析裁到 200 字 + `…` 后仍是 203 字成本；`maxChars=100 / 200` 时目录返回 208 字、正文拿到 0 字。此外，回答自身的句子（「只读取了…」「目录过长…」「本次只返回了前 N 段」）从不占预算。
+- **修复**：第一条也按剩余预算裁剪（`clipHeading`，放不下一个像样的标签就整条省略，`MIN_CLIPPED_HEADING_CHARS = 8`），`boundedOutline` 的 `chars` 永不超过 `maxChars`；被裁剪的标题仍然保留它在 Markdown 中的**完整**区间（`titleStart/titleEnd` 指向原始标题行），定位语义不变。
+- **句子先付账**：预览、读取、Context 三处统一先按最长的措辞预留说明（`只读取了…` 与 `目录过长…`），剩下的才分给目录与正文；读取的每个策略还为自己那句「本次只返回了前 N 段」按**已知计数**预留上限（不取自结果）。因此**整份回答——目录 + 正文 + 说明——不超过 `maxChars`**，而 `scope=partial` / `truncated` / 原文定位语义没有任何放松。
+- **实测口径**：10 万字标题 + 10 万字正文（Latin，200 KB，未触到 512 KiB 上限），`maxChars=100` 时目录 21 + 正文 43 + 说明 35 = 99 字；`maxChars=200` 时恰好 200 字；2000 标题的文档在 1500 字预算下仍然给出被裁剪的第一条与「只列出前 N 个」。
+
+### 3. 超大附件按 413 回答，且不留半成品
+
+- **根因**：`POST /intents` 把 `createIntent` 的任何失败都映射成 400，服务层算出的 `document_too_large` 在返回时被丢掉，于是「文件太大」被答成「请求不合法」，与 `/documents`、`/documents/import` 的答案不一致。
+- **修复**：`createIntent` 的拒绝带上子原因（`code`），路由改用与其它文档入口同一个 `sendRefusal` 映射（超限 413 / 缺会话 400 / 不存在 404 / 冲突 403 / 需要重读 409）。回滚路径本已存在（先写探索与附件，任一附件被拒即删除本次写入的探索与文档），本轮把它写成反例：一份正常 + 一份超大 → 整个请求被拒、没有探索、没有任何文档（连那份正常的也没有）；去掉超大附件后同样的请求照常创建。
+
+### 收尾轮新增测试（8 例，全部为反例）
+
+先在**未打补丁**的源码上运行过（`git stash` 源码后跑测试），下面每一条都确实失败，补丁恢复后全部通过。
+
+- `packages/plugin-research/tests/documents-repair.test.ts`（+4，Service + 真实视图 / 读取）：10 万字标题在 `maxChars=100 / 200` 下目录 + 正文 + 说明都不超过预算、Context 块的目录 + 预览也不超过、视图里的标题被裁剪但区间仍精确指向原文整行；四种读取策略（默认 / 关键词 / 章节 / 段落）在 200 字预算下都满足 `outlineChars + readChars + note.length ≤ 200`，且每个片段的 Markdown 区间与拼接文本区间仍然自洽；超大附件让整个 `createIntent` 被拒（`code=document_too_large`）、无探索、无文档，去掉超大附件后同样请求照常创建。
+- `apps/research/tests/document-isolation.test.ts`（+3，真实 HTTP）：`sessionId=B + intentId=A` 的列表 403 `document_scope_conflict`（单独给 A 的探索或 B 的会话都仍然正常）；query 的 `sessionId` 与 body 的其它作用域冲突时，读取与上传都 403，A 的文档无损、B 的库仍为空；`POST /intents` 带 600 KiB 附件（text 与 base64）都是 413 + `document_too_large`、响应里没有 `intentId`，随后正常创建仍然成功。
+- `apps/research/tests/document-api.test.ts`（+1，真实 HTTP + 真实任务 + 真实报告）：在一个已有任务与报告的项目上，`GET /documents?sessionId=B&intentId=A`、`POST /documents/<A 的文档>/source?sessionId=B`（body 带 A 的 `taskId`）、`POST /documents?sessionId=B`（body 带 A 的 `intentId`）、`POST /documents/<A 的文档>/read?sessionId=B`（body 又写 `sessionId=A`）四种入口全部 403 `document_scope_conflict`，来源数量不变、B 的库仍为空；按本人身份发起的同名请求（`GET ?intentId=A`、`POST /source`）仍然成功。
+
+### 收尾轮的后端改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `packages/plugin-research/src/documents.ts` | `boundedOutline` 第一条按预算裁剪（`clipHeading`）、`outlineSentence` / `outlineSentenceRoom` / `readSentence` / `wholeSentence` / `sentencesRoom`、预览与读取把说明计入预算、四种读取策略各自为说明预留上限 |
+| `packages/plugin-research/src/service.ts` | `DocumentScopeDeclaration`、`documentScopeDeclarations` / `sessionOfDeclaration` / `resolveDocumentScope` 的交叉验证与 `document_scope_conflict`、`documentsOf` 按解析后的作用域回答、`createIntent` 透传拒绝码、`DocumentAccessRef.declared` 与 `DocumentUploadInput.declared` |
+| `apps/research/src/server/routes.ts` | `documentScopeOf` 收集 query + body 的全部声明、列表路由不再按 `intentId` 短路、上传 / 导入 / 转来源改用统一作用域、`/intents` 改用 `sendRefusal`、`sendRefusal` 增加 `403 document_scope_conflict` |
+
+未改动：前端、Agent Core / Host / Protocol / Client、Search / Retry / Circuit Breaker、Evidence Truth Contract、Claim Validator、PDF Renderer、Artifact Blueprint、Intent Discovery 语义、MinerU 集成。
+
 ## Step 3.7B 新增（本次工作产物）
 
 本轮只做两件后端能力：**正式研究主题必须由用户确认**（Intent Discovery 位于任务卡之前），以及**用户在研究全流程都能加入 Markdown 文档**（同一套文档库，区分为「帮助理解意图」与「研究材料」）。没有重写 Agent Core / Host / Protocol / Client，没有装 MinerU / MCP / 解析 PDF，没有改 Brief / Guide / Proposal / Evidence / Claim / Artifact 契约，没有重做前端。
@@ -182,7 +225,7 @@ POST /api/research/documents/import          // 普通 HTTP 调用：只写 clie
 | `POST /api/research/intents/:id/confirm` | **用户确认研究方向**（唯一写 `confirmedDirection` 的入口），随后排队任务卡阶段 |
 | `POST /api/research/documents` | 上传 Markdown（JSON `{filename, content}` / `{filename, contentBase64}`，或原始请求体 + `?filename=&sessionId=`）；上限 512 KiB，超限 413 |
 | `POST /api/research/documents/import` | 转换器导入（见上；HTTP 路径一律 `client_claimed`） |
-| `GET /api/research/documents?sessionId=\|intentId=\|taskId=` | 文档列表（必须点名会话，否则 400） |
+| `GET /api/research/documents?sessionId=\|intentId=\|taskId=` | 文档列表（必须点名会话，否则 400；一个请求只能说一个会话，多个声明指向不同会话时 403 `document_scope_conflict`） |
 | `GET /api/research/documents/:id` / `/content` | 元信息 + 目录 / 原始 Markdown（须带 `sessionId\|intentId\|taskId`） |
 | `POST /api/research/documents/:id/read` | 有界读取（question / terms / sectionIndex / paragraphIndex / maxChars；预算覆盖正文 + 目录） |
 | `PATCH /api/research/documents/:id` | 指定用途（`usage`，可带 `expectedRevision`；过期 409） |

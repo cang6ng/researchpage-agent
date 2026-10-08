@@ -340,6 +340,93 @@ describe("the library's limits, as the transport reports them", () => {
     expect(attached.status, JSON.stringify(attached.json).slice(0, 200)).toBe(202);
     expect((attached.json["documents"] as readonly unknown[]).length).toBe(1);
   }, 60_000);
+
+  it("answers an over-limit attachment to a seed topic as too large, and creates nothing", async () => {
+    // The same file and the same limit as every other entry point: an attachment
+    // that is over it is a 413 here too, not a 400 that reads as「请求不合法」.
+    const oversized = `# 太大\n\n${"x".repeat(600 * 1024)}`;
+    const text = await post("/api/research/intents", {
+      seedTopic: "带一个超大附件",
+      documents: [{ filename: "big.md", content: oversized }],
+    });
+    expect(text.status, JSON.stringify(text.json).slice(0, 200)).toBe(413);
+    expect(text.json["code"]).toBe("document_too_large");
+    expect(String(text.json["error"])).toContain("文件过大");
+
+    const base64 = await post("/api/research/intents", {
+      seedTopic: "带一个超大附件（base64）",
+      documents: [{ filename: "big.md", contentBase64: Buffer.from(oversized, "utf8").toString("base64") }],
+    });
+    expect(base64.status).toBe(413);
+    expect(base64.json["code"]).toBe("document_too_large");
+
+    // Nothing half-made: no exploration was started (there is no intent to name),
+    // and the ordinary creation path still works right after.
+    expect(text.json["intentId"]).toBeUndefined();
+    expect(base64.json["intentId"]).toBeUndefined();
+    const ordinary = await post("/api/research/intents", { seedTopic: "正常创建" });
+    expect(ordinary.status, JSON.stringify(ordinary.json).slice(0, 200)).toBe(202);
+    expect(typeof ordinary.json["intentId"]).toBe("string");
+  }, 60_000);
+});
+
+describe("a request that names two sessions is refused, not executed as one of them", () => {
+  it("refuses a list whose session and exploration do not agree", async () => {
+    const sessionA = await newSession("列表作用域的会话 A");
+    const sessionB = await newSession("列表作用域的会话 B");
+    await upload(sessionA, "notes.md", NOTES);
+    const state = await request("GET", `/api/research/sessions/${sessionA}/intent`);
+    const intentId = (state.json["intent"] as { intentId: string }).intentId;
+
+    // B's own library is empty, and A's exploration is not B's to read. Reading
+    // only the exploration id is how this request used to answer with A's file.
+    const conflict = await request("GET", `/api/research/documents?sessionId=${sessionB}&intentId=${intentId}`);
+    expect(conflict.status).toBe(403);
+    expect(conflict.json["code"]).toBe("document_scope_conflict");
+
+    // One claim each still answers the library it named.
+    const byIntent = await request("GET", `/api/research/documents?intentId=${intentId}`);
+    expect(byIntent.status).toBe(200);
+    expect((byIntent.json["documents"] as readonly unknown[]).length).toBe(1);
+    const bySession = await request("GET", `/api/research/documents?sessionId=${sessionA}`);
+    expect((bySession.json["documents"] as readonly unknown[]).length).toBe(1);
+  }, 60_000);
+
+  it("refuses an operation whose query and body name different sessions", async () => {
+    const sessionA = await newSession("作用域交叉的会话 A");
+    const sessionB = await newSession("作用域交叉的会话 B");
+    const documentId = await upload(sessionA, "notes.md", NOTES);
+    const state = await request("GET", `/api/research/sessions/${sessionA}/intent`);
+    const intentId = (state.json["intent"] as { intentId: string }).intentId;
+
+    // The same field written twice with two values: whichever is read first, the
+    // other one is a claim the request also made.
+    const readConflict = await post(`/api/research/documents/${documentId}/read?sessionId=${sessionB}`, {
+      sessionId: sessionA,
+      question: "成本",
+    });
+    expect(readConflict.status).toBe(403);
+    expect(readConflict.json["code"]).toBe("document_scope_conflict");
+
+    // A session in the query, somebody else's exploration in the body.
+    const uploadConflict = await post(`/api/research/documents?sessionId=${sessionB}`, {
+      intentId,
+      filename: "smuggled.md",
+      content: NOTES,
+    });
+    expect(uploadConflict.status).toBe(403);
+    expect(uploadConflict.json["code"]).toBe("document_scope_conflict");
+
+    // Nothing was read, written or moved: A's document is intact and B's library
+    // still holds nothing.
+    const owned = await request("GET", `/api/research/documents/${documentId}?sessionId=${sessionA}`);
+    expect(owned.status, JSON.stringify(owned.json)).toBe(200);
+    const listed = await request("GET", `/api/research/documents?sessionId=${sessionB}`);
+    expect(listed.status).toBe(200);
+    expect(listed.json["documents"]).toEqual([]);
+    const inA = await request("GET", `/api/research/documents?sessionId=${sessionA}`);
+    expect((inA.json["documents"] as readonly unknown[]).length).toBe(1);
+  }, 60_000);
 });
 
 describe("a table of contents cannot spend the model's context", () => {

@@ -885,4 +885,61 @@ describe("Scenarios F and G — material, reports and the boundary between them"
     const after = app.service.reportsOf(taskId).find((report) => report.id === reportId);
     expect(after?.contentHash).toBe(beforeReportHash);
   }, 60_000);
+
+  it("H. a request that names two sessions is refused, whichever entry it uses", async () => {
+    // A second session of the same product, with its own exploration: an id that
+    // exists is not the same thing as an id that belongs to this request.
+    const other = await post("/api/research/intents", { seedTopic: "另一个会话的主题" });
+    expect(other.status, JSON.stringify(other.json)).toBe(202);
+    const otherSession = other.json["sessionId"] as string;
+
+    const state = await get(`/api/research/sessions/${sessionId}/intent`);
+    const intentId = (state.json["intent"] as { intentId: string }).intentId;
+    const documentId = documentIds[0] as string;
+    const before = app.service.sourcesOf(taskId).length;
+
+    // The list: B's session beside A's exploration. Answering with the
+    // exploration's documents is how this request used to read somebody else's
+    // library while naming its own session.
+    const listConflict = await get(`/api/research/documents?sessionId=${otherSession}&intentId=${intentId}`);
+    expect(listConflict.status).toBe(403);
+    expect(listConflict.json["code"]).toBe("document_scope_conflict");
+
+    // The promotion: the query says B, the body names A's task. The query used to
+    // be dropped, and the source was created.
+    const promoteConflict = await post(`/api/research/documents/${documentId}/source?sessionId=${otherSession}`, { taskId });
+    expect(promoteConflict.status).toBe(403);
+    expect(promoteConflict.json["code"]).toBe("document_scope_conflict");
+
+    // The upload: the query says B, the body names A's exploration.
+    const uploadConflict = await post(`/api/research/documents?sessionId=${otherSession}`, {
+      intentId,
+      filename: "smuggled.md",
+      content: NOTES_A,
+    });
+    expect(uploadConflict.status).toBe(403);
+    expect(uploadConflict.json["code"]).toBe("document_scope_conflict");
+
+    // One field written twice with two values: `sessionId=B` in the query and
+    // `sessionId=A` in the body is still a request that claimed both.
+    const readConflict = await post(`/api/research/documents/${documentId}/read?sessionId=${otherSession}`, {
+      sessionId,
+      question: "成本",
+    });
+    expect(readConflict.status).toBe(403);
+    expect(readConflict.json["code"]).toBe("document_scope_conflict");
+
+    // Nothing was created, read or moved, and the honest requests still work.
+    expect(app.service.sourcesOf(taskId)).toHaveLength(before);
+    const otherLibrary = await get(`/api/research/documents?sessionId=${otherSession}`);
+    expect(otherLibrary.status).toBe(200);
+    expect(otherLibrary.json["documents"]).toEqual([]);
+    const own = await get(`/api/research/documents?intentId=${intentId}`);
+    expect(own.status).toBe(200);
+    const bySession = await get(`/api/research/documents?sessionId=${sessionId}`);
+    expect((own.json["documents"] as readonly unknown[]).length).toBe((bySession.json["documents"] as readonly unknown[]).length);
+    expect((own.json["documents"] as readonly unknown[]).length).toBeGreaterThanOrEqual(2);
+    const promoted = await post(`/api/research/documents/${documentId}/source`, { taskId, sessionId });
+    expect([200, 201]).toContain(promoted.status);
+  }, 60_000);
 });

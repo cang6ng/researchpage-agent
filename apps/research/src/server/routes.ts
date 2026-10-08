@@ -20,6 +20,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type {
   AssistantIntent,
   DocumentAccessRef,
+  DocumentScopeDeclaration,
   Refusal,
   Report,
   ReportClaim,
@@ -215,23 +216,32 @@ function readBytes(request: IncomingMessage, limit: number): Promise<BodyReading
 /**
  * The caller's own scope, as a document request names it.
  *
- * It is read from the query string and the body, and it is passed to the
- * service *as the caller's claim about which session it is acting for*. The
- * service resolves those ids and compares them with the document's session; a
- * route never fills this in from the document it looked up, because that would
- * make the comparison answer「是它自己」every time.
+ * Every id in every place the caller could have written one — query string and
+ * JSON body, a session directly or through an exploration or a task — is
+ * collected and passed to the service *as the caller's claim about which session
+ * it is acting for*. They are collected rather than merged:「query 说 sessionId=B，
+ * body 说 A 的 taskId」is two claims that disagree, not one claim plus a stray
+ * field, and reading only the first one that parses is precisely how a request
+ * ends up acting as a session it never named. The service resolves each id to its
+ * owning session and refuses a request whose claims do not agree; a route never
+ * fills the scope in from the document it looked up, because that would make the
+ * comparison answer「是它自己」every time.
  */
 function documentScopeOf(request: IncomingMessage, body?: Record<string, unknown>): DocumentAccessRef {
   const query = new URLSearchParams((request.url ?? "").split("?")[1] ?? "");
-  const read = (key: string): string | undefined => {
-    const fromQuery = query.get(key);
-    if (fromQuery !== null && fromQuery.trim().length > 0) return fromQuery.trim();
-    const fromBody = body === undefined ? undefined : body[key];
-    return typeof fromBody === "string" && fromBody.trim().length > 0 ? fromBody.trim() : undefined;
+  const declared: DocumentScopeDeclaration[] = [];
+  const declare = (field: DocumentScopeDeclaration["field"], value: unknown): void => {
+    const trimmed = typeof value === "string" ? value.trim() : "";
+    if (trimmed.length > 0) declared.push({ field, value: trimmed });
   };
-  const sessionId = read("sessionId");
-  const intentId = read("intentId");
-  const taskId = read("taskId");
+  for (const field of ["sessionId", "intentId", "taskId"] as const) {
+    declare(field, query.get(field) ?? undefined);
+    declare(field, body?.[field]);
+  }
+  const first = (field: DocumentScopeDeclaration["field"]): string | undefined => declared.find((entry) => entry.field === field)?.value;
+  const sessionId = first("sessionId");
+  const intentId = first("intentId");
+  const taskId = first("taskId");
   const expected = body?.["expectedRevision"] ?? query.get("expectedRevision");
   const expectedRevision =
     typeof expected === "number" && Number.isInteger(expected) && expected > 0
@@ -243,6 +253,7 @@ function documentScopeOf(request: IncomingMessage, body?: Record<string, unknown
     ...(sessionId === undefined ? {} : { sessionId }),
     ...(intentId === undefined ? {} : { intentId }),
     ...(taskId === undefined ? {} : { taskId }),
+    ...(declared.length === 0 ? {} : { declared }),
     ...(expectedRevision === undefined ? {} : { expectedRevision }),
   };
 }
@@ -260,7 +271,7 @@ function sendRefusal(response: ServerResponse, refusal: Refusal): void {
   const status =
     refusal.code === "document_not_found"
       ? 404
-      : refusal.code === "document_cross_session"
+      : refusal.code === "document_cross_session" || refusal.code === "document_scope_conflict"
         ? 403
         : refusal.code === "document_too_large"
           ? 413
@@ -769,7 +780,10 @@ export function createResearchRouter(
         }),
       });
       if (created.ok !== true) {
-        sendJson(response, 400, { error: created.problems.join("；"), problems: created.problems, guidance: created.guidance });
+        // The same mapping every other document entry point uses: a file the
+        // library refused as too large is a 413 here too, not a 400 that reads
+        // as「请求不合法」.
+        sendRefusal(response, created);
         return;
       }
       runner.startIntent(sessionId, created.intent.intentId);
@@ -963,9 +977,9 @@ export function createResearchRouter(
         const conversionBody = body["conversion"];
         const conversion = conversionBody === undefined ? undefined : asRecord(conversionBody);
         upload = {
-          ...(typeof body["sessionId"] === "string" ? { sessionId: body["sessionId"] } : {}),
-          ...(typeof body["intentId"] === "string" ? { intentId: body["intentId"] } : {}),
-          ...(typeof body["taskId"] === "string" ? { taskId: body["taskId"] } : {}),
+          // The scope is the caller's own claim, collected from everywhere it
+          // said so — including the query string this request also carries.
+          ...documentScopeOf(request, body),
           filename: body["filename"],
           content: {
             ...(typeof body["content"] === "string" ? { text: body["content"] } : {}),
@@ -1051,9 +1065,7 @@ export function createResearchRouter(
       const conversion = asRecord(body["conversion"]);
       const originalFilename = typeof body["originalFilename"] === "string" ? body["originalFilename"] : "";
       const result = service.uploadDocument({
-        ...(typeof body["sessionId"] === "string" ? { sessionId: body["sessionId"] } : {}),
-        ...(typeof body["intentId"] === "string" ? { intentId: body["intentId"] } : {}),
-        ...(typeof body["taskId"] === "string" ? { taskId: body["taskId"] } : {}),
+        ...documentScopeOf(request, body),
         filename: typeof body["filename"] === "string" && body["filename"].trim().length > 0
           ? body["filename"]
           : markdownNameFor(originalFilename),
@@ -1097,18 +1109,11 @@ export function createResearchRouter(
     }
 
     // GET /api/research/documents?sessionId=|intentId=|taskId= — the library.
+    // One scope, resolved once: an exploration named here is resolved to its own
+    // session by the service, so naming one session and somebody else's
+    // exploration in the same request is refused rather than answered with the
+    // exploration's documents.
     if (path === "/api/research/documents" && method === "GET") {
-      const query = new URLSearchParams((request.url ?? "").split("?")[1] ?? "");
-      const intentId = query.get("intentId");
-      const intent = intentId === null ? undefined : service.intentViewOf(intentId);
-      if (intentId !== null && intent === undefined) {
-        sendJson(response, 404, { error: "意图探索不存在" });
-        return;
-      }
-      if (intent !== undefined) {
-        sendJson(response, 200, { documents: intent.documents });
-        return;
-      }
       const documents = service.documentsOf(documentScopeOf(request));
       if ("ok" in documents) {
         sendRefusal(response, documents);
@@ -1219,8 +1224,11 @@ export function createResearchRouter(
         return;
       }
       const result = service.promoteDocumentToSource(documentSourceMatch[1] ?? "", {
+        // The target task and the caller's own scope are one set of claims: the
+        // query string that named a session is not allowed to be dropped just
+        // because the body also named a task.
+        ...documentScopeOf(request, body),
         taskId,
-        ...(typeof body["sessionId"] === "string" && body["sessionId"].trim().length > 0 ? { sessionId: body["sessionId"].trim() } : {}),
       });
       if (result.ok !== true) {
         sendRefusal(response, result);

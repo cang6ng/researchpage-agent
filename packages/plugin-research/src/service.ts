@@ -238,12 +238,15 @@ export interface Refusal {
      * `document_scope_missing` never names whose document it is (there is no
      * caller to compare against), `document_not_found` is a 404,
      * `document_cross_session` is a 403 — the document exists and is not the
-     * caller's — and `document_too_large` is a 413, because「文件太大」and
-     * 「请求不合法」are different answers with different fixes.
+     * caller's — `document_scope_conflict` is a 403 as well, because the request
+     * claimed one session in one place and another session elsewhere and cannot
+     * be executed as either — and `document_too_large` is a 413, because「文件
+     * 太大」and「请求不合法」are different answers with different fixes.
      */
     | "document_scope_missing"
     | "document_not_found"
     | "document_cross_session"
+    | "document_scope_conflict"
     | "document_too_large";
   /**
    * What to tell the user, when the reader's sentence differs from the model's.
@@ -712,6 +715,22 @@ export interface DocumentContext {
 }
 
 /**
+ * One claim about whose request this is, and how it was made.
+ *
+ * A request can name a session more than once — a query string and a JSON body,
+ * an exploration *and* a task — and every one of those names is a claim. They
+ * are collected rather than merged, because a request that says sessionId=B in
+ * one place and taskId=<A's task> in another is not「一个作用域加上一个无关
+ * 参数」: it is two claims that disagree, and the only honest answer is to refuse
+ * it. Taking the first one that parses is how a caller ends up acting as a
+ * session it did not name.
+ */
+export interface DocumentScopeDeclaration {
+  readonly field: "sessionId" | "intentId" | "taskId";
+  readonly value: string;
+}
+
+/**
  * Who is asking, for a document operation.
  *
  * This is the whole identity model on this path: a caller names the session it
@@ -725,6 +744,15 @@ export interface DocumentAccessRef {
   readonly sessionId?: string | undefined;
   readonly intentId?: string | undefined;
   readonly taskId?: string | undefined;
+  /**
+   * Every id the request carried, when the caller has them all.
+   *
+   * A single HTTP request may write its scope in several places; the route
+   * collects them here so that they are all resolved and cross-checked. Callers
+   * that hold exactly one id (a tool, a runner stage) leave it out and the three
+   * fields above are checked instead.
+   */
+  readonly declared?: readonly DocumentScopeDeclaration[] | undefined;
   /** Refuses the write when the document moved on since the caller read it. */
   readonly expectedRevision?: number | undefined;
 }
@@ -733,6 +761,8 @@ export interface DocumentUploadInput {
   readonly sessionId?: string | undefined;
   readonly intentId?: string | undefined;
   readonly taskId?: string | undefined;
+  /** Every scope id the request carried, when the caller has more than one. */
+  readonly declared?: readonly DocumentScopeDeclaration[] | undefined;
   readonly filename: unknown;
   readonly content: { readonly text?: string | undefined; readonly bytes?: Uint8Array | undefined };
   readonly usage?: readonly DocumentUsage[] | undefined;
@@ -894,7 +924,7 @@ export interface ResearchService {
    */
   promoteDocumentToSource(
     documentId: string,
-    input: { readonly taskId: string; readonly sessionId?: string },
+    input: { readonly taskId: string; readonly sessionId?: string; readonly declared?: readonly DocumentScopeDeclaration[] | undefined },
   ): { readonly ok: true; readonly source: Source; readonly created: boolean; readonly note: string } | Refusal;
 
   // ------------------------------------------------------------------ brief --
@@ -2228,49 +2258,103 @@ export function createResearchService(options: ResearchServiceOptions): Research
 
   // ------------------------------------------------------------- documents --
 
-  function resolveDocumentScope(input: { readonly sessionId?: string; readonly intentId?: string; readonly taskId?: string }):
-    | { readonly ok: true; readonly sessionId: string; readonly taskId: string | null; readonly intent: IntentDraft | null }
-    | Refusal {
-    let sessionId = (input.sessionId ?? "").trim();
-    let taskId: string | null = null;
-    let intent: IntentDraft | null = null;
-    const intentId = (input.intentId ?? "").trim();
-    if (intentId.length > 0) {
-      const found = repo.getIntent(intentId);
+  /** Every id a request named, whichever way it was able to name it. */
+  function documentScopeDeclarations(input: {
+    readonly sessionId?: string | undefined;
+    readonly intentId?: string | undefined;
+    readonly taskId?: string | undefined;
+    readonly declared?: readonly DocumentScopeDeclaration[] | undefined;
+  }): readonly DocumentScopeDeclaration[] {
+    const declarations: DocumentScopeDeclaration[] = [];
+    const add = (field: DocumentScopeDeclaration["field"], value: string | undefined): void => {
+      const trimmed = (value ?? "").trim();
+      if (trimmed.length === 0) return;
+      if (declarations.some((declaration) => declaration.field === field && declaration.value === trimmed)) return;
+      declarations.push({ field, value: trimmed });
+    };
+    add("sessionId", input.sessionId);
+    add("intentId", input.intentId);
+    add("taskId", input.taskId);
+    // The collected list is the same claim said again, so re-adding it costs
+    // nothing and a value the three fields above do not carry is still resolved.
+    for (const declaration of input.declared ?? []) add(declaration.field, declaration.value);
+    return declarations;
+  }
+
+  /**
+   * The session one declaration belongs to, or the reason it names nothing.
+   *
+   * A session id is taken at face value — it is the bearer capability in this
+   * product — but an exploration id and a task id are looked up, because「这个
+   * intent 属于哪个会话」is a fact only the repository knows.
+   */
+  function sessionOfDeclaration(declaration: DocumentScopeDeclaration): { readonly ok: true; readonly sessionId: string } | Refusal {
+    if (declaration.field === "sessionId") return { ok: true, sessionId: declaration.value };
+    if (declaration.field === "intentId") {
+      const found = repo.getIntent(declaration.value);
       if (found === undefined) {
-        return { ok: false, problems: [`没有找到意图探索：${intentId}`], guidance: "请确认 intentId（它由创建意图探索的接口返回）。" };
+        return { ok: false, problems: [`没有找到意图探索：${declaration.value}`], guidance: "请确认 intentId（它由创建意图探索的接口返回）。" };
       }
-      if (sessionId.length > 0 && found.sessionId !== sessionId) {
-        return { ok: false, problems: ["这个意图探索不属于该会话"], guidance: "文档只能保存到它所属的会话。" };
-      }
-      intent = found;
-      sessionId = found.sessionId;
-      taskId = found.taskId;
+      return { ok: true, sessionId: found.sessionId };
     }
-    const rawTaskId = (input.taskId ?? "").trim();
-    if (rawTaskId.length > 0) {
-      const task = repo.getTask(rawTaskId);
-      if (task === undefined) {
-        return { ok: false, problems: [`没有找到研究任务：${rawTaskId}`], guidance: "请确认 taskId。" };
-      }
-      if (sessionId.length > 0 && task.sessionId !== sessionId) {
-        return { ok: false, problems: ["这个研究任务不属于该会话，不能把文档关联过去"], guidance: "文档只能关联到它所属会话的研究任务。" };
-      }
-      sessionId = task.sessionId;
-      taskId = task.id;
+    const task = repo.getTask(declaration.value);
+    if (task === undefined) {
+      return { ok: false, problems: [`没有找到研究任务：${declaration.value}`], guidance: "请确认 taskId。" };
     }
-    if (sessionId.length === 0) {
+    return { ok: true, sessionId: task.sessionId };
+  }
+
+  /**
+   * The one session a request may act as, resolved from *every* id it named.
+   *
+   * A request can say whose it is in several places at once, and all of them are
+   * resolved and compared here: a query string that names session B while the
+   * body names session A's task is refused rather than answered as whichever of
+   * the two happened to be read first. Refusing costs a caller one corrected
+   * request; answering would let it read and write another session's library
+   * while believing it was acting as its own.
+   */
+  function resolveDocumentScope(input: {
+    readonly sessionId?: string | undefined;
+    readonly intentId?: string | undefined;
+    readonly taskId?: string | undefined;
+    readonly declared?: readonly DocumentScopeDeclaration[] | undefined;
+  }): { readonly ok: true; readonly sessionId: string; readonly taskId: string | null; readonly intent: IntentDraft | null } | Refusal {
+    const declarations = documentScopeDeclarations(input);
+    if (declarations.length === 0) {
       return {
         ok: false,
         problems: ["缺少会话信息"],
         guidance: "保存文档需要 sessionId / intentId / taskId 中的一个，文档必须绑定到可信会话，不能匿名保存。",
       };
     }
+    let sessionId = "";
+    let taskId: string | null = null;
+    let intent: IntentDraft | null = null;
+    const claims: string[] = [];
+    for (const declaration of declarations) {
+      const owner = sessionOfDeclaration(declaration);
+      if (owner.ok !== true) return owner;
+      claims.push(`${declaration.field}=${declaration.value}（会话 ${owner.sessionId}）`);
+      if (sessionId.length === 0) {
+        sessionId = owner.sessionId;
+      } else if (owner.sessionId !== sessionId) {
+        return {
+          ok: false,
+          problems: [`请求里的作用域互相矛盾：${claims.join("、")}——它们不属于同一个会话`],
+          guidance: "一个请求只能代表一个会话：请只带属于同一个会话的 id，不要用别的会话的 intentId / taskId 来访问自己的文档。",
+          code: "document_scope_conflict",
+        };
+      }
+      if (declaration.field === "intentId") intent = repo.getIntent(declaration.value) ?? intent;
+      if (declaration.field === "taskId") taskId = declaration.value;
+    }
     // Whichever id the caller had, the document belongs to the session's
     // exploration when there is one: an attachment is part of the conversation
     // that produced it, and a client that only knows the session id must not be
     // able to leave a file unattached by accident.
     if (intent === null) intent = repo.intentForSession(sessionId) ?? null;
+    if (taskId === null) taskId = intent?.taskId ?? null;
     return { ok: true, sessionId, taskId, intent };
   }
 
@@ -2609,9 +2693,12 @@ export function createResearchService(options: ResearchServiceOptions): Research
         maxChars: Math.min(maxChars, budget),
       });
       const outline = preview.outline.map((heading) => `${"#".repeat(heading.level)} ${heading.text}`);
-      // The outline was counted by the preview against its own share; what the
-      // block costs the *total* is both halves of what it carries.
-      budget -= preview.charsRead + preview.outlineChars;
+      // What the block costs the *total* is everything it carries — the opening,
+      // the outline, and the sentences that say how much of the document this is
+      // and that its text is data rather than instruction. A preview that fits
+      // its own budget and then hands a caller three sentences of explanation has
+      // spent more than it counted.
+      budget -= preview.charsRead + preview.outlineChars + UNTRUSTED_DOCUMENT_NOTE.length + preview.note.length + 1;
       contexts.push({
         documentId: document.id,
         filename: document.originalFilename,
@@ -2661,7 +2748,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
 
   function promoteDocumentImpl(
     documentId: string,
-    input: { readonly taskId: string; readonly sessionId?: string },
+    input: { readonly taskId: string; readonly sessionId?: string; readonly declared?: readonly DocumentScopeDeclaration[] | undefined },
   ): { readonly ok: true; readonly source: Source; readonly created: boolean; readonly note: string } | Refusal {
     // Both the document and the target task are checked against the caller's own
     // scope, so a material cannot be slipped into another project by naming an
@@ -2934,7 +3021,10 @@ export function createResearchService(options: ResearchServiceOptions): Research
           // so the user can fix the file and submit the same request again.
           for (const documentId of attached) repo.deleteDocument(documentId);
           repo.deleteIntent(intent.id);
-          return { ok: false, problems: uploaded.problems, guidance: uploaded.guidance };
+          // The reason travels with the refusal:「文件太大」is a 413 and a broken
+          // file name is a 400, and a transport that cannot tell them apart would
+          // answer「请求不合法」for a file that is simply too big.
+          return { ok: false, problems: uploaded.problems, guidance: uploaded.guidance, ...(uploaded.code === undefined ? {} : { code: uploaded.code }) };
         }
         attached.push(uploaded.document.documentId);
       }
@@ -3259,7 +3349,17 @@ export function createResearchService(options: ResearchServiceOptions): Research
         const missing = resolved.problems.some((problem) => problem.includes("缺少会话信息"));
         return { ...resolved, ...(missing ? { code: "document_scope_missing" as const } : {}) };
       }
-      return documentsFor(scope).map(documentViewOfStored);
+      // The list comes from the *resolved* scope rather than from the fields as
+      // they arrived: a caller that named only an exploration (or only a session)
+      // asked about the library behind that id, and the ids it did not repeat are
+      // not a reason to answer「什么都没有」. A named task still lists the task's
+      // own documents, which is what it asked for.
+      return documentsFor({
+        sessionId: resolved.sessionId,
+        ...(documentScopeDeclarations(scope).some((declaration) => declaration.field === "taskId") && resolved.taskId !== null
+          ? { taskId: resolved.taskId }
+          : {}),
+      }).map(documentViewOfStored);
     },
 
     documentContextOf: (scope, maxChars) =>
@@ -3352,7 +3452,11 @@ export function createResearchService(options: ResearchServiceOptions): Research
     },
 
     promoteDocumentToSource: (documentId, input) =>
-      promoteDocumentImpl(documentId, { taskId: input.taskId, ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }) }),
+      promoteDocumentImpl(documentId, {
+        taskId: input.taskId,
+        ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+        ...(input.declared === undefined ? {} : { declared: input.declared }),
+      }),
 
     // ------------------------------------------------------------- the brief --
 

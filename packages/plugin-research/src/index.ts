@@ -361,6 +361,7 @@ export {
   type CellView,
   type ConfirmResult,
   type DocumentContext,
+  type DocumentScopeDeclaration,
   type DocumentUploadInput,
   type DocumentUploadResult,
   type GuideAnswerInput,

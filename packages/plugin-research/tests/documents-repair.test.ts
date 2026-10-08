@@ -628,3 +628,131 @@ describe("the library's own rules stay intact", () => {
     expect(workDir.length).toBeGreaterThan(0);
   });
 });
+
+/**
+ * The closing review's first defect, with the counterexample that proved it: the
+ * outline's first entry was exempt from the budget that was bounding it, so a
+ * 100,000-character label answered a 100-character request with 208 characters of
+ * table of contents and no text at all.
+ */
+describe("a heading longer than the budget cannot spend the budget", () => {
+  // 100,000 characters of label and 100,000 of prose: the first outline entry used
+  // to be kept whatever it cost, so a 100-character preview answered with 208
+  // characters of table of contents and no text at all. The text is Latin so that
+  // the file is 200 KB rather than the library's own 512 KB limit.
+  const LABEL = "a-long-heading-label-".repeat(5_000);
+  const BODY = "a-body-paragraph-sentence. ".repeat(4_000);
+  const document = `# ${LABEL}\n\n${BODY}`;
+
+  /** Everything a bounded answer carries: the outline, the text, its own sentences. */
+  function carried(answer: { readonly outlineChars: number; readonly readChars: number; readonly note: string }): number {
+    return answer.outlineChars + answer.readChars + answer.note.length;
+  }
+
+  it("bounds the first heading and the sentences about it, at maxChars 100 and 200", () => {
+    const app = service();
+    app.createIntent("head_a", { seedTopic: "超长标题" });
+    const uploaded = app.uploadDocument({ sessionId: "head_a", filename: "long-heading.md", content: { text: document } });
+    if (uploaded.ok !== true) throw new Error(JSON.stringify(uploaded));
+    const documentId = uploaded.document.documentId;
+
+    for (const maxChars of [100, 200]) {
+      const contexts = app.documentContextOf({ documentIds: [documentId] }, maxChars);
+      const block = contexts[0];
+      if (block === undefined) throw new Error("no context block");
+      const outlineChars = block.outline.reduce((sum, line) => sum + line.length, 0);
+      // The block a prompt would carry, against the budget it was given.
+      expect(outlineChars + block.previewChars).toBeLessThanOrEqual(maxChars);
+      expect(block.complete).toBe(false);
+      expect(block.note).toContain("部分读取");
+      // The first entry is not the whole label: it was cut down to what fits.
+      const first = block.outline[0] ?? "";
+      expect(first.length).toBeLessThanOrEqual(maxChars);
+      expect(LABEL.startsWith(first.replace(/^#+\s*/, "").replace(/…$/, ""))).toBe(true);
+
+      // A read is bounded the same way, with its own sentences paid for out of
+      // the same budget. `maxChars` has a floor of 200 on this path.
+      const read = app.readDocument({ sessionId: "head_a", documentId, request: { maxChars } });
+      if (read.ok !== true) throw new Error("read refused");
+      expect(carried(read)).toBeLessThanOrEqual(Math.max(200, maxChars));
+      expect(read.scope).toBe("partial");
+      expect(read.outlineChars).toBeLessThanOrEqual(Math.max(200, maxChars));
+    }
+  });
+
+  it("keeps every read strategy inside the budget, and each excerpt where it says it is", () => {
+    const app = service();
+    app.createIntent("head_b", { seedTopic: "超长标题" });
+    const uploaded = app.uploadDocument({ sessionId: "head_b", filename: "long-heading.md", content: { text: document } });
+    if (uploaded.ok !== true) throw new Error(JSON.stringify(uploaded));
+    const documentId = uploaded.document.documentId;
+
+    for (const request of [{}, { question: "正文段落" }, { sectionIndex: 0 }, { paragraphIndex: 0 }]) {
+      const read = app.readDocument({ sessionId: "head_b", documentId, request: { ...request, maxChars: 200 } });
+      if (read.ok !== true) throw new Error("read refused");
+      expect(carried(read), JSON.stringify(request)).toBeLessThanOrEqual(200);
+      expect(read.scope).toBe("partial");
+      for (const fragment of read.fragments) {
+        // Whatever the budget did, the text is still the user's own characters at
+        // the position it reports — in the stored Markdown and in the joined text.
+        expect(document.slice(fragment.sourceStart, fragment.sourceEnd)).toBe(fragment.text);
+        expect(fragment.charStart).toBeLessThanOrEqual(fragment.charEnd);
+        expect(fragment.sourceStart).toBeLessThanOrEqual(fragment.sourceEnd);
+      }
+    }
+  });
+
+  it("keeps a clipped first heading located in the stored Markdown", () => {
+    const app = service();
+    app.createIntent("head_c", { seedTopic: "超长标题" });
+    const uploaded = app.uploadDocument({ sessionId: "head_c", filename: "long-heading.md", content: { text: document } });
+    if (uploaded.ok !== true) throw new Error(JSON.stringify(uploaded));
+    const shown = app.documentViewOf(uploaded.document.documentId, { sessionId: "head_c" });
+    if ("ok" in shown) throw new Error("view refused");
+    const heading = shown.outline[0];
+    if (heading === undefined) throw new Error("no heading");
+    // The label is shorter than the one the user wrote; the range it came from
+    // is not, so the section it names can still be found in the file.
+    expect(heading.text.length).toBeLessThan(LABEL.length);
+    expect(document.slice(heading.titleStart, heading.titleEnd)).toBe(LABEL);
+  });
+});
+
+/**
+ * The closing review's other defect: an attachment over the content limit came
+ * back as「请求不合法」— the library's own `document_too_large` never reached the
+ * transport — and the exploration it arrived with had to be gone.
+ */
+describe("an over-limit attachment leaves nothing behind", () => {
+  it("refuses the exploration, the oversized file and the good file beside it", () => {
+    const app = service();
+    const oversized = `# 太大\n\n${"x".repeat(MAX_DOCUMENT_BYTES + 8)}`;
+    const refused = app.createIntent("half_a", {
+      seedTopic: "带一个超大附件",
+      documents: [
+        { filename: "ok.md", content: { text: "# 可以保存\n\n这一段没有问题。" } },
+        { filename: "big.md", content: { text: oversized } },
+      ],
+    });
+    expect(refused.ok).toBe(false);
+    if (refused.ok !== false) return;
+    // The reason is the file's size rather than the request's shape: the
+    // transport answers this one with 413.
+    expect(refused.code).toBe("document_too_large");
+    // Nothing half-made: no exploration, and no document from that request —
+    // including the one that would have been fine on its own.
+    expect(app.intentForSession("half_a")).toBeUndefined();
+    const listed = app.documentsOf({ sessionId: "half_a" });
+    expect("ok" in listed ? 0 : listed.length).toBe(0);
+
+    // The ordinary path is unchanged: the same request without the oversized file
+    // creates the exploration and keeps its attachment.
+    const accepted = app.createIntent("half_b", {
+      seedTopic: "带一个正常附件",
+      documents: [{ filename: "ok.md", content: { text: "# 可以保存\n\n这一段没有问题。" } }],
+    });
+    expect(accepted.ok).toBe(true);
+    if (accepted.ok !== true) return;
+    expect(accepted.intent.documents).toHaveLength(1);
+  });
+});
