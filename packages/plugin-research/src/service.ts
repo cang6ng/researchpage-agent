@@ -15,10 +15,12 @@
 
 import type {
   ActionDelta,
+  ActivityLevel,
   CellRef,
   CoverageAssessment,
   CoverageEvidence,
   ClaimType,
+  DiscoveryTelemetry,
   EditActionOutcome,
   ReportDraftState,
   ReportFrame,
@@ -30,8 +32,13 @@ import type {
   ReportSection,
   ReportTask,
   ReadSnapshot,
+  ResearchActivityEvent,
+  ResearchActivityKind,
+  ResearchAttempt,
+  ResearchProgressStage,
   ResearchResolution,
   ResearchRunRecord,
+  ResearchUsage,
   RunOutcome,
   Source,
   SourceRole,
@@ -56,10 +63,13 @@ import {
   type ProposalSection,
   type ProposalTarget,
 } from "./proposal.js";
-import { readSource, type ReadOutcome } from "./read.js";
+import { readSource, type ReadOutcome, type ReadRequest } from "./read.js";
 import { newId, type ResearchRepository } from "./repository.js";
 import { createGrant, EMPTY_ACTION_USAGE, type ActionCapability, type ActionGrant, type ActionUsage, type GrantInput } from "./semantics.js";
-import { searchArxiv, type SearchOutcome } from "./search.js";
+import { PROVIDER_NAMES, SearchError, type SearchCandidate, type SearchOutcome } from "./search.js";
+import { arxivIdOf, arxivIdOfDoi, candidateKeys, dedupeCandidates } from "./search.js";
+import { ProviderCircuitBreaker, searchSources, type DiscoveryOptions } from "./discovery.js";
+import type { DiscoveryEvent } from "./search.js";
 import { buildMatrix, createTask, normalizeCard, slugId, STRUCTURE_SECTIONS, type ProposedCard } from "./structure.js";
 import { TECHNICAL_COMPARISON_V2, blueprintSections } from "./blueprint.js";
 import {
@@ -109,11 +119,25 @@ import {
 
 export interface ResearchServiceOptions {
   readonly repo: ResearchRepository;
-  /** The discovery path; the default is the real arXiv client. */
+  /**
+   * The discovery path; the default is the real one — providers with bounded
+   * retries, a circuit breaker and a fallback.
+   */
   readonly search?: (query: string, options: { readonly limit: number; readonly signal?: AbortSignal }) => Promise<SearchOutcome>;
+  /**
+   * The network seam of the default discovery path.
+   *
+   * A test supplies a `fetchImpl` and a `sleep` so the *real* provider code —
+   * classification, retries, breaker, fallback — runs without the network and
+   * without waiting. Nothing else about the product changes: the same code path
+   * a demo takes is the one under test.
+   */
+  readonly discovery?: Omit<DiscoveryOptions, "limit" | "signal" | "onEvent">;
   /** The read path; the default is the real HTTP reader. */
-  readonly read?: (request: { readonly url: string }, options: { readonly signal?: AbortSignal }) => Promise<ReadOutcome>;
+  readonly read?: (request: ReadRequest, options: { readonly signal?: AbortSignal }) => Promise<ReadOutcome>;
   readonly now?: () => Date;
+  /** The provider failure memory; the default is one per service instance. */
+  readonly breaker?: ProviderCircuitBreaker;
 }
 
 /** One incremental write to the report draft. */
@@ -186,6 +210,16 @@ export interface SearchResult {
   readonly searchesRemaining: number;
   /** Which budget `searchesRemaining` belongs to. */
   readonly budgetScope: BudgetScope;
+  /** Which provider actually answered this search. */
+  readonly provider: string;
+  /** The providers this call asked, in order. */
+  readonly providersTried?: readonly string[];
+  /** What the physical requests of this call did, as counts. */
+  readonly attempts?: {
+    readonly attempted: number;
+    readonly succeeded: number;
+    readonly failed: number;
+  };
   readonly note: string;
 }
 
@@ -213,6 +247,37 @@ export interface ReadResult {
   readonly budgetScope: BudgetScope;
   readonly note: string;
 }
+
+/** Why a retry was refused, in terms the route can turn into a status code. */
+export type RetryRefusalReason = "task_unknown" | "brief_unconfirmed" | "not_recoverable" | "run_in_progress";
+
+export interface RetryRefusal {
+  readonly ok: false;
+  readonly reason: RetryRefusalReason;
+  readonly problems: readonly string[];
+  readonly guidance: string;
+  /** Retries and unavailable states are conflicts with the task's state. */
+  readonly conflict: true;
+}
+
+/** What a retry did, and what it left untouched. */
+export interface RetryResearchResultOk {
+  readonly ok: true;
+  readonly task: ReportTask;
+  readonly attempt: ResearchAttempt;
+  /** The material the retry found in place; it is kept, not rebuilt. */
+  readonly preserved: {
+    readonly sources: number;
+    readonly evidence: number;
+    readonly assessments: number;
+    readonly reports: number;
+    readonly revisions: number;
+    readonly reportKept: boolean;
+  };
+  readonly message: string;
+}
+
+export type RetryResearchResult = RetryResearchResultOk | RetryRefusal;
 
 export interface CellView extends CellRef {
   readonly subjectName: string;
@@ -545,6 +610,36 @@ export interface ResearchService {
 
   startResearch(taskId: string): ReportTask;
   failTask(taskId: string, error: string): void;
+  /**
+   * Starts a new bounded research attempt on a task that stopped.
+   *
+   * It is the user's own retry: the task, its brief, its subjects, dimensions,
+   * sources, evidence, report and frozen revisions are all kept exactly as they
+   * are, the failure that was blocking the project is cleared, and the attempt
+   * the pipeline budget governs starts fresh — which is what makes an old
+   * `startedAt` unable to reject the retry it just allowed.
+   */
+  retryResearch(taskId: string): RetryResearchResult;
+  /** The activity history a reader can read back after a reload. */
+  activityOf(taskId: string, limit?: number): readonly ResearchActivityEvent[];
+  /**
+   * Appends one line to a project's activity history.
+   *
+   * The application writes the stage-level lines (a stage started, a stage
+   * finished, a stage failed) through this, because the runner is what knows a
+   * stage exists; everything a tool does inside the stage is written by the
+   * service itself, where those facts are.
+   */
+  recordActivity(input: {
+    readonly taskId: string;
+    readonly kind: ResearchActivityKind;
+    readonly level?: ActivityLevel;
+    readonly message: string;
+    readonly stage?: ResearchProgressStage;
+    readonly provider?: string;
+    readonly attempt?: number;
+    readonly nextRetryAt?: string | null;
+  }): ResearchActivityEvent;
   getTask(taskId: string): ReportTask | undefined;
   search(taskId: string, input: { readonly query: string; readonly limit?: number; readonly targetSectionId?: string; readonly targetCell?: CellRef; readonly signal?: AbortSignal }): Promise<SearchResult | Refusal>;
   read(taskId: string, input: {
@@ -707,10 +802,69 @@ function locatorLabelOf(evidence: Evidence): string {
 export function createResearchService(options: ResearchServiceOptions): ResearchService {
   const repo = options.repo;
   const now = options.now ?? (() => new Date());
-  const searchImpl = options.search ?? ((query: string, searchOptions: { readonly limit: number; readonly signal?: AbortSignal }) => searchArxiv(query, searchOptions));
-  const readImpl = options.read ?? ((request: { readonly url: string }, readOptions: { readonly signal?: AbortSignal }) => readSource(request, readOptions));
+  const breaker = options.breaker ?? new ProviderCircuitBreaker({ now });
+  const searchImpl =
+    options.search ??
+    ((query: string, searchOptions: { readonly limit: number; readonly signal?: AbortSignal }) =>
+      searchSources(query, { ...options.discovery, ...searchOptions, breaker: options.discovery?.breaker ?? breaker }));
+  const readImpl = options.read ?? ((request: ReadRequest, readOptions: { readonly signal?: AbortSignal }) => readSource(request, readOptions));
 
   const isoNow = (): string => now().toISOString();
+
+  /**
+   * One line of the project's activity history.
+   *
+   * The stage is read from the run the task is currently in, because that is
+   * the stage a reader is watching; a call that happens outside any run (the
+   * application API answering a direct request) is attributed to the project in
+   * `preparing`, which is true: nothing is running.
+   */
+  function recordActivity(
+    taskId: string,
+    kind: ResearchActivityKind,
+    level: ResearchActivityEvent["level"],
+    message: string,
+    extra: { readonly stage?: ResearchProgressStage; readonly provider?: string; readonly attempt?: number; readonly nextRetryAt?: string | null } = {},
+  ): ResearchActivityEvent {
+    const event: ResearchActivityEvent = {
+      id: newId(ID_PREFIX.activity),
+      taskId,
+      at: isoNow(),
+      stage: extra.stage ?? currentStageOf(taskId),
+      level,
+      kind,
+      message,
+      ...(extra.provider === undefined ? {} : { provider: extra.provider }),
+      ...(extra.attempt === undefined ? {} : { attempt: extra.attempt }),
+      ...(extra.nextRetryAt === undefined ? {} : { nextRetryAt: extra.nextRetryAt }),
+    };
+    repo.appendActivity(event);
+    return event;
+  }
+
+  /** The stage of the run this task is currently in, in a reader's vocabulary. */
+  function currentStageOf(taskId: string): ResearchProgressStage {
+    const running = repo.listRuns(taskId).find((record) => record.status === "running");
+    if (running === undefined) return "preparing";
+    switch (running.stage) {
+      case "card":
+      case "guide":
+        return "preparing";
+      case "research":
+      case "gap":
+        return "searching";
+      case "report":
+        return "reporting";
+      case "synthesis":
+        return "validating";
+      case "ask":
+        return "answering";
+      case "edit":
+        return "editing";
+      default:
+        return "preparing";
+    }
+  }
 
   function requireTask(taskId: string): ReportTask {
     const task = repo.getTask(taskId);
@@ -859,6 +1013,194 @@ export function createResearchService(options: ResearchServiceOptions): Research
   function spend(grant: ActionGrant, what: "searches" | "reads" | "gapRounds"): void {
     const usage = usageOf(grant);
     actionUsage.set(grant.id, { ...usage, [what]: usage[what] + 1 });
+  }
+
+  /**
+   * The usage the pipeline budget is enforced against.
+   *
+   * On a task that has never retried there is no attempt, and the lifetime
+   * usage is the answer — exactly the behaviour this product had before
+   * attempts existed. After a retry, the attempt is the answer, and the
+   * lifetime totals stay what they are: telemetry about everything that
+   * happened, not a budget anybody is still spending from.
+   */
+  function governingUsage(task: ReportTask): ResearchUsage {
+    const attempt = task.attempt;
+    if (attempt === undefined) return task.usage;
+    return { searches: attempt.searches, reads: attempt.reads, gapRounds: attempt.gapRounds, startedAt: attempt.startedAt };
+  }
+
+  /**
+   * One spend, written to both ledgers.
+   *
+   * The lifetime counter always moves (it is what the workspace reports about
+   * the project), and the current attempt moves with it when there is one (it
+   * is what the next call is refused by). The task is re-read here rather than
+   * taken from the caller's copy: a search updates the discovery ledger while
+   * it runs, and writing the caller's older payload back would erase it.
+   */
+  function spendOnTask(taskId: string, what: "searches" | "reads" | "gapRounds", amount = 1): ReportTask {
+    const task = requireTask(taskId);
+    const usage: ResearchUsage = {
+      ...task.usage,
+      [what]: task.usage[what] + amount,
+    };
+    const attempt =
+      task.attempt === undefined ? undefined : { ...task.attempt, [what]: task.attempt[what] + amount };
+    return updateTask(task, { usage, ...(attempt === undefined ? {} : { attempt }) });
+  }
+
+  /** The counts one discovery call adds to the project's request ledger. */
+  interface DiscoveryTelemetryUpdate {
+    readonly attemptedRequests: number;
+    readonly successfulRequests: number;
+    readonly failedRequests: number;
+    readonly lastProvider: string | null;
+    readonly lastElapsedMs: number | null;
+    /** `undefined` keeps the previous failure; `null` clears it (a success). */
+    readonly lastFailure?: DiscoveryTelemetry["lastFailure"] | undefined;
+  }
+
+  /** The discovery ledger, advanced by the physical attempts of one call. */
+  function recordDiscovery(taskId: string, outcome: DiscoveryTelemetryUpdate): ReportTask {
+    const task = requireTask(taskId);
+    const previous = task.discovery;
+    const next: DiscoveryTelemetry = {
+      attemptedRequests: (previous?.attemptedRequests ?? 0) + outcome.attemptedRequests,
+      successfulRequests: (previous?.successfulRequests ?? 0) + outcome.successfulRequests,
+      failedRequests: (previous?.failedRequests ?? 0) + outcome.failedRequests,
+      lastProvider: outcome.lastProvider ?? previous?.lastProvider ?? null,
+      lastElapsedMs: outcome.lastElapsedMs ?? previous?.lastElapsedMs ?? null,
+      lastFailure: outcome.lastFailure === undefined ? (previous?.lastFailure ?? null) : outcome.lastFailure,
+    };
+    return updateTask(task, { discovery: next });
+  }
+
+  /**
+   * Starts a new bounded attempt on a task.
+   *
+   * The first research pass and a retry both come through here, which is what
+   * keeps「这一次研究」one thing: the deadline is counted from this moment, the
+   * search/read/gap counters that govern the pipeline start at zero, and the
+   * lifetime usage keeps everything that was ever spent.
+   */
+  function beginAttempt(task: ReportTask, reason: string): { readonly task: ReportTask; readonly attempt: ResearchAttempt } {
+    const attempt: ResearchAttempt = {
+      number: (task.attempt?.number ?? 0) + 1,
+      startedAt: isoNow(),
+      searches: 0,
+      reads: 0,
+      gapRounds: 0,
+      reason,
+    };
+    const updated = updateTask(task, {
+      status: "researching",
+      error: null,
+      usage: { ...task.usage, startedAt: attempt.startedAt },
+      attempt,
+    });
+    return { task: updated, attempt };
+  }
+
+  /**
+   * The user's decision to research this project again after it stopped.
+   *
+   * Retrying is not resetting: the brief, the subjects, the dimensions, every
+   * source, every piece of evidence, the report and every frozen revision stay
+   * exactly where they are — what changes is that the failure which was
+   * blocking the project is cleared and a new, bounded attempt begins. The
+   * attempt is why the old `startedAt` cannot reject the retry it just
+   * allowed, and why the project's lifetime counters are never wound back: the
+   * work that happened is still recorded as having happened.
+   */
+  function retryResearch(taskId: string): RetryResearchResult {
+    const task = repo.getTask(taskId);
+    if (task === undefined) {
+      return {
+        ok: false,
+        reason: "task_unknown",
+        problems: [`没有找到研究任务：${taskId}`],
+        guidance: "请确认任务 id。",
+        conflict: true,
+      };
+    }
+    if (task.confirmedAt === null) {
+      return {
+        ok: false,
+        reason: "brief_unconfirmed",
+        problems: ["这个项目的研究简报还没有确认，研究从未开始，也就不存在可以重试的运行"],
+        guidance: "请先确认研究简报，再开始研究。",
+        conflict: true,
+      };
+    }
+    if (task.status !== "failed") {
+      return {
+        ok: false,
+        reason: "not_recoverable",
+        problems: [`只有失败的项目可以重新研究，这个项目的状态是「${task.status}」`],
+        guidance:
+          task.status === "researching"
+            ? "项目正在研究中：请等待当前运行结束，或让助手基于已有材料继续。"
+            : "项目没有停在失败上；如果需要补充材料，请让助手发起一次补查。",
+        conflict: true,
+      };
+    }
+    if (repo.listRuns(taskId).some((record) => record.status === "running")) {
+      return {
+        ok: false,
+        reason: "run_in_progress",
+        problems: ["这个项目还有一次运行正在进行中"],
+        guidance: "请等待当前运行结束后再重新研究，避免两次运行同时写入同一个项目。",
+        conflict: true,
+      };
+    }
+    const begun = beginAttempt(task, "用户请求重新研究（保留原有材料、报告与冻结版本）");
+    const preserved = {
+      sources: repo.listSources(taskId).length,
+      evidence: repo.listEvidence(taskId).length,
+      assessments: repo.listAssessments(taskId).length,
+      reports: repo.listReports(taskId).length,
+      revisions: repo.listRevisions(taskId).length,
+      reportKept: begun.task.currentReportId !== null,
+    };
+    recordActivity(taskId, "retry_started", "info", "重新开始研究：保留已有的来源、证据、报告与冻结版本", {
+      stage: "preparing",
+    });
+    return {
+      ok: true,
+      task: begun.task,
+      attempt: begun.attempt,
+      preserved,
+      message:
+        preserved.sources > 0
+          ? `已重新开始研究。原有的 ${preserved.sources} 个来源与 ${preserved.evidence} 条证据保留不变${preserved.reportKept ? "，报告正文也不会被自动改写" : ""}。`
+          : "已重新开始研究。这个项目此前没有留下可用的来源或证据，将重新检索。",
+    };
+  }
+
+  /**
+   * A stored source as the candidate it was discovered as.
+   *
+   * The corpus is deduplicated by the identity of a *work* — DOI, arXiv id,
+   * normalized URL — so the stored source has to be expressible in the same
+   * terms the providers return. Nothing is invented here: a field the source
+   * does not carry stays empty, and an empty key simply does not participate in
+   * the comparison.
+   */
+  function sourceOfCandidate(source: Source): SearchCandidate {
+    return {
+      provider: (source.discovery.provider === "openalex" ? "openalex" : "arxiv") as SearchCandidate["provider"],
+      providerId: source.discovery.providerId ?? "",
+      title: source.title,
+      authors: source.authors,
+      abstract: source.abstract,
+      landingUrl: source.url,
+      pdfUrl: source.pdfUrl,
+      publishedAt: source.publishedAt,
+      doi: source.doi,
+      venue: source.venue,
+      arxivId: arxivIdOf(source.url) ?? arxivIdOfDoi(source.doi) ?? null,
+    };
   }
 
   /** The action budget governing this task's session, when one is a user's. */
@@ -1047,7 +1389,12 @@ export function createResearchService(options: ResearchServiceOptions): Research
       return undefined;
     }
 
-    const started = task.usage.startedAt;
+    // The pipeline budget is enforced against the current *attempt*, not against
+    // the project's lifetime totals: a retry is allowed to research again, and
+    // the numbers that bound it are this attempt's own. On a task that never
+    // retried, the two are the same object, and nothing about this path changes.
+    const usage = governingUsage(task);
+    const started = usage.startedAt;
     if (started !== undefined) {
       const elapsed = now().getTime() - new Date(started).getTime();
       if (elapsed > task.budget.deadlineMs) {
@@ -1060,28 +1407,28 @@ export function createResearchService(options: ResearchServiceOptions): Research
     }
     switch (what) {
       case "search":
-        if (task.usage.searches >= task.budget.maxSearches) {
+        if (usage.searches >= task.budget.maxSearches) {
           return {
             ok: false,
-            problems: [`搜索次数已达上限（${task.usage.searches}/${task.budget.maxSearches}）`],
+            problems: [`搜索次数已达上限（${usage.searches}/${task.budget.maxSearches}）`],
             guidance: "请读取已知候选来源，并用 assess_coverage 评估覆盖情况。",
           };
         }
         break;
       case "read":
-        if (task.usage.reads >= task.budget.maxReads) {
+        if (usage.reads >= task.budget.maxReads) {
           return {
             ok: false,
-            problems: [`读取次数已达上限（${task.usage.reads}/${task.budget.maxReads}）`],
+            problems: [`读取次数已达上限（${usage.reads}/${task.budget.maxReads}）`],
             guidance: "请停止读取，评估矩阵并用已有证据生成报告；缺少依据的项目如实标注。",
           };
         }
         break;
       case "gap":
-        if (task.usage.gapRounds >= task.budget.maxGapRounds) {
+        if (usage.gapRounds >= task.budget.maxGapRounds) {
           return {
             ok: false,
-            problems: [`定向补查轮次已达上限（${task.usage.gapRounds}/${task.budget.maxGapRounds}）`],
+            problems: [`定向补查轮次已达上限（${usage.gapRounds}/${task.budget.maxGapRounds}）`],
             guidance: "补查预算已用完：请在报告中明确写出仍未找到依据的比较项。",
           };
         }
@@ -1823,13 +2170,28 @@ export function createResearchService(options: ResearchServiceOptions): Research
     },
 
     startResearch(taskId) {
-      const task = requireTask(taskId);
-      return updateTask(task, { status: "researching", usage: { ...task.usage, startedAt: isoNow() } });
+      return beginAttempt(requireTask(taskId), "用户确认任务后开始研究").task;
     },
 
     failTask(taskId, error) {
       const task = requireTask(taskId);
       updateTask(task, { status: "failed", error });
+      recordActivity(taskId, "stage_failed", "error", error, { stage: "failed" });
+    },
+
+    retryResearch(taskId) {
+      return retryResearch(taskId);
+    },
+
+    activityOf: (taskId, limit) => repo.listActivity(taskId, limit),
+
+    recordActivity(input) {
+      return recordActivity(input.taskId, input.kind, input.level ?? "info", input.message, {
+        ...(input.stage === undefined ? {} : { stage: input.stage }),
+        ...(input.provider === undefined ? {} : { provider: input.provider }),
+        ...(input.attempt === undefined ? {} : { attempt: input.attempt }),
+        ...(input.nextRetryAt === undefined ? {} : { nextRetryAt: input.nextRetryAt }),
+      });
     },
 
     getTask: (taskId) => repo.getTask(taskId),
@@ -1842,18 +2204,102 @@ export function createResearchService(options: ResearchServiceOptions): Research
       if (budgetStop !== undefined) return budgetStop;
 
       const limit = Math.max(1, Math.min(task.budget.maxCandidatesPerSearch, input.limit ?? task.budget.maxCandidatesPerSearch));
-      const outcome = await searchImpl(input.query, {
-        limit,
-        ...(input.signal === undefined ? {} : { signal: input.signal }),
+      const startedAt = now().getTime();
+      recordActivity(task.id, "search_started", "info", `开始检索：${input.query}`, {
+        stage: currentStageOf(task.id),
+      });
+
+      let outcome: SearchOutcome;
+      try {
+        outcome =
+          options.search === undefined
+            ? await searchSources(input.query, {
+                ...options.discovery,
+                limit,
+                breaker: options.discovery?.breaker ?? breaker,
+                ...(input.signal === undefined ? {} : { signal: input.signal }),
+                // Inside a stage, what discovery does is what the reader is
+                // waiting for: every request, refusal, wait and switch becomes
+                // a line of this project's own history.
+                onEvent: (event: DiscoveryEvent) => {
+                  recordActivity(task.id, event.kind, event.level, event.message, {
+                    ...(event.attempt === undefined ? {} : { attempt: event.attempt }),
+                    provider: event.provider,
+                    ...(event.nextRetryAt === undefined ? {} : { nextRetryAt: event.nextRetryAt }),
+                  });
+                },
+              })
+            : await searchImpl(input.query, {
+                limit,
+                ...(input.signal === undefined ? {} : { signal: input.signal }),
+              });
+      } catch (error) {
+        // A search that could not reach any provider is an *answer* the model
+        // has to be able to act on — never an exception that leaves a run
+        // looking like it did nothing, and never a silent retry loop. The
+        // request ledger is advanced first, so「0 次检索」can no longer hide
+        // the failed requests that produced it.
+        const failure = error instanceof SearchError ? error : undefined;
+        const elapsed = now().getTime() - startedAt;
+        const attempts = failure?.attempts ?? [];
+        recordDiscovery(task.id, {
+          attemptedRequests: Math.max(attempts.length, 1),
+          successfulRequests: attempts.filter((attempt) => attempt.ok).length,
+          failedRequests: Math.max(attempts.filter((attempt) => !attempt.ok).length, 1),
+          lastProvider: failure?.provider ?? null,
+          lastElapsedMs: elapsed,
+          lastFailure: {
+            at: isoNow(),
+            provider: failure?.provider ?? "unknown",
+            kind: failure?.kind ?? "network_error",
+            status: failure?.status ?? null,
+            userMessage: failure?.userMessage ?? "检索请求失败",
+          },
+        });
+        if (failure?.kind !== "aborted") {
+          recordActivity(task.id, "search_failed", "error", failure?.userMessage ?? "检索请求失败", {
+            provider: failure?.provider,
+            nextRetryAt: failure?.retryAfterMs === null || failure?.retryAfterMs === undefined ? null : new Date(now().getTime() + failure.retryAfterMs).toISOString(),
+          });
+        }
+        return {
+          ok: false,
+          problems: [
+            failure === undefined
+              ? `检索失败：${error instanceof Error ? error.message : "未知错误"}`
+              : failure.userMessage,
+          ],
+          guidance:
+            failure?.kind === "aborted"
+              ? "本次检索已被取消，没有产生候选。"
+              : "检索服务当前不可用（不是「主题没有资料」）。不要反复调用 search_sources：请基于已读取的材料继续评估与写作，并把缺少依据的项目如实写成缺口。",
+        };
+      }
+
+      const attempts = outcome.attempts ?? [];
+      recordDiscovery(task.id, {
+        attemptedRequests: attempts.length,
+        successfulRequests: attempts.filter((attempt) => attempt.ok).length,
+        failedRequests: attempts.filter((attempt) => !attempt.ok).length,
+        lastProvider: outcome.provider,
+        lastElapsedMs: now().getTime() - startedAt,
+        lastFailure: null,
       });
 
       const known = new Set(repo.listSources(task.id).map((source) => source.url));
+      // A work is the same work whoever listed it: the corpus is keyed by DOI,
+      // arXiv id and normalized URL, so a fallback provider listing a paper
+      // arXiv already found adds a hit to the search's provenance rather than a
+      // duplicate row the report could cite twice.
+      const knownKeys = new Set(repo.listSources(task.id).flatMap((source) => candidateKeys(sourceOfCandidate(source))));
       const target: CellRef | null = input.targetCell ?? null;
       const created: SearchResult["sources"][number][] = [];
-      for (const candidate of outcome.candidates) {
-        const url = candidate.absUrl;
-        const alreadyKnown = known.has(url);
-        const existing = repo.listSources(task.id).find((source) => source.url === url);
+      for (const candidate of dedupeCandidates(outcome.candidates)) {
+        const url = candidate.landingUrl;
+        const keys = candidateKeys(candidate);
+        const existing = repo
+          .listSources(task.id)
+          .find((source) => source.url === url || keys.some((key) => candidateKeys(sourceOfCandidate(source)).includes(key)));
         if (existing !== undefined) {
           created.push({
             sourceId: existing.id,
@@ -1864,8 +2310,10 @@ export function createResearchService(options: ResearchServiceOptions): Research
             abstract: existing.abstract.slice(0, 400),
             alreadyKnown: true,
           });
+          for (const key of keys) knownKeys.add(key);
           continue;
         }
+        const alreadyKnown = known.has(url) || keys.some((key) => knownKeys.has(key));
         const source: Source = {
           id: newId(ID_PREFIX.source),
           taskId: task.id,
@@ -1876,11 +2324,13 @@ export function createResearchService(options: ResearchServiceOptions): Research
           pdfUrl: candidate.pdfUrl,
           doi: candidate.doi,
           publishedAt: candidate.publishedAt,
-          venue: candidate.primaryCategory.length > 0 ? `arXiv ${candidate.primaryCategory}` : "arXiv",
+          venue: candidate.venue,
           abstract: candidate.abstract,
           discovery: {
-            provider: outcome.provider,
+            provider: candidate.provider,
+            providerId: candidate.providerId,
             query: input.query,
+            requestUrl: outcome.requestUrl,
             queriedAt: outcome.fetchedAt,
             target,
           },
@@ -1894,6 +2344,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         };
         repo.addSource(source);
         known.add(url);
+        for (const key of keys) knownKeys.add(key);
         created.push({
           sourceId: source.id,
           title: source.title,
@@ -1905,14 +2356,28 @@ export function createResearchService(options: ResearchServiceOptions): Research
         });
       }
 
+      if (created.length > 0) {
+        recordActivity(task.id, "candidates_found", "info", `找到 ${created.length} 个候选来源`, {
+          provider: outcome.provider,
+        });
+      }
+      // A degraded search says so: a thin result set is a different fact from a
+      // topic without literature, and the provider that refused to answer is
+      // part of the answer's provenance.
+      const degraded =
+        (outcome.providerFailures ?? []).length === 0
+          ? ""
+          : `；另有 ${(outcome.providerFailures ?? []).map((failure) => failure.userMessage).join("；")}`;
+
       // The task's counter is cumulative telemetry and always moves; which
       // budget *refuses the next call* is the thing that differs, so the
       // remaining count is reported against whichever one governs this run.
-      const searches = task.usage.searches + 1;
-      updateTask(task, { usage: { ...task.usage, searches } });
-      const action = userActionOf(task);
+      const spent = spendOnTask(task.id, "searches");
+      const searches = spent.usage.searches;
+      const action = userActionOf(spent);
       if (action !== undefined) spend(action, "searches");
       const actionUsage = action === undefined ? undefined : usageOf(action);
+      const budgetUsage = governingUsage(spent);
 
       return {
         ok: true,
@@ -1920,16 +2385,23 @@ export function createResearchService(options: ResearchServiceOptions): Research
         query: input.query,
         requestUrl: outcome.requestUrl,
         total: outcome.total,
+        provider: outcome.provider,
+        providersTried: outcome.providersTried ?? [outcome.provider],
+        attempts: {
+          attempted: attempts.length,
+          succeeded: attempts.filter((attempt) => attempt.ok).length,
+          failed: attempts.filter((attempt) => !attempt.ok).length,
+        },
         searchCount: searches,
         searchesRemaining:
           action === undefined || actionUsage === undefined
-            ? Math.max(0, task.budget.maxSearches - searches)
+            ? Math.max(0, spent.budget.maxSearches - budgetUsage.searches)
             : Math.max(0, action.budget.maxSearches - actionUsage.searches),
         budgetScope: action === undefined ? "project" : "user-action",
         note:
           created.length === 0
-            ? "本次检索没有返回候选：请换英文关键词或更基础的术语。搜索结果只是候选，不是依据。"
-            : "以上是检索候选（metadata）。只有 read_source 真正读取后才会产生可引用证据。",
+            ? `本次检索没有返回候选（${PROVIDER_NAMES[outcome.provider]}）${degraded}：请换英文关键词或更基础的术语。搜索结果只是候选，不是依据。`
+            : `以上是${PROVIDER_NAMES[outcome.provider]}返回的检索候选（metadata）${degraded}。只有 read_source 真正读取后才会产生可引用证据。`,
       };
     },
 
@@ -1976,9 +2448,27 @@ export function createResearchService(options: ResearchServiceOptions): Research
         if (refusal !== undefined) return refusal;
 
         const grant = userActionOf(task);
-        const outcome = await readImpl({ url: source.url }, input.signal === undefined ? {} : { signal: input.signal });
+        recordActivity(task.id, "read_started", "info", `开始读取：${source.title}`, {
+          provider: source.discovery.provider,
+        });
+        // What discovery already knows about this work travels with the read:
+        // when nothing can be fetched, the provider's own abstract is still a
+        // real — and partial — read, and the reader says which of the two
+        // happened instead of reporting a bare failure.
+        const outcome = await readImpl(
+          {
+            url: source.url,
+            metadata: {
+              provider: source.discovery.provider === "openalex" ? "openalex" : "arxiv",
+              workUrl: source.discovery.requestUrl ?? null,
+              title: source.title,
+              abstract: source.abstract,
+              doi: source.doi,
+            },
+          },
+          input.signal === undefined ? {} : { signal: input.signal },
+        );
         if (grant !== undefined) spend(grant, "reads");
-        const reads = task.usage.reads + 1;
         if (outcome.status === "failed" || outcome.scope === null) {
           repo.updateSource({
             ...source,
@@ -1990,7 +2480,10 @@ export function createResearchService(options: ResearchServiceOptions): Research
             retrievalNote: outcome.note,
             failure: outcome.failure,
           });
-          updateTask(task, { usage: { ...task.usage, reads } });
+          spendOnTask(task.id, "reads");
+          recordActivity(task.id, "read_failed", "warn", `读取失败：${source.title}（${outcome.failure ?? outcome.note}）`, {
+            provider: source.discovery.provider,
+          });
           return {
             ok: false,
             problems: [`读取失败：${outcome.failure ?? outcome.note}`],
@@ -2023,10 +2516,20 @@ export function createResearchService(options: ResearchServiceOptions): Research
           failure: null,
           snapshotId: snapshot.id,
         });
-        updateTask(task, { usage: { ...task.usage, reads } });
+        spendOnTask(task.id, "reads");
         note = outcome.note;
+        recordActivity(
+          task.id,
+          "read_completed",
+          outcome.scope === "abstract" ? "warn" : "info",
+          outcome.scope === "abstract"
+            ? `读取完成（摘要级）：${snapshot.title}`
+            : `读取完成（${scopeLabel(outcome.scope)}）：${snapshot.title}`,
+          { provider: source.discovery.provider },
+        );
       } else {
         note = `${snapshot.note}（复用已保存读取快照，未重复消耗读取预算）`;
+        recordActivity(task.id, "read_completed", "info", `复用已保存的读取快照：${snapshot.title}`);
       }
 
       // Evidence comes from the saved text, and from a range that is verified
@@ -2096,7 +2599,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         })),
         readsRemaining:
           action === undefined || actionUsage === undefined
-            ? Math.max(0, refreshed.budget.maxReads - refreshed.usage.reads)
+            ? Math.max(0, refreshed.budget.maxReads - governingUsage(refreshed).reads)
             : Math.max(0, action.budget.maxReads - actionUsage.reads),
         budgetScope: action === undefined ? "project" : "user-action",
         note: `${note}（读取范围：${scopeLabel(snapshot.scope)}；excerpt 均为保存文本中的原样片段）`,
@@ -2112,7 +2615,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         if (refusal !== undefined) return refusal;
         const action = userActionOf(task);
         if (action === undefined) {
-          task = updateTask(task, { usage: { ...task.usage, gapRounds: task.usage.gapRounds + 1 } });
+          task = spendOnTask(task.id, "gapRounds");
         } else {
           // `gapRound` counts the pipeline's own rounds: how many times the
           // agent decided on its own to go back for more. A round a person
@@ -2189,18 +2692,21 @@ export function createResearchService(options: ResearchServiceOptions): Research
       const gaps = views
         .filter((cell) => needsAttention(cell.status))
         .sort((a, b) => (a.status === b.status ? 0 : a.status === "missing" ? -1 : 1));
+      if (recorded.length > 0) {
+        recordActivity(task.id, "assessment_recorded", "info", `记录 ${recorded.length} 条支持评估（仍有 ${gaps.length} 个比较项未达到「已核对」）`);
+      }
       const action = userActionOf(task);
       const actionUsage = action === undefined ? undefined : usageOf(action);
+      const governing = governingUsage(task);
 
       return {
         ok: true,
         cells: views,
         gaps,
-        gapRoundsUsed:
-          action === undefined || actionUsage === undefined ? task.usage.gapRounds : actionUsage.gapRounds,
+        gapRoundsUsed: action === undefined || actionUsage === undefined ? governing.gapRounds : actionUsage.gapRounds,
         gapRoundsRemaining:
           action === undefined || actionUsage === undefined
-            ? Math.max(0, task.budget.maxGapRounds - task.usage.gapRounds)
+            ? Math.max(0, task.budget.maxGapRounds - governing.gapRounds)
             : Math.max(0, action.budget.maxGapRounds - actionUsage.gapRounds),
         budgetScope: action === undefined ? "project" : "user-action",
         note:

@@ -10,6 +10,8 @@
 
 ## Current Status（2026-10-08）
 
+- **Step 3.7A（Research Runtime Reliability）已完成**：真实用户测试发现的「arXiv 429 → 研究彻底停下、模型反复无效检索、界面说可以重试却没有 Retry API、失败请求统计不到、用户不知道在等什么」按有界重试 / 备用 Provider / 熔断 / 请求台账 / 活动日志 / 进度 DTO / Retry API 全部修完，并用真实网络 smoke 验证「arXiv 失败 → 备用检索（OpenAlex）→ 真实读取 → 快照与证据」。没有重写 Agent Core / Host / Protocol / Client，没有新增通用搜索框架、Web Search、MinerU、MCP、文件上传、Intent Discovery，没有改 Brief / Guide / Proposal / Evidence / Claim 语义，没有重做前端（正式进度页与 Activity Log UI 属于下一轮）。
+
 - **Step 3.6B（Navigation, Status & Trust UX）已完成**：3.6A 已经正确的业务语义接上了界面——项目只剩三个一级工作空间（报告 → 研究 → 来源），研究范围退到项目标题旁（未确认的项目自动以它为主流程），样式退到报告工具栏（不再叫「模板」），顶栏不再常驻检索/读取额度、只回答「这个项目现在发生什么」并可展开六条并列事实；补查结果第一句回答「问题解决了吗」（已解决 / 部分解决 / 未解决），工具次数折叠在结果之后，「查看本轮证据」只打开这一轮新增的来源 / 证据 / 支持评估与仍未解决的缺口，并能回到刚才那一轮对话；提案在待确认时完整展开、决定后折叠成一行、没形成提案时不出现任何「接受」按钮；未知角色、旧报告的空白单元格、质量核验详情、动作提示跨页残留与内部术语全部按读者语言收口。未做 PDF / Mermaid / Upload / MCP / 第二 Blueprint / Tauri，未改任何后端语义（本轮没有一处 server / plugin 改动）。
 
 - **Step 3.6A（Product Trust & Co-edit Reliability）已完成**：一次独立真实验收发现的「看到的状态、结果与可执行操作不可信」按 P0/P1 修完——待接受提案在生成时就通过报告自身的内容契约（改不下去就不会出现「接受」按钮），比较表与提案表格不再出现空白单元格，补查结果先回答「问题解决了吗」，提案上的「新增」是这次动作真实的增量，来源角色未分类不再被当成「0 个一手材料」，项目状态拆成六个互不代偿的字段。未改视觉、未做 PDF / Mermaid、未进入 Next Action。
@@ -31,6 +33,87 @@
 - **Vertical Product 可真实演示**：Topic → Task Card → 确认 → 真实检索/读取 → Evidence Matrix → 缺口定向补查（≤2 轮）→ 结构化报告 → HTML 预览 → PDF 下载 → 刷新重开。
 - **Step 1（Research Editing Semantics）已完成**：Ask / Research / Edit 三种正式意图由应用签发 Action Grant 约束；Edit 产出待接受 Proposal；报告版本可冻结、导出只读冻结依赖包；矩阵状态不再由「有正文片段」直接升级为充分。
 - 真实 Demo 两个主题此前均通过（真实模型 + 真实 arXiv + 真实 Chrome PDF）；Step 2 后又用新版各重跑一次（见「Current Status」与「Step 2 的验证入口」）。
+
+## Step 3.7A 新增（本次工作产物）
+
+本轮只做一件事：**发现环节失败时，研究仍然能走完**——有界重试、备用 Provider、熔断、请求台账、可读活动日志、真实进度、以及一个真能用的 Retry。没有重写 Agent Core / Host / Protocol / Client，没有新增通用搜索插件框架、没有 Web Search / MinerU / MCP / 文件上传 / Intent Discovery，没有改 Brief / Guide / Proposal / Evidence / Claim 契约，没有重做前端。
+
+### 发现契约与错误分类（`search.ts` 重写）
+
+- **候选不再是 arXiv 形状的容器**：`SearchCandidate` 现在带 `provider`（谁发现的）、`providerId`（Provider 自己的 id）、`landingUrl`（读者真实会打开的页面）、`venue`、`doi`、`pdfUrl`、`abstract`，以及**只在它确实是 arXiv 预印本时**才有的 `arxivId`。OpenAlex 的 work id 不会被写进 arXiv 字段；arXiv id 也不会为没有它的论文凭空生成。`Source.discovery` 增加可选 `providerId` / `requestUrl`，因此「谁发现的」和「读的是哪个地址」两件事都留了痕。
+- **六类失败分类**（`SearchFailureKind`）：`rate_limited`(429) / `timeout` / `network_error` / `server_error`(5xx) / `invalid_request`(不可重试的 4xx) / `aborted`。`SearchError` 携带 provider、status、`retryable`、`userMessage`（给读者的句子）、`technical`（只进日志）、`retryAfterMs` 以及**它之前真实发出的物理请求**（`attempts`）。
+- **单次请求超时 20s → 35s**（`DEFAULT_TIMEOUT_MS`），这是唯一收紧/放宽的时限；超时现在是可重试分类，所以多给的时间才有意义。
+
+### 有界重试与间隔（`requestWithRetries` / `rateLimitedFor`）
+
+- 一次逻辑请求最多 **2 次物理尝试**；失败按分类决定是否重试；退避 **5–10s**，`Retry-After` 优先但在上限内截断（provider 说「等一小时」不会把 run 挂住）；**所有等待都可被 AbortSignal 打断**，且取消后**不再重试、也不切换到备用 Provider**（`discovery.ts` 里 `aborted` 直接抛出）。
+- **整个 discovery 调用有一个 60s 总上限**（`DEFAULT_DISCOVERY_BUDGET_MS`）：每次物理请求的 timeout 取 `min(35s, 剩余预算)`，退避也会被预算截断，所以「arXiv 慢 + OpenAlex 慢」不会变成两分钟。arXiv 的 **3s 请求间隔**（`PROVIDER_INTERVALS.arxiv`）在重试路径上照样生效（等待与间隔取实际约束）。
+- 查询阶梯（all terms → 前 3 → 前 2 → 前 1）仍然只在 arXiv 侧使用；OpenAlex 一次查询一次请求。
+
+### 熔断（`ProviderCircuitBreaker`，`discovery.ts`）
+
+- 一个 Provider 一条记录：连续失败次数、可以再次探测的时间、失败原因。**明确限流（429）立即打开**；其它可重试失败累计到阈值打开；**计数的是失败的物理请求**（一次调用把两次尝试都耗在超时上，就已经证明它不答了）。冷却 90s（`Retry-After` 更长时最多 120s），冷却期间不再请求同一端点、直接走备用 Provider，**到期后允许重新探测，一次成功即清除记录**——因此熔断永远不会变成永久禁用。
+
+### 第二 Provider：OpenAlex（`openalex.ts`）
+
+- 选它的理由是可验证的：**免密钥**（只有静态 `mailto` 表明身份）、真实可访问、返回标题/作者/DOI/年份/venue/landing page/OA PDF/摘要。`select` 明确列出只读这些字段，不读的不要。
+- **摘要按位置重建**：OpenAlex 存的是 word → positions 的倒排索引，`abstractFromInvertedIndex` 按位置还原成论文自己的摘要（不是产品写的转述）；格式不对就留空，不猜。
+- **真实可读性是硬点**：优先用出版方 landing page（非 doi.org）、其次 best OA landing page、再次 arXiv abs（当真身是 arXiv 预印本时）、最后才是 DOI 链接；`arxivId` 只从 arXiv URL 或 `10.48550/arxiv.…` DOI 得出。
+- **非 arXiv 来源也只有一条诚实的退路**：`read.ts` 接受 `metadata`（Provider 记录里的 title/abstract/workUrl），当所有可 fetch 的路都失败（付费墙、只有 PDF、arXiv 当天挂了）时，把**论文自己的摘要**按 `abstract` 级保存，note 明说「不是正文，不能当正文证据」，`readUrl` 指向 Provider 的记录。摘要级证据在既有覆盖规则下到不了「已核对」，`metadata != evidence` 的边界没有被放宽。
+
+### 去重与来源追踪
+
+- 一个作品的身份是 **DOI（归一化）→ arXiv id（归一化）→ 归一化 URL**（去 `www` / 尾斜杠 / 版本号 / 大小写），Provider 自己的 id 只作为补充键：两次检索、两个 Provider 命中同一篇论文只留一条 source，**先发现者即它记录的 provider**；重复命中会在检索结果的 provenance 里体现，而不是多建一行可被报告引用两次的来源。
+
+### 请求台账（`DiscoveryTelemetry`）与工具结果
+
+- 任务上新增 `discovery`：`attemptedRequests / successfulRequests / failedRequests / lastProvider / lastElapsedMs / lastFailure{at,provider,kind,status,userMessage}`。**失败请求不再隐身**：`usage.searches` 只记成功检索（预算语义不变），而失败的物理请求记进台账，两者不混算。
+- `search_sources` 的结果新增 `provider / providersTried / attempts{attempted,succeeded,failed}`，`note` 会说出「另有 arXiv：请求过于频繁（HTTP 429）」这种降级信息；工具描述写明**检索不可用时不要反复重复调用**，改为基于已有材料收尾并如实写缺口。
+- 一个 Provider「答复了但零候选」优先于另一个 Provider「拒绝了」：此时返回的是这次检索的真实结果（0 候选 + `providerFailures`），而不是把「arXiv 限流 + OpenAlex 没找到」说成「检索失败」。
+
+### 活动日志（用户可读，持久化）
+
+- 新表 `research_activity`（`CREATE TABLE IF NOT EXISTS`，每任务保留最近 300 条）。每条 = `timestamp / stage / level / message / kind`，必要时带 `provider / attempt / nextRetryAt`。
+- 事件来自事实发生的地方：discovery 里的 `request_started / request_failed / retry_wait / provider_skipped / provider_fallback / candidates_found / search_empty`，service 里的 `search_started / search_failed / read_started / read_completed / read_failed / assessment_recorded / retry_started`，runner 里的 `stage_started / stage_completed / stage_failed`。**没有模型推理、没有工具 payload、没有凭据**；日志经 `GET /tasks/:id` 的 `activityLog` 下发，刷新后照样能读。
+
+### 进度 DTO（`presentation.ts: researchProgressOf`）
+
+- `progress`：`currentStage / displayName / currentMessage / completedStages / lastActivityAt / searchAttempts / candidatesFound / sourcesRead / currentProvider / retrying / waitingUntil`。阶段覆盖 preparing / searching / reading / assessing / gap_research / reporting / validating / answering / editing / waiting_retry / completed / failed（外加辅助的 `retrying`）。
+- **阶段来自 run 记录，阶段内部在做什么来自活动流**（research stage 会在 searching / reading / assessing 之间移动）；残留的旧事件不会让正在写报告的 run 看起来在检索。**没有百分比、没有「63%」**——测试直接断言产物里没有 `%` 与 `progress` 这类字段。
+
+### 真正的失败恢复（`POST /api/research/tasks/:id/retry-research`）
+
+- 资格：任务存在（否则 404）、Brief 已确认（否则 409 `brief_unconfirmed`）、状态停在失败上（否则 409 `not_recoverable`）、该任务没有正在跑或排队的 stage（否则 409 `run_in_progress`；runner 新增 `hasWorkFor(taskId)`，把「正在执行的」与「排队中的」一起回答）。
+- 保留：任务、Brief、subjects、dimensions、Source、Evidence、Assessment、Report、Frozen Revision **一个都不动**；清掉的是失败阻塞态（`error = null`）与流水线预算，然后 `runner.startResearch` 重新进入研究流水线。响应带 `attempt` 与 `preserved{sources,evidence,assessments,reports,revisions,reportKept}` 和一句人话。
+- **attempt-local budget（本轮的关键设计）**：`ReportTask.attempt = { number, startedAt, searches, reads, gapRounds, reason }`。`startResearch`（含 Retry）开一次新 attempt；流水线预算的 deadline 从 **attempt.startedAt** 起算、搜索/读取/补查轮次比对 **attempt 的计数**；`usage` 保持 lifetime telemetry 只增不减。因此**旧的 `startedAt` 不会再拒绝它刚刚允许的 Retry**，也没有「重置整个项目 lifetime usage」这种掩盖式做法；runner 的 gap 轮次与「阶段失败自动重试一次」也按 attempt 边界计数。
+- Retry **不签发任何 User ActionGrant**：预算分账照旧（`actionBudgetOf` 在 Retry 后仍为 undefined，之后的检索 `budgetScope = "project"`）。
+
+### 失败必须说清原因（`runner.ts: researchFailureCopy`）
+
+- 「研究阶段没有成功读取任何来源；可以重试或更换主题。」被删除。现在按 discovery 台账分三种说真话：**检索服务都不可用**（给出 provider 与分类，「论文检索暂时不可用：arXiv：请求过于频繁（HTTP 429）。备用检索服务也没有取得可读取的材料。已有的研究范围与已读材料都保留了，可以重新研究（重试），或稍后再试。」）／**检索到了候选但没有一个可读**（附最近一次失败原因）／**没有取得任何候选**。HTTP 429 不会被说成「主题不合适」，网络故障不会被伪装成学术结论。
+
+### 后端改动清单
+
+| 位置 | 改动 |
+| --- | --- |
+| `packages/plugin-research/src/search.ts` | 重写：provider 中立的候选/结果、六类错误分类、`requestWithRetries`、`retryDecisionOf`、`rateLimitedFor`、去重键、事件类型；arXiv provider 保留 `searchArxiv` / `parseArxivFeed` / `queryLadder` |
+| `packages/plugin-research/src/openalex.ts`（新） | OpenAlex provider：`searchOpenAlex` / `parseOpenAlexWorks` / `abstractFromInvertedIndex` |
+| `packages/plugin-research/src/discovery.ts`（新） | `searchSources`（provider 顺序、备用切换、降级信息、总预算）+ `ProviderCircuitBreaker` |
+| `packages/plugin-research/src/domain.ts` | `SearchCandidate` 相关类型以外的领域新增：`ResearchAttempt`、`DiscoveryTelemetry`、`ResearchActivityEvent`/`Kind`/`Level`、`ResearchProgressStage`、`ReportTask.attempt`/`discovery`、`Source.discovery.providerId`/`requestUrl`、`ID_PREFIX.activity` |
+| `packages/plugin-research/src/repository.ts` | `research_activity` 表 + `appendActivity` / `listActivity`（每任务上限 300 条） |
+| `packages/plugin-research/src/read.ts` | `ReadRequest.metadata` 与 abstract 级兜底路径（诚实标注来源，绝不冒充正文） |
+| `packages/plugin-research/src/service.ts` | `search` 捕获分类失败并返回可行动拒绝（新增 `provider/providersTried/attempts`）、台账累加、活动记录、`read` 传 metadata 并记录读取事件、`assess` 事件、`spendOnTask` 双账本、`beginAttempt`/`retryResearch`、公开 `recordActivity`/`activityOf`、`discovery` 注入缝（测试可用假 socket 跑真代码） |
+| `apps/research/src/server/presentation.ts` | `researchProgressOf` 进度投影（含 `waiting_retry` 与 `waitingUntil`） |
+| `apps/research/src/server/runner.ts` | 阶段活动事件、`progressStageOf`、attempt 作用域的 gap/stage 计数、`researchFailureCopy`、`hasWorkFor(taskId)`、`activeRequest` |
+| `apps/research/src/server/routes.ts` | bundle 新增 `attempt` / `discovery` / `progress` / `activityLog`；新增 `POST /tasks/:id/retry-research` |
+| `apps/research/src/browser/api.ts` | DTO 补齐（`attempt` / `discovery` / `progress` / `activityLog`）+ `api.retryResearch()`；**未改任何视图**（正式进度页与日志 UI 属于下一轮） |
+
+### 测试
+
+- `packages/plugin-research/tests/discovery-resilience.test.ts`（12 例，A/B/C/D/E/F/G/H/I/J，全部确定性，注入 fetch 与 sleep）：429 有界重试并遵守 Retry-After、连续 429 切备用、返回真实 provider 与真实 arXiv id、OpenAlex 零候选是「诚实答复」而不是失败、备用候选真的走到 Snapshot + Evidence、不可读候选不产生证据、只有摘要时标 abstract 级且到不了「已核对」、全部失败时给出明确句子且请求次数有界、取消不重试不切备用、熔断生效且冷却后能恢复、失败请求进台账而不进 `usage.searches`、活动日志记下 retry/fallback/failure 且不含堆栈或凭据。
+- `apps/research/tests/retry-api.test.ts`（5 例，K/L/M/N/O，HTTP → runner → host → tools → DB 全链路，脚本化模型 + 固定 fixture）：失败项目经 Retry API 恢复且失败原因写明 HTTP 429（不出现「主题不合适」）、运行中/未确认/未失败三种拒绝与 404、旧 `startedAt` 不再挡住 Retry、材料与报告与冻结版本全部保留且正文不被改写、Retry 不签发 user grant 且两本账分账正确。
+- `apps/research/tests/research-progress.test.ts`（7 例）：阶段判定（含阶段内部移动、旧事件不污染当前阶段）、等待态与 `waitingUntil`、请求/候选/读取计数来自真实记录、已完成阶段列表、失败态使用项目自己记录的原因、**产物里没有百分比**。
+- 真实网络 smoke（`RESEARCHPAGE_REAL_NETWORK=1`，9 例）：arXiv 当前状态如实记录（不猜）、OpenAlex 真实候选与元数据、备用候选真实读取为 full_text 快照并产生可校验片段、「arXiv 不可用（模拟）→ 真实 OpenAlex → 真实读取 → 验证 excerpt」的完整链路。
 
 ## Step 3.6B 新增（本次工作产物）
 
@@ -435,6 +518,18 @@ bundle 新增 `presentation`，六个字段各自回答一个问题，都由真�
 
 ## 已知限制
 
+- 研究运行可靠性（Step 3.7A 后仍存在的限制）：
+  - **界面未接**：`progress` / `activityLog` / `retryResearch` 只有 API 与 DTO，没有画出来（属于 STEP 3.7B）。用户现在读到的失败原因是可行动的，但「重新研究」这个动作只能从 API 发起。
+  - **备用 Provider 只有一个**（OpenAlex），没有 Provider Marketplace，也没有任意 Web Search：这是有意的范围裁剪，不是待补的能力。
+  - **熔断状态活在进程内存里**（每个 service 实例一份）：重启即清空，与既有 Action Grant 的存活语义一致；没有做跨进程/跨机器的限流协调。
+  - **非 arXiv 来源的可读性仍然取决于出版方**：能读到 HTML 正文就记 `full_text/body_excerpt`，只有 PDF 或付费墙时按 `abstract` 级保存 Provider 记录里的真实摘要（chapter 里已说明），**仍然不解析 PDF 正文**。摘要级材料按既有覆盖规则到不了「已核对」。
+  - **一次 search_sources 的总上限是 60s**（arXiv 自身 2 次尝试 + 退避 + 备用 Provider 都算在里面）。预算用完时旧记录如实报告失败原因，不会为了凑够备用 Provider 的机会无限延长。
+  - **重试是手动的**：Retry API 由用户/前台发起；产品没有「等一会儿自动重试」的机制（冷却由熔断在 Provider 级别处理，不改变这一点）。
+  - **重复的失败调用是有界的，但不是由预算拦住的**：一次 `search_sources` 最多 4 次物理请求（两个 Provider 各 2 次）且总耗时 60s 封顶；被测熔断的 Provider 在下一次调用里会被直接跳过（快速失败）；工具结果明确要求「不要反复重复调用」；剩下的边界由 host 的单 run 步数上限与 stage 超时兜住。`usage.searches` 不因失败增长，所以「失败」永远不会伪装成「已用完预算」。
+  - `pipeline` 的搜索预算按 attempt 计数，因此**一次 Retry 会重新拿到完整的 searches/reads/gapRounds**（这正是「重新进入 Research Pipeline」的含义），而 lifetime `usage` 继续只增不减——两本账都真实，但它们回答的是不同的问题。
+  - 真实网络 smoke 依赖当天服务可达：`real-network.test.ts` 会如实记录 arXiv 的当前分类（429 → 记 rate_limited 而不是 FAIL），但 OpenAlex 不可达时会 FAIL，不会被写成「跳过即通过」。
+  - **`runner.hasWorkFor` 之外没有全局锁**：同一任务并发的两个 Retry 会被拒（一个已在执行/排队），但不同任务之间仍然共用 runner 的串行队列（既有行为）。
+
 - 可信性与协同修改（Step 3.6A 后仍存在的限制）：
   - **旧报告的比较表仍然是空的**（本机 4 份 v2 报告实测 16–24 个空单元格）。契约现在拒绝再产生这种内容，渲染层也为每一格给出真实状态词，但**没有改写既有数据**：要真正修好这些报告，需要重写它们的 comparison 章节（属于 artifact 质量，不在本轮范围）。
   - 因此空白单元格的规则对**本次编辑没有触碰的章节**记为 warning，而不是 error——否则「改合成章节」会因为「比较表是先前的空表」被拒绝，那条路用户走不通。新建与重新发布的报告没有任何豁免。
@@ -493,14 +588,27 @@ bundle 新增 `presentation`，六个字段各自回答一个问题，都由真�
 
 ## Next Action
 
-**STEP 4 — Artifact Delivery & Semantic Visualization**（下一步）：
+**STEP 3.7B — Intent Discovery & Unified Markdown Documents**（下一步）：
+
+- **活动日志与进度的正式界面**：3.7A 的 `progress` / `activityLog` 已经在 bundle 里（真实阶段、等待与冷却、请求与候选计数、每条活动的时间/阶段/级别/句子），本轮的 UI 缺口是它们还没被画出来；`api.retryResearch()` 也还没有按钮。界面上「失败 → 可以重试」目前仍只有文案，正式的进度页、Activity Log 与 Retry 入口属于 3.7B。
+- 3.7A 的其余后端能力（备用 Provider、熔断、台账、attempt-local 预算）已经有 API 与测试，不需要在这一轮返工。
+
+3.7A 交付后，研究在发现环节失败时仍然有界地走下去（重试 → 备用 Provider → 真实读取），全部服务不可用时给出可行动的失败原因并保留已有项目、支持重新研究；用户仍然只能看到产品写下的事实，而不是模型的推理或伪造的百分比。
+
+**STEP 4 — Artifact Delivery & Semantic Visualization**：
 
 - **PDF 双主题适配**：把 ThemeSpec 映射到 plugin 的 HTML/PDF renderer，使 Editorial / Swiss 在导出文件里也成立（现在只有 Editorial 有 PDF 版式）。工具栏的「样式（Editorial / Swiss）」已经就位，冻结时也记录 `themeId`，位置留好了。
 - **Mermaid / DiagramSpec 机制图**：机制块的结构化数据（input / intermediate / steps / output / tradeoff / failure）完整保留，交互式报告里现在是 CSS 步骤流，替换成图形渲染不需要改数据。
 - **File Upload 作为来源**、**第二 Blueprint**、**MCP 集成**：Source Workspace 与 Settings 对未接入能力已如实标注；Blueprint 信息现在显示在 Brief 与研究范围里（「技术比较」），模板页已收为「样式对照」，第二 Blueprint 出现之前不会再有「模板」这个误导性入口。
-- 3.6B 交付后，界面看到的状态、结果与可执行操作与 3.6A 的真实语义一致，STEP 4 之前没有新的「数据有了、界面没接」的缺口。
 
-3.6A 交付后，产品看到的状态、结果与可执行操作与它自己知道的真实状态一致；STEP 4（PDF 双主题、Mermaid / DiagramSpec、File Upload、第二 Blueprint、MCP）在此之前没有新的「数据有了、界面没接」的缺口。
+## Step 3.7A 的验证入口
+
+- 发现层韧性（A–J，确定性、无网络）：`npx vitest run packages/plugin-research/tests/discovery-resilience.test.ts`。
+- Retry API 全链路（K–O）：`npx vitest run apps/research/tests/retry-api.test.ts`。
+- 进度 DTO：`npx vitest run apps/research/tests/research-progress.test.ts`。
+- 真实网络 smoke（有界，会真的访问 arXiv / OpenAlex）：`RESEARCHPAGE_REAL_NETWORK=1 npx vitest run packages/plugin-research/tests/real-network.test.ts`；其中「arXiv 不可用 → 真实 OpenAlex → 真实读取」一条把 arXiv 侧模拟为 429（这是唯一无法按需复现的一件事），其余全部真实。
+- 离线全量、类型检查与构建：`pnpm typecheck`、`pnpm build:research`、`EVERY_DAGENT_NO_BROWSER=1 npx vitest run --exclude "**/real-provider.e2e.test.ts" --exclude "**/real-network.test.ts" --exclude "**/render-pdf.test.ts" --exclude "**/research-plugin.real.test.ts" --exclude "**/real-demo.e2e.test.ts"`。
+- **本次实测**（2026-10-08）：`pnpm typecheck` 三个 project 全过；`pnpm build:research` 通过；离线全量 `1869 passed / 62 skipped / 0 failed`；真实网络 smoke 9/9（arXiv 当天实测可用，OpenAlex 免密钥可用，备用候选读取为 full_text 且 excerpt 可校验）。没有跑浏览器 gate（本轮未改视觉，前端未接线）。
 
 ## Step 3.6B 的验证入口
 

@@ -188,6 +188,53 @@ export interface ResearchUsage {
   readonly startedAt?: string;
 }
 
+/**
+ * What one bounded research attempt has spent, and when it started.
+ *
+ * `usage` is the project's lifetime telemetry: it only ever grows, and it is
+ * what the workspace reports. The attempt is the thing the pipeline budget is
+ * enforced against, because a project that failed yesterday must be able to be
+ * researched again today without resetting its own history: a retry starts a
+ * new attempt, the deadline is counted from the new attempt's start, and the
+ * old searches/reads stay on the record as what they were — work that happened.
+ * Absent on tasks written before attempts existed, where the lifetime usage is
+ * read as the attempt (which is exactly what it used to be).
+ */
+export interface ResearchAttempt {
+  /** 1 for the first attempt, +1 per retry. */
+  readonly number: number;
+  readonly startedAt: string;
+  readonly searches: number;
+  readonly reads: number;
+  readonly gapRounds: number;
+  /** Why this attempt started, in the user's own words when they asked for it. */
+  readonly reason: string;
+}
+
+/**
+ * The request ledger of discovery: what was tried, and how it ended.
+ *
+ * It exists because `usage.searches` counts *successful* searches — the budget
+ * is what it is — and a run that never got an answer therefore looked like a
+ * run that never searched. A failed request is not a search, and it is not
+ * nothing either: it is an attempt with a provider and a reason, which is what
+ * a reader needs to understand「为什么还没有结果」.
+ */
+export interface DiscoveryTelemetry {
+  readonly attemptedRequests: number;
+  readonly successfulRequests: number;
+  readonly failedRequests: number;
+  readonly lastProvider: string | null;
+  readonly lastElapsedMs: number | null;
+  readonly lastFailure: {
+    readonly at: string;
+    readonly provider: string;
+    readonly kind: string;
+    readonly status: number | null;
+    readonly userMessage: string;
+  } | null;
+}
+
 export const DEFAULT_BUDGET: ResearchBudget = Object.freeze({
   maxSearches: 6,
   maxCandidatesPerSearch: 5,
@@ -267,6 +314,14 @@ export interface ReportTask {
   readonly guideClosed?: { readonly at: string; readonly reason: string } | null;
   readonly budget: ResearchBudget;
   readonly usage: ResearchUsage;
+  /**
+   * The attempt the pipeline budget currently governs, when one has started.
+   *
+   * A retry writes a new one; the lifetime usage keeps accumulating beside it.
+   */
+  readonly attempt?: ResearchAttempt;
+  /** What discovery has tried and how it ended; absent before the first search. */
+  readonly discovery?: DiscoveryTelemetry;
   readonly currentReportId: string | null;
   /** The report being accumulated, or `null` when none is in progress. */
   readonly reportDraft: ReportDraftState | null;
@@ -330,6 +385,14 @@ export interface Source {
     readonly query: string;
     readonly queriedAt: string;
     readonly target: CellRef | null;
+    /**
+     * The provider's own id for this work, and the request that produced the
+     * metadata. Kept because a source found by a fallback provider has to be
+     * traceable to the API that listed it — the page it points at and the
+     * record that made it discoverable are two different facts.
+     */
+    readonly providerId?: string;
+    readonly requestUrl?: string;
   };
   readonly readStatus: ReadStatus;
   readonly readScope: ReadScope | null;
@@ -725,6 +788,77 @@ export interface ResearchActionOutcome {
   readonly delta: ActionDelta;
 }
 
+/** How serious one line of activity is. Three levels, and no more. */
+export type ActivityLevel = "info" | "warn" | "error";
+
+/**
+ * The stages a *reader* watches, as opposed to the agent's internal ones.
+ *
+ * They are the vocabulary of「现在在做什么、为什么在等」, and they are a
+ * projection rather than a state machine: a run has one internal stage at a
+ * time, while these say what that stage is doing right now (a research stage
+ * spends its time searching, reading and assessing) and whether it is waiting
+ * for a provider to let it continue.
+ */
+export type ResearchProgressStage =
+  | "preparing"
+  | "searching"
+  | "reading"
+  | "assessing"
+  | "gap_research"
+  | "reporting"
+  | "validating"
+  | "answering"
+  | "editing"
+  | "waiting_retry"
+  | "completed"
+  | "failed";
+
+/** The machine-readable name of one activity line, for tests and the UI. */
+export type ResearchActivityKind =
+  | "stage_started"
+  | "stage_completed"
+  | "stage_failed"
+  | "search_started"
+  | "request_started"
+  | "request_failed"
+  | "retry_wait"
+  | "provider_skipped"
+  | "provider_fallback"
+  | "candidates_found"
+  | "search_empty"
+  | "search_failed"
+  | "read_started"
+  | "read_completed"
+  | "read_failed"
+  | "assessment_recorded"
+  | "retry_started";
+
+/**
+ * One line of a project's activity history, as the workspace reads it.
+ *
+ * It is deliberately not a log platform: no levels beyond three, no sinks, no
+ * configuration, and a bounded history per task. What it must be is *stored*,
+ * so a page reload still shows「arXiv 返回 429，等待重试后改用 OpenAlex」rather
+ * than an empty panel, and *user-readable*, so nothing here is a tool name, a
+ * payload or a model's reasoning.
+ */
+export interface ResearchActivityEvent {
+  readonly id: string;
+  readonly taskId: string;
+  readonly at: string;
+  readonly stage: ResearchProgressStage;
+  readonly level: ActivityLevel;
+  readonly kind: ResearchActivityKind;
+  readonly message: string;
+  /** Which provider this line is about, when it is about one. */
+  readonly provider?: string;
+  /** Which physical attempt this line is about, when it is about one. */
+  readonly attempt?: number;
+  /** When a retry or a cooldown ends, when this line is about waiting. */
+  readonly nextRetryAt?: string | null;
+}
+
 /**
  * What a user action ended as.
  *
@@ -938,4 +1072,5 @@ export const ID_PREFIX = Object.freeze({
   revision: "rev",
   assessment: "asm",
   guide: "gq",
+  activity: "actv",
 } as const);

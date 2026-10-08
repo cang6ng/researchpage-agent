@@ -28,25 +28,29 @@ const SESSION = "session_resolution";
 /** Two background papers, both about GraphRAG in general. */
 const BACKGROUND_SOURCES = [
   {
+    provider: "arxiv" as const,
+    providerId: "2401.00001",
     title: "A Survey of Graph-Based Retrieval (background)",
     authors: ["A. Author"],
     abstract: "We survey graph-based retrieval methods.",
-    absUrl: "https://arxiv.org/abs/2401.00001",
+    landingUrl: "https://arxiv.org/abs/2401.00001",
     pdfUrl: null,
     publishedAt: "2024-01-01T00:00:00Z",
     arxivId: "2401.00001",
-    primaryCategory: "cs.CL",
+    venue: "arXiv cs.CL",
     doi: null,
   },
   {
+    provider: "arxiv" as const,
+    providerId: "2402.00002",
     title: "Community Summarisation in Practice (background)",
     authors: ["B. Author"],
     abstract: "A general discussion of community summarisation.",
-    absUrl: "https://arxiv.org/abs/2402.00002",
+    landingUrl: "https://arxiv.org/abs/2402.00002",
     pdfUrl: null,
     publishedAt: "2024-02-01T00:00:00Z",
     arxivId: "2402.00002",
-    primaryCategory: "cs.CL",
+    venue: "arXiv cs.CL",
     doi: null,
   },
 ];

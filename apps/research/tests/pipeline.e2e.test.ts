@@ -120,14 +120,16 @@ function searchFixture(query: string, options: { readonly limit: number }) {
     fetchedAt: new Date().toISOString(),
     total: PAPERS.length,
     candidates: PAPERS.slice(0, options.limit).map((paper) => ({
+      provider: "arxiv" as const,
+      providerId: paper.id,
       title: paper.title,
       authors: ["Fixture Author"],
       abstract: paper.paragraphs[0] ?? "",
-      absUrl: paper.url,
+      landingUrl: paper.url,
       pdfUrl: null,
       publishedAt: "2024-04-24T00:00:00Z",
       arxivId: paper.id,
-      primaryCategory: "cs.CL",
+      venue: "arXiv cs.CL",
       doi: null,
     })),
   });

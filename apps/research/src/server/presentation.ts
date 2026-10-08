@@ -20,7 +20,16 @@
  * bundle for anything that needs to compute with them.
  */
 
-import type { CellStatus, ReportTask, ReportValidation, Source, SourceRole } from "@every-dagent/plugin-research";
+import type {
+  CellStatus,
+  ReportTask,
+  ReportValidation,
+  ResearchActivityEvent,
+  ResearchProgressStage,
+  ResearchRunRecord,
+  Source,
+  SourceRole,
+} from "@every-dagent/plugin-research";
 
 export type RunStateName = "preparing" | "researching" | "report_ready" | "editing" | "failed";
 
@@ -324,4 +333,178 @@ export function presentationOf(input: PresentationInput): PresentationReadout {
     artifactQuality: artifactQualityOf(input.validation),
     sourceRoles: sourceRolesOf(input.sources),
   };
+}
+
+/**
+ * Where the research actually is, and why it is waiting.
+ *
+ * This is the honest answer to the question a progress bar lies about. There is
+ * no percentage here and there cannot be one: research does not complete a
+ * fixed amount of work per second, and「63%」would be a number this product made
+ * up. What it can say truthfully is which stage is running, what that stage is
+ * doing right now, which stages have finished, how many requests and candidates
+ * there have been, and — when something is waiting — what it is waiting for and
+ * until when.
+ *
+ * The stage is read from two places that know different things: the run record
+ * knows the *stage* (searching, reporting, validating), and the activity stream
+ * knows what the stage is doing *within itself* (a research stage spends its
+ * time searching, reading, assessing) and whether it is in a retry wait. The
+ * projection prefers the more specific answer when the two disagree, because
+ * the newer event is the one that is true now.
+ */
+export type ResearchStageName = ResearchProgressStage;
+
+export interface ResearchProgressProjection {
+  readonly currentStage: ResearchStageName;
+  readonly displayName: string;
+  readonly currentMessage: string;
+  /** The stages that finished, in the order the product ran them. */
+  readonly completedStages: readonly ResearchProgressStage[];
+  readonly lastActivityAt: string | null;
+  /** Physical discovery requests: the real count, including the failed ones. */
+  readonly searchAttempts: number;
+  readonly candidatesFound: number;
+  readonly sourcesRead: number;
+  readonly currentProvider: string | null;
+  readonly retrying: boolean;
+  /** When a retry or a provider cooldown ends, if the research is waiting. */
+  readonly waitingUntil: string | null;
+}
+
+const PROGRESS_STAGE_WORDS: Readonly<Record<ResearchStageName, string>> = Object.freeze({
+  preparing: "准备中",
+  searching: "正在检索",
+  reading: "正在读取",
+  assessing: "正在核对证据",
+  gap_research: "正在定向补查",
+  reporting: "正在撰写报告",
+  validating: "正在校验报告",
+  answering: "正在回答问题",
+  editing: "正在修改报告",
+  waiting_retry: "正在等待检索服务",
+  completed: "已完成",
+  failed: "已失败",
+});
+
+/** Which progress stage a finished internal run corresponds to. */
+function completedStageOf(stage: ResearchRunRecord["stage"]): ResearchProgressStage {
+  switch (stage) {
+    case "card":
+    case "guide":
+      return "preparing";
+    case "research":
+      return "searching";
+    case "gap":
+      return "gap_research";
+    case "report":
+      return "reporting";
+    case "synthesis":
+      return "validating";
+    case "ask":
+      return "answering";
+    case "edit":
+      return "editing";
+    default:
+      return "preparing";
+  }
+}
+
+/** What the newest activity line says the run is doing inside its stage. */
+function stageFromActivity(event: ResearchActivityEvent, fallback: ResearchProgressStage): ResearchProgressStage {
+  switch (event.kind) {
+    case "search_started":
+    case "request_started":
+      return "searching";
+    case "retry_wait":
+      return "waiting_retry";
+    case "read_started":
+    case "read_completed":
+    case "read_failed":
+      return "reading";
+    case "assessment_recorded":
+      return "assessing";
+    case "stage_started":
+    case "stage_completed":
+    case "stage_failed":
+      return event.stage;
+    default:
+      return fallback;
+  }
+}
+
+/** The stages a research pass moves through inside itself. */
+const RESEARCH_INNER_STAGES: ReadonlySet<ResearchProgressStage> = new Set(["searching", "reading", "assessing", "waiting_retry"]);
+
+export interface ProgressInput {
+  readonly task: ReportTask;
+  readonly runs: readonly ResearchRunRecord[];
+  readonly activity: readonly ResearchActivityEvent[];
+  readonly sources: readonly Pick<Source, "readStatus">[];
+}
+
+export function researchProgressOf(input: ProgressInput): ResearchProgressProjection {
+  const newest = input.activity[input.activity.length - 1];
+  const running = input.runs.find((record) => record.status === "running");
+  const failed = input.task.status === "failed";
+  const completedStages = [
+    ...new Set(input.runs.filter((record) => record.status === "completed").map((record) => completedStageOf(record.stage))),
+  ];
+  const base: ResearchProgressStage =
+    running === undefined
+      ? failed
+        ? "failed"
+        : input.task.currentReportId !== null
+          ? "completed"
+          : "preparing"
+      : completedStageOf(running.stage);
+  // A stage is the run's fact; what the stage is *doing* is the activity's.
+  // The refinement only applies inside the stage that is actually running —
+  // a search event left over from the research pass must not make a reporting
+  // run look like it is searching again.
+  const refine =
+    running !== undefined &&
+    newest !== undefined &&
+    (newest.stage === base || (RESEARCH_INNER_STAGES.has(newest.stage) && (base === "searching" || base === "gap_research")));
+  const currentStage: ResearchStageName = refine ? stageFromActivity(newest as ResearchActivityEvent, base) : base;
+  const retrying = newest !== undefined && (newest.kind === "retry_wait" || newest.kind === "provider_skipped");
+  const waitingUntil = retrying ? (newest?.nextRetryAt ?? null) : null;
+
+  const searches = input.task.discovery?.attemptedRequests ?? 0;
+  const sourcesRead = input.sources.filter((source) => source.readStatus === "ok").length;
+  const candidatesFound = input.sources.length;
+  const currentProvider = running === undefined ? (input.task.discovery?.lastProvider ?? null) : (newest?.provider ?? input.task.discovery?.lastProvider ?? null);
+
+  const message =
+    newest !== undefined && (running !== undefined || recentEnough(newest, input.task.updatedAt))
+      ? newest.message
+      : currentStage === "failed"
+        ? (input.task.error ?? "这个项目停在一次失败上。")
+        : currentStage === "completed"
+          ? "报告已经写好并保存；可以继续补充材料或提出修改。"
+        : currentStage === "preparing"
+          ? "研究还没有开始。"
+          : PROGRESS_STAGE_WORDS[currentStage];
+
+  return {
+    currentStage,
+    displayName: PROGRESS_STAGE_WORDS[currentStage],
+    currentMessage: message,
+    completedStages,
+    lastActivityAt: newest?.at ?? null,
+    searchAttempts: searches,
+    candidatesFound,
+    sourcesRead,
+    currentProvider,
+    retrying,
+    waitingUntil,
+  };
+}
+
+/** Whether an activity line is still about now, rather than about last week. */
+function recentEnough(event: ResearchActivityEvent, updatedAt: string): boolean {
+  const at = Date.parse(event.at);
+  const updated = Date.parse(updatedAt);
+  if (Number.isNaN(at) || Number.isNaN(updated)) return false;
+  return at >= updated - 60_000;
 }

@@ -454,7 +454,69 @@ export interface TaskBundle {
    * merge them into one word that is true of none of them.
    */
   readonly presentation: PresentationReadout;
+  /**
+   * The attempt the pipeline budget currently governs, if one has started.
+   *
+   * Separate from `usage`: `usage` is everything the project ever spent, while
+   * an attempt is one bounded research pass — the thing a retry begins anew.
+   */
+  readonly attempt: {
+    readonly number: number;
+    readonly startedAt: string;
+    readonly searches: number;
+    readonly reads: number;
+    readonly gapRounds: number;
+    readonly reason: string;
+  } | null;
+  /** What discovery has tried, including the requests that failed. */
+  readonly discovery: {
+    readonly attemptedRequests: number;
+    readonly successfulRequests: number;
+    readonly failedRequests: number;
+    readonly lastProvider: string | null;
+    readonly lastElapsedMs: number | null;
+    readonly lastFailure: {
+      readonly at: string;
+      readonly provider: string;
+      readonly kind: string;
+      readonly status: number | null;
+      readonly userMessage: string;
+    } | null;
+  } | null;
+  /** Where the research really is, and why it is waiting. No percentage. */
+  readonly progress: ProgressView;
+  /** The reader-facing activity history, oldest first; stored, not in memory. */
+  readonly activityLog: readonly ActivityEventView[];
   readonly busy: boolean;
+}
+
+/** One line of a project's activity history, as the page reads it. */
+export interface ActivityEventView {
+  readonly id: string;
+  readonly taskId: string;
+  readonly at: string;
+  readonly stage: string;
+  readonly level: "info" | "warn" | "error";
+  readonly kind: string;
+  readonly message: string;
+  readonly provider?: string;
+  readonly attempt?: number;
+  readonly nextRetryAt?: string | null;
+}
+
+/** The research stages a reader watches, in the product's own words. */
+export interface ProgressView {
+  readonly currentStage: string;
+  readonly displayName: string;
+  readonly currentMessage: string;
+  readonly completedStages: readonly string[];
+  readonly lastActivityAt: string | null;
+  readonly searchAttempts: number;
+  readonly candidatesFound: number;
+  readonly sourcesRead: number;
+  readonly currentProvider: string | null;
+  readonly retrying: boolean;
+  readonly waitingUntil: string | null;
 }
 
 /* ------------------------------------------------------------- readout -- */
@@ -702,6 +764,30 @@ export const api = {
   sessionState: (sessionId: string): Promise<{ readonly pending: boolean; readonly task: TaskBundle | null }> =>
     request(`/api/research/sessions/${encodeURIComponent(sessionId)}`),
   task: (taskId: string): Promise<TaskBundle> => request(`/api/research/tasks/${encodeURIComponent(taskId)}`),
+  /**
+   * Starts a new bounded research attempt on a project that stopped.
+   *
+   * The project keeps its brief, its material, its report and its frozen
+   * revisions; what the route does is clear the failure that was blocking it
+   * and begin again. A project that is running, unconfirmed, or not stopped
+   * is refused with the reason.
+   */
+  retryResearch: (
+    taskId: string,
+  ): Promise<{
+    readonly ok: boolean;
+    readonly started: string;
+    readonly attempt: TaskBundle["attempt"];
+    readonly preserved: {
+      readonly sources: number;
+      readonly evidence: number;
+      readonly assessments: number;
+      readonly reports: number;
+      readonly revisions: number;
+      readonly reportKept: boolean;
+    };
+    readonly message: string;
+  }> => request(`/api/research/tasks/${encodeURIComponent(taskId)}/retry-research`, { method: "POST", body: "{}" }),
   answers: (taskId: string): Promise<{ readonly answers: readonly AnswerView[] }> =>
     request(`/api/research/tasks/${encodeURIComponent(taskId)}/answers`),
   document: (reportId: string): Promise<DocumentView> =>

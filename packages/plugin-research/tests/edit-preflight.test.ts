@@ -51,25 +51,29 @@ function open(): Harness {
       total: 2,
       candidates: [
         {
+          provider: "arxiv" as const,
+          providerId: "2401.00001",
           title: "Fixture Paper on Graph Retrieval",
           authors: ["A. Author"],
           abstract: "We describe a graph-based retrieval method and its evaluation.",
-          absUrl: "https://arxiv.org/abs/2401.00001",
+          landingUrl: "https://arxiv.org/abs/2401.00001",
           pdfUrl: null,
           publishedAt: "2024-01-01T00:00:00Z",
           arxivId: "2401.00001",
-          primaryCategory: "cs.CL",
+          venue: "arXiv cs.CL",
           doi: null,
         },
         {
+          provider: "arxiv" as const,
+          providerId: "2402.00002",
           title: "Fixture Paper on Community Summarisation",
           authors: ["B. Author"],
           abstract: "A second fixture source.",
-          absUrl: "https://arxiv.org/abs/2402.00002",
+          landingUrl: "https://arxiv.org/abs/2402.00002",
           pdfUrl: null,
           publishedAt: "2024-02-01T00:00:00Z",
           arxivId: "2402.00002",
-          primaryCategory: "cs.CL",
+          venue: "arXiv cs.CL",
           doi: null,
         },
         // A third paper that only a cost-focused query finds, so a later action
@@ -77,14 +81,16 @@ function open(): Harness {
         ...(query.toLowerCase().includes("cost")
           ? [
               {
+                provider: "arxiv" as const,
+                providerId: "2403.00003",
                 title: "Fixture Paper on Indexing Cost",
                 authors: ["C. Author"],
                 abstract: "We report indexing costs in tokens.",
-                absUrl: "https://arxiv.org/abs/2403.00003",
+                landingUrl: "https://arxiv.org/abs/2403.00003",
                 pdfUrl: null,
                 publishedAt: "2024-03-01T00:00:00Z",
                 arxivId: "2403.00003",
-                primaryCategory: "cs.CL",
+                venue: "arXiv cs.CL",
                 doi: null,
               },
             ]

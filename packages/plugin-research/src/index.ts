@@ -8,6 +8,7 @@ export type {
   ActionDelta,
   AssessmentDirectness,
   AssessmentRelationship,
+  ActivityLevel,
   BriefFieldName,
   BriefFieldState,
   BriefFieldStates,
@@ -19,6 +20,7 @@ export type {
   Comparability,
   CostStage,
   Dimension,
+  DiscoveryTelemetry,
   EditActionOutcome,
   Evidence,
   ExportArtifact,
@@ -40,8 +42,12 @@ export type {
   ReportTask,
   ReportValidation,
   ResearchActionOutcome,
+  ResearchActivityEvent,
+  ResearchActivityKind,
+  ResearchAttempt,
   ResearchBudget,
   ResearchGapNote,
+  ResearchProgressStage,
   ResearchResolution,
   ResearchResolutionStatus,
   ResearchRunRecord,
@@ -225,17 +231,63 @@ export {
 export { openResearchRepository, newId, type ResearchRepository } from "./repository.js";
 
 export {
+  attemptArxiv,
+  attemptWithProvider,
+  arxivIdOf,
+  arxivIdOfDoi,
   buildArxivQuery,
+  candidateKeys,
+  classifyStatus,
+  classifyThrown,
+  dedupeCandidates,
+  DEFAULT_DISCOVERY_BUDGET_MS,
+  DEFAULT_RETRY_POLICY,
+  normalizeArxivId,
+  normalizeDoi,
+  normalizeUrl,
   parseArxivFeed,
+  PROVIDER_INTERVALS,
+  PROVIDER_NAMES,
   queryLadder,
   queryTerms,
+  rateLimitedFor,
+  requestWithRetries,
+  retryAfterMsOf,
+  retryDecisionOf,
   searchArxiv,
   SearchError,
+  sleepWithSignal,
+  type AttemptResult,
+  type DiscoveryEvent,
+  type DiscoveryEventKind,
+  type FetchLike,
+  type ResearchProvider,
+  type RetryPolicy,
+  type SearchAttempt,
   type SearchCandidate,
+  type SearchFailureKind,
+  type SearchOptions,
   type SearchOutcome,
+  type SleepLike,
 } from "./search.js";
 
-export { readSource, type ReadOutcome, type ReadRequest, type ReaderOptions } from "./read.js";
+export {
+  abstractFromInvertedIndex,
+  candidateOfOpenAlexWork,
+  openAlexIdOf,
+  parseOpenAlexWorks,
+  searchOpenAlex,
+} from "./openalex.js";
+
+export {
+  ProviderCircuitBreaker,
+  searchSources,
+  type DiscoveryOptions,
+  type ProviderCircuitState,
+  type ProviderSearch,
+} from "./discovery.js";
+
+export { readSource, type ReadMetadata, type ReadOutcome, type ReadRequest, type ReaderOptions } from "./read.js";
 export { decodeEntities, extractHtmlDocument, extractPlainText, MAX_DOCUMENT_CHARS } from "./html.js";
 
 export {

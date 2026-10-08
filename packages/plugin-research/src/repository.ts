@@ -26,6 +26,7 @@ import type {
   Report,
   ReportTask,
   ReadSnapshot,
+  ResearchActivityEvent,
   ResearchRunRecord,
   Source,
   SupportAssessment,
@@ -37,6 +38,9 @@ import type { GuideQuestion } from "./brief.js";
 export function newId(prefix: string): string {
   return `${prefix}_${randomBytes(8).toString("hex")}`;
 }
+
+/** How many activity lines one task keeps. Enough to read back a whole run. */
+const ACTIVITY_LIMIT = 300;
 
 export interface ResearchRepository {
   /** The task a session is trusted to work on, if one is bound. */
@@ -92,6 +96,16 @@ export interface ResearchRepository {
 
   recordRun(record: ResearchRunRecord): void;
   listRuns(taskId: string): readonly ResearchRunRecord[];
+
+  /**
+   * Appends one line to a task's activity history.
+   *
+   * The history is bounded here rather than by its callers: this product needs
+   *「刷新之后还看得见刚才发生了什么」, not a log retention policy, so only the
+   * most recent lines of one task are kept.
+   */
+  appendActivity(event: ResearchActivityEvent): void;
+  listActivity(taskId: string, limit?: number): readonly ResearchActivityEvent[];
 
   /**
    * Runs several writes as one unit.
@@ -192,6 +206,13 @@ CREATE TABLE IF NOT EXISTS brief_guide (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS brief_guide_task ON brief_guide (task_id);
+CREATE TABLE IF NOT EXISTS research_activity (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS research_activity_task ON research_activity (task_id, at);
 `;
 
 export function openResearchRepository(options: { readonly location: string }): ResearchRepository {
@@ -420,6 +441,26 @@ export function openResearchRepository(options: { readonly location: string }): 
         .prepare("SELECT payload FROM research_runs WHERE task_id = ? ORDER BY started_at ASC")
         .all(taskId) as { payload: string }[];
       return rows.map((row) => readJson<ResearchRunRecord>(row.payload));
+    },
+
+    appendActivity(event: ResearchActivityEvent): void {
+      database
+        .prepare("INSERT INTO research_activity (id, task_id, payload, at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload")
+        .run(event.id, event.taskId, JSON.stringify(event), event.at);
+      // Keep the newest ACTIVITY_LIMIT lines: an activity history is for
+      // reading back what just happened, and an unbounded one would grow with
+      // every poll of a long-running project.
+      database
+        .prepare(
+          "DELETE FROM research_activity WHERE task_id = ? AND id NOT IN (SELECT id FROM research_activity WHERE task_id = ? ORDER BY at DESC, rowid DESC LIMIT ?)",
+        )
+        .run(event.taskId, event.taskId, ACTIVITY_LIMIT);
+    },
+    listActivity(taskId: string, limit = ACTIVITY_LIMIT): readonly ResearchActivityEvent[] {
+      const rows = database
+        .prepare("SELECT payload FROM research_activity WHERE task_id = ? ORDER BY at DESC, rowid DESC LIMIT ?")
+        .all(taskId, Math.max(1, Math.trunc(limit))) as { payload: string }[];
+      return rows.map((row) => readJson<ResearchActivityEvent>(row.payload)).reverse();
     },
 
     transact<T>(work: () => T): T {

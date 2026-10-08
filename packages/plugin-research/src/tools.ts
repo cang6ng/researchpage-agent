@@ -276,8 +276,10 @@ export function createResearchTools(service: ResearchService): ResearchTools {
   const searchSources: Tool = {
     name: "search_sources",
     description:
-      "在 arXiv 检索公开技术论文候选（真实网络请求）。返回的是候选 metadata（标题/作者/年份/链接/摘要），不是已读证据。" +
-      "要用英文技术关键词检索。可指定 targetCell 说明这次检索服务于哪个矩阵单元格。",
+      "检索公开技术论文候选（真实网络请求）：默认先问 arXiv，arXiv 限流或不可用时自动改用备用检索服务 OpenAlex。" +
+      "返回的是候选 metadata（标题/作者/年份/链接/摘要）与真正的发现来源，不是已读证据。" +
+      "要用英文技术关键词检索。可指定 targetCell 说明这次检索服务于哪个矩阵单元格。" +
+      "如果结果是 ok:false 的检索不可用错误，说明检索服务当前都不可用（不是「主题没有资料」）：不要反复重复调用本工具，改为基于已读材料继续评估与写作，并把缺少依据的项目如实写成缺口。",
     inputSchema: {
       type: "object",
       properties: {
@@ -320,7 +322,8 @@ export function createResearchTools(service: ResearchService): ResearchTools {
   const readSource: Tool = {
     name: "read_source",
     description:
-      "真实读取一个候选来源并保存读取快照：arXiv 论文优先取 HTML 正文（full_text / body_excerpt），没有正文时退回论文摘要（abstract）。" +
+      "真实读取一个候选来源并保存读取快照：arXiv 论文优先取 HTML 正文（full_text / body_excerpt），没有正文时退回论文摘要（abstract）；" +
+      "OpenAlex 找到的非 arXiv 论文走同一套 HTML 读取，取不到正文时按检索服务返回的真实摘要记为 abstract 级（不是正文，不能当正文证据）。" +
       "工具会从保存的文本中切出与 question/terms 最相关的 1–5 条证据片段（excerpt 为原文原样字符，带位置）。" +
       "只有这里产生的 evidenceId 才能被报告引用；搜索摘要不能当证据。读取失败会如实记录失败状态。\n" +
       "role：你读完材料后判断这条来源是什么——primary（原始方法/原始研究）、official（官方文档/实现说明）、independent-evaluation（第三方评估）、" +

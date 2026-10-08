@@ -28,6 +28,7 @@ import type {
   GuideTarget,
   MatrixCell,
   ReportTask,
+  ResearchProgressStage,
   ResearchRunRecord,
   ResearchService,
   ResearchStage,
@@ -138,6 +139,13 @@ export interface ResearchRunner {
   questionOf(runId: string): string | undefined;
   readonly busy: boolean;
   readonly queued: number;
+  /**
+   * Whether this task already has a stage running or waiting to run.
+   *
+   * It is the question a retry asks before it starts one: two research passes
+   * writing the same project at once is how one of them silently loses.
+   */
+  hasWorkFor(taskId: string): boolean;
   /** Resolves when nothing is queued and no stage is executing. */
   idle(): Promise<void>;
   /** Waits for the current stage, then stops accepting new ones. */
@@ -190,6 +198,29 @@ const STAGE_LABELS: Readonly<Record<ResearchStage, string>> = Object.freeze({
 
 function stageLabel(stage: ResearchStage): string {
   return STAGE_LABELS[stage] ?? stage;
+}
+
+/** The reader-facing stage one internal stage run belongs to. */
+function progressStageOf(stage: ResearchStage): ResearchProgressStage {
+  switch (stage) {
+    case "card":
+    case "guide":
+      return "preparing";
+    case "research":
+      return "searching";
+    case "gap":
+      return "gap_research";
+    case "report":
+      return "reporting";
+    case "synthesis":
+      return "validating";
+    case "ask":
+      return "answering";
+    case "edit":
+      return "editing";
+    default:
+      return "preparing";
+  }
 }
 
 /**
@@ -491,6 +522,8 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
 
   const queue: StageRequest[] = [];
   let active: Promise<void> | undefined;
+  /** Which stage request is executing, so a caller can ask about one task. */
+  let activeRequest: StageRequest | undefined;
   let stopping = false;
   let idleResolvers: (() => void)[] = [];
   /** Card stages have no task yet, so their one retry is counted here. */
@@ -522,8 +555,10 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       return;
     }
     const request = queue.shift() as StageRequest;
+    activeRequest = request;
     active = execute(request).finally(() => {
       active = undefined;
+      activeRequest = undefined;
       pump();
     });
   }
@@ -623,6 +658,16 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       log(`[runner] task ${request.taskId} no longer exists; dropping ${request.stage}`);
       return;
     }
+    if (request.taskId !== null && task !== undefined) {
+      // The reader's own account of the run starts here, in their vocabulary:
+      // 「开始撰写报告」is a fact about the product, while the stage id is not.
+      service.recordActivity({
+        taskId: task.id,
+        kind: "stage_started",
+        message: `${stageLabel(request.stage)}：已启动`,
+        stage: progressStageOf(request.stage),
+      });
+    }
 
     // The permission this run acts under, minted here and nowhere earlier: the
     // stage decides what the run may write, not the model and not the prompt.
@@ -707,15 +752,28 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         // change what an earlier action is said to have answered.
         const outcome =
           request.userText === undefined ? undefined : service.actionOutcomeOf(request.sessionId, request.userText);
+        const note =
+          state.status === "completed"
+            ? `${stageLabel(request.stage)}：完成`
+            : `${stageLabel(request.stage)}：${state.error ?? state.status}`;
         finish({
           status: state.status === "completed" ? "completed" : "failed",
-          note:
-            state.status === "completed"
-              ? `${stageLabel(request.stage)}：完成`
-              : `${stageLabel(request.stage)}：${state.error ?? state.status}`,
+          note,
           endedAt: new Date().toISOString(),
           ...(outcome === undefined ? {} : { outcome }),
         });
+        if (request.taskId !== null) {
+          const settled = service.getTask(request.taskId);
+          const running = settled !== undefined && settled.status !== "failed";
+          if (state.status === "completed" && running) {
+            service.recordActivity({
+              taskId: request.taskId,
+              kind: "stage_completed",
+              message: note,
+              stage: progressStageOf(request.stage),
+            });
+          }
+        }
         break;
       }
       if (Date.now() > deadline) {
@@ -741,7 +799,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           return;
         }
       } else {
-        const tally = stageAttempts(request.taskId, request.stage);
+        const tally = stageAttempts(request.taskId, request.stage, service.getTask(request.taskId)?.attempt?.startedAt);
         if (tally.failures === 1 && tally.attempts === 1) {
           log(`[runner] retrying ${request.stage} once for task ${request.taskId}`);
           enqueue(request);
@@ -757,15 +815,20 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
   }
 
   /**
-   * How many gap rounds this task has already run.
+   * How many gap rounds this task has already run *in the current attempt*.
    *
    * Counted from the run records the runner itself wrote, not from a number a
    * model reported: a model that forgets to mark a round must not turn the gap
    * policy into an unbounded loop, and a run that is interrupted must still
-   * count as a round it spent.
+   * count as a round it spent. The attempt boundary is respected because gap
+   * rounds are a budget of *this* research pass: a project that stopped
+   * yesterday and was retried today starts with its rounds available, rather
+   * than with yesterday's already spent.
    */
-  function gapStagesSoFar(taskId: string): number {
-    return service.runsOf(taskId).filter((record) => record.stage === "gap").length;
+  function gapStagesSoFar(taskId: string, since?: string): number {
+    return service
+      .runsOf(taskId)
+      .filter((record) => record.stage === "gap" && (since === undefined || record.startedAt >= since)).length;
   }
 
   /** Whether the last stage actually added material; a round that did not is not repeated. */
@@ -775,17 +838,49 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
   }
 
   /**
-   * How many times a stage has been tried for a task, and whether it already
-   * failed before.
+   * Why the research pass ended without material, in words a reader can act on.
+   *
+   * The distinction this function exists to keep: a search service that is
+   * refusing to answer is not「主题不合适」, and saying so would dress a network
+   * failure up as an academic conclusion. The discovery ledger knows which of
+   * the two happened — a failed request has a provider and a reason, an empty
+   * result has neither — so the sentence is written from those facts.
+   */
+  function researchFailureCopy(task: ReportTask): string {
+    const discovery = task.discovery;
+    const sources = service.sourcesOf(task.id);
+    const reason = discovery?.lastFailure?.userMessage ?? "检索服务没有响应";
+    if ((discovery?.successfulRequests ?? 0) === 0 && (discovery?.failedRequests ?? 0) > 0) {
+      return `论文检索暂时不可用：${reason}。备用检索服务也没有取得可读取的材料。已有的研究范围与已读材料都保留了，可以重新研究（重试），或稍后再试。`;
+    }
+    if (sources.length > 0) {
+      const failed = sources.filter((source) => source.readStatus === "failed");
+      const last = failed[failed.length - 1];
+      return `检索到了 ${sources.length} 个候选，但没有一个来源能被真正读取${
+        last?.failure === null || last?.failure === undefined ? "" : `（最近一次：${last.failure}）`
+      }。已有的研究范围与候选来源都保留了，可以重新研究，或改用其他来源。`;
+    }
+    return "这次研究没有取得任何可读取的来源（检索没有返回候选，或候选都不可读）。已有的研究范围已保留，可以重新研究或改用其他检索词。";
+  }
+
+  /**
+   * How many times a stage has been tried *in the current attempt*, and whether
+   * it already failed before.
    *
    * A real provider occasionally fails a request for reasons that have nothing
    * to do with this product — a transient error, a momentary rate limit. The
    * bounded answer is one retry per stage, counted from the records the runner
    * itself wrote, so a demo that hits a hiccup recovers by itself and a stage
-   * that is failing for a real reason stops after the second attempt.
+   * that is failing for a real reason stops after the second attempt. The
+   * count is scoped to the attempt for the same reason the budget is: a retry
+   * is a new pass, and it deserves its own one.
    */
-  function stageAttempts(taskId: string, stage: ResearchStage): { readonly attempts: number; readonly failures: number } {
-    const records = service.runsOf(taskId).filter((record) => record.stage === stage);
+  function stageAttempts(
+    taskId: string,
+    stage: ResearchStage,
+    since?: string,
+  ): { readonly attempts: number; readonly failures: number } {
+    const records = service.runsOf(taskId).filter((record) => record.stage === stage && (since === undefined || record.startedAt >= since));
     return {
       attempts: records.length,
       failures: records.filter((record) => record.status === "failed" || record.status === "interrupted").length,
@@ -890,8 +985,10 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       case "research": {
         if (task.usage.reads === 0) {
           // Nothing was read, so there is nothing to assess or report on. The
-          // task keeps its materials and the workspace offers a retry.
-          service.failTask(task.id, "研究阶段没有成功读取任何来源；可以重试或更换主题。");
+          // task keeps its materials and the workspace offers a retry — and the
+          // reason says what actually happened, because a search service that
+          // refused to answer is not a topic that lacks literature.
+          service.failTask(task.id, researchFailureCopy(task));
           return;
         }
         // A task that already has a report is never re-written by research:
@@ -910,7 +1007,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           });
           return;
         }
-        if (gaps.length > 0 && gapStagesSoFar(task.id) < task.budget.maxGapRounds) {
+        if (gaps.length > 0 && gapStagesSoFar(task.id, task.attempt?.startedAt) < task.budget.maxGapRounds) {
           enqueue({
             taskId: task.id,
             sessionId,
@@ -936,7 +1033,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         // material, not with a new version of the report.
         if (refreshed.currentReportId !== null) return;
         const gaps = refreshed.matrix.filter((cell) => needsAttention(cell.status));
-        const budgetLeft = gapStagesSoFar(refreshed.id) < refreshed.budget.maxGapRounds;
+        const budgetLeft = gapStagesSoFar(refreshed.id, refreshed.attempt?.startedAt) < refreshed.budget.maxGapRounds;
         // A round that read nothing new cannot have changed the matrix, so it
         // is not repeated: the report is written with the gaps that remain.
         const progressed = readsProgressed(refreshed.id, readsBefore);
@@ -1217,6 +1314,19 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     },
     get queued() {
       return queue.length;
+    },
+    /**
+     * Whether this task already has work in flight.
+     *
+     * A retry must not start a second research pass beside a running one: two
+     * runs writing the same project is how one of them silently loses. The
+     * answer covers both halves of "in flight" — the stage executing now and
+     * the stages queued behind it — because only the runner knows about the
+     * second half.
+     */
+    hasWorkFor(taskId) {
+      if (activeRequest !== undefined && activeRequest.taskId === taskId) return true;
+      return queue.some((request) => request.taskId === taskId);
     },
     answerOf: readAnswer,
     questionOf: (runId) => questions.get(runId),

@@ -37,7 +37,7 @@ import {
   reportContentOf,
 } from "@every-dagent/plugin-research";
 import { exportRevisionPdf, exportTaskReportPdf, renderHtmlOf, revisionHtmlOf } from "./export.js";
-import { presentationOf } from "./presentation.js";
+import { presentationOf, researchProgressOf } from "./presentation.js";
 import type { ResearchRunner } from "./runner.js";
 
 const MAX_BODY_BYTES = 32 * 1024;
@@ -280,10 +280,41 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
     })),
     budget: task.budget,
     usage: task.usage,
+    /**
+     * The attempt the pipeline budget governs, and what discovery has tried.
+     *
+     * They are separate from `usage` on purpose: `usage` is the project's
+     * lifetime telemetry, the attempt is what the next call is refused by, and
+     * the discovery ledger is the honest count of requests — including the
+     * failed ones, which used to be invisible.
+     */
+    attempt: task.attempt ?? null,
+    discovery: task.discovery ?? null,
     // What a user action may still spend, while one is actually running: the
     // grant lives exactly as long as its stage, so this is null between
     // actions rather than a project-wide remainder dressed up as an allowance.
     actionBudget: service.actionBudgetOf(task.sessionId) ?? null,
+    /**
+     * Where the research really is, and why it is waiting.
+     *
+     * Derived from the same records the page already polls (run records and the
+     * activity history), so a live run and a historical one are read the same
+     * way, and no percentage is invented for either.
+     */
+    progress: researchProgressOf({
+      task,
+      runs: service.runsOf(taskId),
+      activity: service.activityOf(taskId, 60),
+      sources: service.sourcesOf(taskId),
+    }),
+    /**
+     * The reader-facing activity history, oldest first.
+     *
+     * It is stored rather than kept in memory, so a page reload still shows the
+     * 429, the wait and the fallback that happened before it — and it carries
+     * no tool payloads, no model reasoning and no credentials.
+     */
+    activityLog: service.activityOf(taskId, 200),
     // The brief travels with the rest of the project: it is the same draft the
     // structured editor and the guided assistant write to, so a page that polls
     // one endpoint sees both ways of working on it.
@@ -675,6 +706,45 @@ export function createResearchRouter(
       }
       runner.startGapRound(gapId);
       sendJson(response, 202, { ok: true, started: "gap" });
+      return;
+    }
+
+    // POST /api/research/tasks/:id/retry-research — the retry the workspace
+    // already promised. A failed project can be researched again: the brief,
+    // the material, the report and the frozen revisions stay exactly where they
+    // are, the failure that was blocking it is cleared, and a new bounded
+    // attempt starts. Everything that decides eligibility lives in the service;
+    // the route adds the one fact only the runner knows — whether a stage for
+    // this task is already running or waiting.
+    const retryId = taskIdOf(path, "/retry-research");
+    if (retryId !== undefined && method === "POST") {
+      if (runner.hasWorkFor(retryId)) {
+        sendJson(response, 409, {
+          error: "这个项目还有一次运行正在进行中",
+          problems: ["这个项目还有一次运行正在进行中"],
+          guidance: "请等待当前运行结束后再重新研究，避免两次运行同时写入同一个项目。",
+          reason: "run_in_progress",
+        });
+        return;
+      }
+      const result = service.retryResearch(retryId);
+      if (!result.ok) {
+        sendJson(response, result.reason === "task_unknown" ? 404 : 409, {
+          error: result.problems.join("；"),
+          problems: result.problems,
+          guidance: result.guidance,
+          reason: result.reason,
+        });
+        return;
+      }
+      runner.startResearch(retryId);
+      sendJson(response, 202, {
+        ok: true,
+        started: "research",
+        attempt: result.attempt,
+        preserved: result.preserved,
+        message: result.message,
+      });
       return;
     }
 

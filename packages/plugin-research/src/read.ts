@@ -8,20 +8,50 @@
  * and it *says which of the two happened*, because the coverage rules treat an
  * abstract-only read as partial. A PDF that cannot be parsed is a reported
  * failure, never a silent success.
+ *
+ * The third route exists because a fallback provider can locate papers this
+ * reader cannot fetch (a paywalled publisher page, a PDF-only record, an arXiv
+ * outage). When discovery already holds the paper's own abstract, that abstract
+ * is read as an `abstract`-scope document with its provenance in the note —
+ * partial, honest, and never body-level evidence. When there is no such
+ * abstract either, the read fails and says why.
  */
 
 import type { Paragraph, ReadScope } from "./domain.js";
 import { extractHtmlDocument, extractPlainText, MAX_DOCUMENT_CHARS } from "./html.js";
-import { arxivIdOf, type FetchLike } from "./search.js";
+import { arxivIdOf, PROVIDER_NAMES, type FetchLike, type ResearchProvider } from "./search.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 4_000_000;
 const USER_AGENT = "researchpage-agent/0.1 (competition demo; contact: local run)";
 const MIN_FULL_TEXT_PARAGRAPHS = 4;
+/** The shortest abstract this reader will accept as a real one. */
+const MIN_ABSTRACT_CHARS = 120;
+
+/**
+ * What discovery already knows about the work being read.
+ *
+ * It exists for the sources a reader can locate but not fetch — a paywalled
+ * publisher page, a PDF-only open-access record, an arXiv outage on the day the
+ * paper is read. The abstract in here came from the discovery provider's own
+ * record of the paper, so it may be stored as an *abstract-level* read with the
+ * provenance said out loud; it may never be presented as the paper's body, and
+ * the coverage rules already treat it as partial.
+ */
+export interface ReadMetadata {
+  readonly provider: ResearchProvider;
+  /** The provider's record of this work (its API request URL). */
+  readonly workUrl?: string | null;
+  readonly title?: string | null;
+  readonly abstract?: string | null;
+  readonly doi?: string | null;
+}
 
 export interface ReadRequest {
   /** The address to read; an arXiv abs/PDF URL is upgraded to full text first. */
   readonly url: string;
+  /** What discovery already knows, for the paths where nothing can be fetched. */
+  readonly metadata?: ReadMetadata;
 }
 
 export interface ReadOutcome {
@@ -226,6 +256,37 @@ export async function readSource(request: ReadRequest, options: ReaderOptions = 
       paragraphs: document.paragraphs,
       contentType: answer.contentType,
       note: `按纯文本读取（${answer.contentType}）`,
+      failure: null,
+    };
+  }
+
+  // Nothing could be fetched. If discovery already holds the paper's own
+  // abstract, that is a real — and partial — read of the paper, and saying so
+  // is better than reporting a bare failure: the material can be assessed, the
+  // coverage rules keep it below body-level, and the reader learns which of the
+  // two happened. What is never done here is dressing the abstract up as the
+  // body, or turning a failed fetch into a silent success.
+  const metadata = request.metadata;
+  const abstract = (metadata?.abstract ?? "").replace(/\s+/g, " ").trim();
+  if (metadata !== undefined && abstract.length >= MIN_ABSTRACT_CHARS) {
+    const paragraph: Paragraph = {
+      index: 0,
+      headingPath: ["Abstract"],
+      text: abstract,
+      charStart: 0,
+      charEnd: abstract.length,
+    };
+    const title = (metadata.title ?? "").trim();
+    return {
+      status: "ok",
+      readUrl: (metadata.workUrl ?? "").trim().length > 0 ? (metadata.workUrl as string) : request.url,
+      fetchedAt: now().toISOString(),
+      title,
+      scope: "abstract",
+      text: abstract,
+      paragraphs: [paragraph],
+      contentType: "application/json",
+      note: `${notes.length > 0 ? `${notes.join("；")}；` : ""}未能取得可读正文，改用 ${PROVIDER_NAMES[metadata.provider]} 返回的论文摘要（abstract 级读取：不是正文，不能当作正文证据）`,
       failure: null,
     };
   }
