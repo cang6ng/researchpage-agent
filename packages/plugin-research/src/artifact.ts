@@ -64,6 +64,20 @@ export interface ArtifactVerdict {
   readonly checks: readonly QualityCheckRecord[];
 }
 
+/**
+ * One stored row's cells, whatever the row happens to carry.
+ *
+ * The tool refuses a row without `cells` on the way in, so this is about
+ * *storage* rather than about input: a draft written by an older build, or one
+ * repaired by hand, is still read by every validator and renderer here. A row
+ * that lost its cells is an empty row — a fact Q03 refuses — and it is never a
+ * reason to throw while someone is reading a page.
+ */
+function cellsOfRow(row: { readonly cells?: unknown }): readonly { readonly text: string; readonly claimIds: readonly string[] }[] {
+  const cells = row.cells;
+  return Array.isArray(cells) ? (cells as readonly { readonly text: string; readonly claimIds: readonly string[] }[]) : [];
+}
+
 /** The smallest text a block carries, for the content-minimum checks. */
 function blockText(block: ReportBlock): string {
   switch (block.kind) {
@@ -72,7 +86,7 @@ function blockText(block: ReportBlock): string {
     case "list":
       return block.items.map((item) => item.text).join("\n");
     case "table":
-      return block.rows.map((row) => row.cells.map((cell) => cell.text).join(" | ")).join("\n");
+      return block.rows.map((row) => cellsOfRow(row).map((cell) => cell.text).join(" | ")).join("\n");
     case "callout":
       return block.text;
     case "mechanism":
@@ -108,9 +122,10 @@ export interface TableGap {
 export function blankCellsOfTable(block: Extract<ReportBlock, { kind: "table" }>): readonly BlankCell[] {
   const blanks: BlankCell[] = [];
   block.rows.forEach((row, rowIndex) => {
-    const width = Math.max(block.columns.length, row.cells.length);
+    const cells = cellsOfRow(row);
+    const width = Math.max(block.columns.length, cells.length);
     for (let column = 0; column < width; column += 1) {
-      const cell = row.cells[column];
+      const cell = cells[column];
       if (cell === undefined || cell.text.trim().length === 0) blanks.push({ row: rowIndex + 1, column: column + 1 });
     }
   });
@@ -155,7 +170,7 @@ function claimIdsOf(block: ReportBlock): readonly string[] {
     case "list":
       return block.items.flatMap((item) => item.claimIds);
     case "table":
-      return block.rows.flatMap((row) => row.cells.flatMap((cell) => cell.claimIds));
+      return block.rows.flatMap((row) => cellsOfRow(row).flatMap((cell) => cell.claimIds));
     case "callout":
       return [];
     case "mechanism":

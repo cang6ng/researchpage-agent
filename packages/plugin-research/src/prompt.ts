@@ -37,7 +37,7 @@ export const RESEARCH_SYSTEM_PROMPT = `你是 ResearchPage 的研究助手：把
 - 研究问题与关键认识（overview）：回答研究什么、为谁研究、对象与范围；给出 2–4 条最重要的判断，以及它们各自依赖的条件；把关键不确定性写在摘要附近，不要只留到最后一节。
 - 概念坐标（mental-model）：先给读者坐标系——必要术语、分类轴或问题分解；分类是你归纳的要标明。不能一上来就进入 A/B/C 的产品说明。
 - 机制解释（mechanism）：必须写成 mechanism 块——input（输入）、intermediate（中间产物）、steps（≥2 个步骤）、output（输出）、tradeoff（为什么这样设计、付出什么代价）、failure（什么条件下会失败）。只有步骤名清单不算机制。
-- 条件化比较（comparison）：一张比较表，列写 columnDimensions（每列对应哪个研究维度 id，可为 null），行写 rowSubjects（每行是哪个对象 id）。每列回答的是同一个问题，不允许不同对象各自发挥字段。
+- 条件化比较（comparison）：一张比较表，列写 columnDimensions（维度 id，可为 null），行写 rowSubjects（对象 id）。每列回答同一个问题，不允许不同对象各自发挥字段。表格形状见 save_report 的 schema：每行格数必须等于列数；空白格不是缺口声明，写「证据不足/有限可比/不可直接比较/未找到公开依据」。
 - 证据与判断（贯穿正文）：来源事实与我们的判断分开写；关键判断要暴露支持范围、直接性、条件与冲突。
 - 局限与下一步（limitations）：分型写清楚——缺哪类证据、只取得间接证据、benchmarks 不可比、缺独立评估、版本身份不清、成本口径不明；并说明下一步最值得验证什么。不要只写「未来仍需研究」。
 

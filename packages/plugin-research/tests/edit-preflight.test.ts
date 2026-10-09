@@ -645,15 +645,24 @@ describe("Scenario 1: rewriting the synthesis section", () => {
         },
         reason: "重排比较表。",
       });
+      // The refusal now happens where the row is read, not at the preflight
+      // afterwards: a row that reaches no column is refused by field path, and
+      // the model is told what a cell has to contain. What the proposal path
+      // promised — an empty table never reaches the reader, and never becomes a
+      // pending proposal — is unchanged; the refusal simply arrives earlier,
+      // with the position in it.
       expect(refused["ok"]).toBe(false);
-      expect((refused["problems"] as string[]).join(" ")).toContain("空白单元格");
+      const problems = (refused["problems"] as string[]).join(" ");
+      expect(problems).toContain("0 格");
+      expect(problems).toContain("3 列");
+      expect(JSON.stringify(refused)).toContain("证据不足");
       expect(harness.service.pendingProposalOf(harness.taskId)).toBeUndefined();
     } finally {
       harness.close();
     }
   });
 
-  it("repairs a blank table once, and refuses to show an empty one twice", async () => {
+  it("refuses an empty table before it can become a proposal, however often it is offered", async () => {
     const harness = open();
     try {
       const evidenceIds = await research(harness);
@@ -686,15 +695,21 @@ describe("Scenario 1: rewriting the synthesis section", () => {
         },
         reason: "重排比较表。",
       };
+      // The table with nothing in it is refused at the row reader, so it never
+      // becomes a proposal and never becomes a pending decision for the reader.
+      // It used to get through the tool and be refused by the preflight, which
+      // meant the model learned what was wrong one layer further from the
+      // field it had got wrong.
       const first = await callTool(harness, blank);
-      expect(first["code"]).toBe("proposal_invalid");
-      const userMessage = String(first["userMessage"]);
-      expect(userMessage).toContain("空白");
-      expect(userMessage).not.toContain("Q03");
+      expect(first["ok"]).toBe(false);
+      expect(JSON.stringify(first)).toContain("证据不足");
 
       const second = await callTool(harness, blank);
-      expect(second["code"]).toBe("proposal_not_created");
+      expect(second["ok"]).toBe(false);
       expect(harness.service.pendingProposalOf(harness.taskId)).toBeUndefined();
+      // The state machine that bounds the *content* repairs is unchanged and is
+      // covered by the obligation-losing rewrite above; this table never gets
+      // far enough to spend one.
     } finally {
       harness.close();
     }

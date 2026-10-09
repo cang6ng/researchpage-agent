@@ -88,7 +88,7 @@ function blockClaimIds(block: ReportBlock): readonly string[] {
     case "list":
       return block.items.flatMap((item) => item.claimIds);
     case "table":
-      return block.rows.flatMap((row) => row.cells.flatMap((cell) => cell.claimIds));
+      return block.rows.flatMap((row) => (Array.isArray(row.cells) ? row.cells : []).flatMap((cell) => cell.claimIds));
     case "callout":
       return [];
     case "mechanism":

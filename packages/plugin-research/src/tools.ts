@@ -147,6 +147,23 @@ function refuse(message: string, guidance: string): string {
   return boundedJson({ ok: false, problem: message, guidance });
 }
 
+/**
+ * A refusal that names where in the argument the problem is.
+ *
+ * The product's whole repair loop is "the model fixes the field it was told
+ * about", so a refusal that does not say which field is a refusal that costs
+ * another round trip of guessing. Every entry carries the field path, what is
+ * wrong there, and the shape that would be accepted.
+ */
+function refuseWithPath(problems: readonly BlockProblem[]): string {
+  return boundedJson({
+    ok: false,
+    problems: problems.map((entry) => `${entry.path}: ${entry.problem}`),
+    fields: problems,
+    guidance: "按上面的字段路径修正后重新提交这一节；其它已提交章节不受影响。",
+  });
+}
+
 export interface ResearchTools {
   readonly tools: readonly Tool[];
   /** The same objects, by name, for the trusted policy's catalogue. */
@@ -171,6 +188,13 @@ export function createResearchTools(service: ResearchService): ResearchTools {
       "当前会话还没有研究任务绑定。",
       "请先调用 propose_task 建立任务卡；用户确认后再开始检索。",
     );
+
+  /**
+   * The task's subjects, by id, so a legacy array row's label can be *checked*
+   * against the object its row declares instead of being assumed to be one.
+   */
+  const subjectsOf = (taskId: string): ReadonlyMap<string, string> =>
+    new Map(service.state(taskId).subjects.map((subject) => [subject.id, subject.name]));
 
   const proposeTask: Tool = {
     name: "propose_task",
@@ -593,8 +617,12 @@ export function createResearchTools(service: ResearchService): ResearchTools {
       "block 种类：paragraph / list / table / callout / mechanism。" +
       "mechanism 块形状：{kind:'mechanism', title, input, intermediate, steps:[{text,claimIds}], output, tradeoff, failure, claimIds}——" +
       "它是机制的解释契约，缺步骤或中间产物会被拒绝。" +
-      "比较表要写 columnDimensions（每列对应的研究维度 id，可为 null）与 rowSubjects（每行对应的对象 id）。" +
-      "没有依据的项目写成 callout（tone='gap'，可用 dimensionIds 声明对应维度），不要用常识填空。\n" +
+      "比较表的规范形状（请照抄这个结构，只替换内容）：" +
+      CANONICAL_TABLE_EXAMPLE +
+      "。其中 columnDimensions 是每列对应的研究维度 id（可为 null），rowSubjects 是每行对应的对象 id；" +
+      `rows[].cells 的格数必须与 columns 完全一致，缺一格或多一格都会被拒绝并给出字段路径。${LEGACY_TABLE_ROW_NOTE}` +
+      "没有依据的项目写成 callout（tone='gap'，可用 dimensionIds 声明对应维度），不要用常识填空。" +
+      "结构不合规时工具会返回精确字段路径与规范示例，并且不会保存这一节；修正后重新提交同一节即可，其它章节不受影响。\n" +
       "篇幅由各章节的内容义务决定，没有全篇 claim 数量上限；仍受单次输出预算限制，按节提交即可。",
     inputSchema: {
       type: "object",
@@ -604,7 +632,28 @@ export function createResearchTools(service: ResearchService): ResearchTools {
           enum: ["start", "write", "finalize", "clear"],
           description: "分次提交的步骤；一次性提交完整报告时省略",
         },
-        section: { type: "object", description: "part=write 时提交的单个章节 {id,title,blocks}" },
+        section: {
+          type: "object",
+          description: "part=write 时提交的单个章节 {id,title,blocks}",
+          properties: {
+            id: {
+              type: "string",
+              description:
+                "章节 id（必填）：overview / mental-model / mechanism / representative / comparison / synthesis / limitations / reading",
+            },
+            title: { type: "string" },
+            blocks: {
+              type: "array",
+              description:
+                "内容块。table 的规范形状：" +
+                CANONICAL_TABLE_EXAMPLE +
+                "。" +
+                LEGACY_TABLE_ROW_NOTE,
+              items: { type: "object" },
+            },
+          },
+          required: ["id", "title", "blocks"],
+        },
         title: { type: "string" },
         summary: { type: "string" },
         frame: {
@@ -652,8 +701,12 @@ export function createResearchTools(service: ResearchService): ResearchTools {
                 type: "array",
                 description:
                   "内容块：{kind:'paragraph',text,claimIds}, {kind:'list',items:[{text,claimIds}]}, " +
-                  "{kind:'table',columns,rows,columnDimensions,rowSubjects}, {kind:'callout',tone:'gap'|'note',text,dimensionIds}, " +
-                  "{kind:'mechanism',input,intermediate,steps,output,tradeoff,failure,claimIds}",
+                  "{kind:'callout',tone:'gap'|'note',text,dimensionIds}, " +
+                  "{kind:'mechanism',input,intermediate,steps,output,tradeoff,failure,claimIds}, " +
+                  "以及比较表 {kind:'table',columns,columnDimensions,rowSubjects,rows}——规范形状：" +
+                  CANONICAL_TABLE_EXAMPLE +
+                  "。" +
+                  LEGACY_TABLE_ROW_NOTE,
                 items: { type: "object" },
               },
             },
@@ -687,14 +740,16 @@ export function createResearchTools(service: ResearchService): ResearchTools {
       if (part === "start" || part === "write") {
         const claims = Array.isArray(record["claims"]) ? record["claims"].map(readClaim) : undefined;
         const sectionRecord = asRecord(record["section"]);
-        const section =
-          sectionRecord === undefined
-            ? undefined
-            : {
-                id: asString(sectionRecord["id"]) ?? "",
-                title: asString(sectionRecord["title"]) ?? "",
-                blocks: (Array.isArray(sectionRecord["blocks"]) ? sectionRecord["blocks"] : []).map(normalizeBlock),
-              };
+        let section: ReportSection | undefined;
+        if (sectionRecord !== undefined) {
+          const read = readSection(sectionRecord, "section", subjectsOf(binding.taskId));
+          // A section that cannot be read as declared is refused whole, with the
+          // field path that was wrong. Nothing is saved from it: a partially
+          // applied section is a section whose next edit is made against text
+          // the model never agreed to.
+          if (!read.ok) return refuseWithPath(read.problems);
+          section = read.section;
+        }
         const title = asString(record["title"]);
         const summary = asString(record["summary"]);
         const frame = asFrame(record["frame"]);
@@ -735,17 +790,14 @@ export function createResearchTools(service: ResearchService): ResearchTools {
 
       const frame = asFrame(record["frame"]);
       const claims: ReportClaim[] = Array.isArray(record["claims"]) ? record["claims"].map(readClaim) : [];
-      const sections = Array.isArray(record["sections"])
-        ? record["sections"].map((item) => {
-            const entry = asRecord(item) ?? {};
-            const blocks = Array.isArray(entry["blocks"]) ? entry["blocks"] : [];
-            return {
-              id: asString(entry["id"]) ?? "",
-              title: asString(entry["title"]) ?? "",
-              blocks: blocks.map((block) => normalizeBlock(block)),
-            };
-          })
-        : [];
+      const sections: ReportSection[] = [];
+      if (Array.isArray(record["sections"])) {
+        for (const [index, item] of record["sections"].entries()) {
+          const read = readSection(item, `sections[${String(index)}]`, subjectsOf(binding.taskId));
+          if (!read.ok) return refuseWithPath(read.problems);
+          sections.push(read.section);
+        }
+      }
 
       const result = service.saveReport(binding.taskId, {
         title,
@@ -829,14 +881,12 @@ export function createResearchTools(service: ResearchService): ResearchTools {
       const reason = asString(record?.["reason"]);
       if (reason === undefined) return refuse("缺少 reason", "请说明这次修改的理由。");
 
-      const section = {
-        id: asString(sectionRecord["id"]) ?? "",
-        title: asString(sectionRecord["title"]) ?? "",
-        blocks: (Array.isArray(sectionRecord["blocks"]) ? sectionRecord["blocks"] : []).map((block) => normalizeBlock(block)),
-      };
-      if (section.id === "" || section.blocks.length === 0) {
-        return refuse("section 不完整", "请提供章节 id 与至少一个 block。");
-      }
+      // A proposal replaces a section wholesale, so it is read by the same
+      // reader the save path uses: a table the parser cannot read is refused
+      // here too rather than becoming a proposal whose cells are empty.
+      const read = readSection(sectionRecord, "section", subjectsOf(binding.taskId));
+      if (!read.ok) return refuseWithPath(read.problems);
+      const section = read.section;
       const claims = Array.isArray(record?.["claims"]) ? record!["claims"].map(readClaim) : [];
       const summary = asString(record?.["summary"]);
 
@@ -1139,57 +1189,283 @@ function readClaim(value: unknown): ReportClaim {
   };
 }
 
-/** Blocks arrive as loose JSON; this keeps the shape the renderer expects. */
-function normalizeBlock(value: unknown): ReportBlock {
-  const record = asRecord(value) ?? {};
-  const kind = asString(record["kind"]) ?? "paragraph";
+/** The block kinds this contract has, so an unknown one is refused rather than guessed at. */
+const BLOCK_KINDS = ["paragraph", "list", "table", "callout", "mechanism"] as const;
+
+/**
+ * The canonical table, as one string the model can copy.
+ *
+ * It exists because the shape was the defect: a model that writes `rows` as
+ * `["对象名", "第 1 格", "第 2 格"]` produces content a reader can use and that
+ * this parser used to discard silently. The example and the parser therefore
+ * have to be the same object, so this constant is both — the tool description
+ * quotes it, and `readTable` implements exactly it.
+ */
+export const CANONICAL_TABLE_EXAMPLE =
+  '{"kind":"table","columns":["维度一","维度二"],"columnDimensions":["dim_x","dim_y"],"rowSubjects":["sub_a","sub_b"],' +
+  '"rows":[{"cells":[{"text":"A 在该维度上的有界判断","claimIds":["clm_a"]},{"text":"证据不足","claimIds":[]}]}]}';
+
+/**
+ * The same rows written as arrays, which real models do write.
+ *
+ * Both accepted widths are *determined*, not guessed at: the leading element of
+ * a `columns.length + 1` row is the row's own subject label and the rest are
+ * the cells, and a `columns.length` row is the cells with no label. Any other
+ * width is refused with its field path, because a row that does not line up
+ * with its own headings cannot be read into one.
+ */
+export const LEGACY_TABLE_ROW_NOTE =
+  '也接受数组行，但宽度必须与列对齐：["对象名", "第 1 格", …, "第 N 格"]（N = columns.length），' +
+  '或 ["第 1 格", …, "第 N 格"] 且该行不声明 rowSubjects。其它宽度会被拒绝。';
+
+const BLANK_CELL_HINT =
+  "没有直接证据时写「证据不足 / 有限可比 / 不可直接比较 / 未找到公开依据」，不要留空，也不要拿常识填空。";
+
+/** One structural problem in a tool argument, named by its own field path. */
+export interface BlockProblem {
+  readonly path: string;
+  readonly problem: string;
+  readonly guidance: string;
+}
+
+type BlockRead = { readonly ok: true; readonly block: ReportBlock } | { readonly ok: false; readonly problems: readonly BlockProblem[] };
+
+function bad(path: string, problem: string, guidance: string): BlockRead {
+  return { ok: false, problems: [{ path, problem, guidance }] };
+}
+
+/** What a declaration's own text compares as, for matching a label to a subject. */
+function comparable(value: string): string {
+  return value
+    .replace(/[\s\u3000（）()【】[\]{}「」『』：:、，,。.．\-—_/\\|·"'“”‘’]/g, "")
+    .toLowerCase();
+}
+
+/**
+ * Whether a legacy array row's leading element really names this row's subject.
+ *
+ * The check exists so that "the first element is the object's name" is a
+ * *verified* reading rather than an assumption: the label must match the
+ * subject the row declares, by its id or by the name the task card gives it. A
+ * row whose label matches nothing is refused with its path instead of having
+ * one string dropped out of it.
+ */
+function labelNamesSubject(label: string, declared: string, subjectNames: ReadonlyMap<string, string>): boolean {
+  const wanted = comparable(label);
+  if (wanted.length === 0) return false;
+  const named = subjectNames.get(declared.trim());
+  const candidates = named === undefined ? [declared] : [declared, named];
+  return candidates.some((candidate) => {
+    const known = comparable(candidate);
+    if (known.length === 0) return false;
+    return known === wanted || known.includes(wanted) || wanted.includes(known);
+  });
+}
+
+/**
+ * One row's cells, read from either of the two shapes a row may take.
+ *
+ * `offset` is how many leading elements the row used for its own subject label;
+ * it is what makes the reported path name the position the model actually
+ * wrote, so the fix it is asked for is the fix it can make.
+ */
+type CellsRead =
+  | { readonly ok: true; readonly cells: readonly { readonly text: string; readonly claimIds: readonly string[] }[] }
+  | { readonly ok: false; readonly problems: readonly BlockProblem[] };
+
+function readCells(values: readonly unknown[], rowPath: string, offset: number): CellsRead {
+  const cells: { text: string; claimIds: readonly string[] }[] = [];
+  const fail = (path: string, problem: string, guidance: string): CellsRead => ({ ok: false, problems: [{ path, problem, guidance }] });
+  for (const [index, value] of values.entries()) {
+    const path = offset === 0 ? `${rowPath}.cells[${String(index)}]` : `${rowPath}[${String(index + offset)}]`;
+    if (typeof value === "string") {
+      if (value.trim().length === 0) {
+        return fail(path, "单元格是空字符串", `每一格都要写出判断或明确缺口，不能留空。${BLANK_CELL_HINT}`);
+      }
+      cells.push({ text: value.trim(), claimIds: [] });
+      continue;
+    }
+    const entry = asRecord(value);
+    if (entry === undefined) {
+      return fail(path, "单元格既不是字符串也不是对象", `请使用规范形状 ${CANONICAL_TABLE_EXAMPLE}`);
+    }
+    const text = asString(entry["text"]);
+    if (text === undefined) {
+      return fail(`${path}.text`, "单元格缺少 text", `每一格必须有非空 text。${BLANK_CELL_HINT}`);
+    }
+    cells.push({ text, claimIds: asStringArray(entry["claimIds"]) });
+  }
+  return { ok: true, cells };
+}
+
+/**
+ * Reads a table block, or refuses it by field path.
+ *
+ * This is the one place a report's table comes into being, and it is total: for
+ * every accepted shape it produces rows with exactly `columns.length` written
+ * cells, and for every other shape it produces a problem naming the field that
+ * was wrong. It never produces a row of blanks — which is what the previous
+ * version did with the array rows real models write — because a comparison
+ * table full of empty cells is a document that lost its content between the
+ * model and the reader, and Q03 then refuses a report whose table did have
+ * content.
+ */
+function readTable(record: Record<string, unknown>, path: string, subjectNames: ReadonlyMap<string, string>): BlockRead {
+  const columns = asStringArray(record["columns"]);
+  if (columns.length === 0) {
+    return bad(`${path}.columns`, "比较表没有列头", `请声明 columns（每列回答同一个问题）。规范形状：${CANONICAL_TABLE_EXAMPLE}`);
+  }
+  const declaredRows = record["rows"];
+  if (!Array.isArray(declaredRows)) {
+    return bad(`${path}.rows`, "rows 不是数组", `rows 必须是数组，每行 {cells:[{text,claimIds}]}。规范形状：${CANONICAL_TABLE_EXAMPLE}`);
+  }
+  const columnDimensions = Array.isArray(record["columnDimensions"])
+    ? record["columnDimensions"].map((item) => (typeof item === "string" && item.trim().length > 0 ? item.trim() : null))
+    : undefined;
+  const declaredSubjects = Array.isArray(record["rowSubjects"])
+    ? record["rowSubjects"].map((item) => (typeof item === "string" && item.trim().length > 0 ? item.trim() : null))
+    : undefined;
+
+  const rows: { cells: readonly { text: string; claimIds: readonly string[] }[] }[] = [];
+  const rowSubjects: (string | null)[] = [];
+  for (const [index, declared] of declaredRows.entries()) {
+    const rowPath = `${path}.rows[${String(index)}]`;
+    const declaredSubject = declaredSubjects?.[index] ?? null;
+
+    if (Array.isArray(declared)) {
+      if (declared.length === columns.length + 1) {
+        const label = asString(declared[0]);
+        if (label === undefined) {
+          return bad(`${rowPath}[0]`, "数组行的第 1 个元素不是对象名", `第 1 个元素必须是该行对象的名称。${LEGACY_TABLE_ROW_NOTE}`);
+        }
+        if (declaredSubject !== null && !labelNamesSubject(label, declaredSubject, subjectNames)) {
+          return bad(
+            `${rowPath}[0]`,
+            `数组行的对象名「${label}」与 rowSubjects[${String(index)}]「${declaredSubject}」不是同一个对象`,
+            "数组行的第 1 个元素会被当作该行的对象名。请让它与该行声明的 rowSubjects 一致，或改用规范 cells 形状（此时该行不写对象名列）。",
+          );
+        }
+        const cells = readCells(declared.slice(1), rowPath, 1);
+        if (!cells.ok) return { ok: false, problems: cells.problems };
+        rows.push({ cells: cells.cells });
+        rowSubjects.push(declaredSubject ?? label);
+        continue;
+      }
+      if (declared.length === columns.length) {
+        if (declaredSubject !== null) {
+          return bad(
+            rowPath,
+            `该行有 ${String(columns.length)} 个元素与列数相同，同时又声明了 rowSubjects[${String(index)}]，无法判断第 1 个元素是对象名还是第一格`,
+            `请改用规范形状 ${CANONICAL_TABLE_EXAMPLE}，或写成 ["对象名", "第 1 格", …]（宽度为列数 + 1）。`,
+          );
+        }
+        const cells = readCells(declared, rowPath, 0);
+        if (!cells.ok) return { ok: false, problems: cells.problems };
+        rows.push({ cells: cells.cells });
+        rowSubjects.push(null);
+        continue;
+      }
+      return bad(
+        rowPath,
+        `数组行有 ${String(declared.length)} 个元素，但表有 ${String(columns.length)} 列（只接受 ${String(columns.length)} 或 ${String(columns.length + 1)} 个）`,
+        LEGACY_TABLE_ROW_NOTE,
+      );
+    }
+
+    const entry = asRecord(declared);
+    if (entry === undefined) {
+      return bad(rowPath, "行既不是对象也不是数组", `每行必须是 {cells:[{text,claimIds}]}。规范形状：${CANONICAL_TABLE_EXAMPLE}`);
+    }
+    const declaredCells = entry["cells"];
+    if (!Array.isArray(declaredCells)) {
+      return bad(`${rowPath}.cells`, "行缺少 cells 数组", `每行都要有 cells。规范形状：${CANONICAL_TABLE_EXAMPLE}`);
+    }
+    if (declaredCells.length !== columns.length) {
+      return bad(
+        `${rowPath}.cells`,
+        `该行有 ${String(declaredCells.length)} 格，但表有 ${String(columns.length)} 列`,
+        `每行的格数必须与 columns 完全一致，这一行不会以补齐或截断的方式被接受。${
+          declaredCells.length === 0 ? BLANK_CELL_HINT : ""
+        }`,
+      );
+    }
+    const cells = readCells(declaredCells, rowPath, 0);
+    if (!cells.ok) return { ok: false, problems: cells.problems };
+    rows.push({ cells: cells.cells });
+    rowSubjects.push(declaredSubject);
+  }
+
+  const recognized = rowSubjects.some((subject) => subject !== null);
+  return {
+    ok: true,
+    block: {
+      kind: "table",
+      columns,
+      rows,
+      ...(columnDimensions === undefined ? {} : { columnDimensions }),
+      // The legacy array form declares its rows' identities in the row itself.
+      // Those labels become the row subjects rather than being dropped: the
+      // identity a reader sees has to be the identity the document was written
+      // with, and a row with no declared subject is left null rather than
+      // filled in from a guess.
+      ...(recognized ? { rowSubjects } : {}),
+    },
+  };
+}
+
+/**
+ * Reads a block, or refuses it by field path.
+ *
+ * Blocks arrive as loose JSON. The tolerance is deliberate and it has a floor:
+ * a `kind` this contract does not have, a table whose rows do not line up with
+ * its own columns, or a cell that is empty is refused with the field that was
+ * wrong — never quietly reshaped into something that validates. The one
+ * direction that is not allowed is dropping text the model wrote.
+ */
+function readBlock(value: unknown, path: string, subjectNames: ReadonlyMap<string, string>): BlockRead {
+  const record = asRecord(value);
+  if (record === undefined) {
+    return bad(path, "块不是对象", `每个块是一个 {kind, …} 对象。规范形状：${CANONICAL_TABLE_EXAMPLE}`);
+  }
+  const rawKind = record["kind"];
+  if (rawKind !== undefined && (typeof rawKind !== "string" || !(BLOCK_KINDS as readonly string[]).includes(rawKind))) {
+    return bad(`${path}.kind`, `未知的块类型 ${JSON.stringify(rawKind)}`, `可用块类型：${BLOCK_KINDS.join(" / ")}`);
+  }
+  const kind = asString(rawKind) ?? "paragraph";
   const claimIds = asStringArray(record["claimIds"]);
   const text = asString(record["text"]) ?? "";
   switch (kind) {
     case "list": {
-      const items = Array.isArray(record["items"])
-        ? record["items"].map((item) => {
-            const entry = asRecord(item) ?? {};
-            return { text: asString(entry["text"]) ?? "", claimIds: asStringArray(entry["claimIds"]) };
-          })
-        : [];
-      return { kind: "list", items };
+      const declared = record["items"];
+      if (!Array.isArray(declared) || declared.length === 0) {
+        return bad(`${path}.items`, "列表块没有 items", "列表块要写 items:[{text,claimIds}]。");
+      }
+      const items: { text: string; claimIds: readonly string[] }[] = [];
+      for (const [index, item] of declared.entries()) {
+        const entry = asRecord(item);
+        const itemText = entry === undefined ? undefined : asString(entry["text"]);
+        if (entry === undefined || itemText === undefined) {
+          return bad(`${path}.items[${String(index)}]`, "列表项缺少 text", "每一项都要有非空的 text。");
+        }
+        items.push({ text: itemText, claimIds: asStringArray(entry["claimIds"]) });
+      }
+      return { ok: true, block: { kind: "list", items } };
     }
-    case "table": {
-      const columns = asStringArray(record["columns"]);
-      const rows = Array.isArray(record["rows"])
-        ? record["rows"].map((row) => {
-            const entry = asRecord(row) ?? {};
-            const cells = Array.isArray(entry["cells"])
-              ? entry["cells"].map((cell) => {
-                  const cellEntry = asRecord(cell) ?? {};
-                  return { text: asString(cellEntry["text"]) ?? "", claimIds: asStringArray(cellEntry["claimIds"]) };
-                })
-              : [];
-            return { cells };
-          })
-        : [];
-      const columnDimensions = Array.isArray(record["columnDimensions"])
-        ? record["columnDimensions"].map((item) => (typeof item === "string" && item.trim().length > 0 ? item.trim() : null))
-        : undefined;
-      const rowSubjects = Array.isArray(record["rowSubjects"])
-        ? record["rowSubjects"].map((item) => (typeof item === "string" && item.trim().length > 0 ? item.trim() : null))
-        : undefined;
-      return {
-        kind: "table",
-        columns,
-        rows,
-        ...(columnDimensions === undefined ? {} : { columnDimensions }),
-        ...(rowSubjects === undefined ? {} : { rowSubjects }),
-      };
-    }
+    case "table":
+      return readTable(record, path, subjectNames);
     case "callout": {
+      if (text.length === 0) {
+        return bad(`${path}.text`, "callout 没有正文", "callout 必须写出它要说的内容。");
+      }
       const dimensionIds = asStringArray(record["dimensionIds"]);
       return {
-        kind: "callout",
-        tone: record["tone"] === "gap" ? "gap" : "note",
-        text,
-        ...(dimensionIds.length === 0 ? {} : { dimensionIds }),
+        ok: true,
+        block: {
+          kind: "callout",
+          tone: record["tone"] === "gap" ? "gap" : "note",
+          text,
+          ...(dimensionIds.length === 0 ? {} : { dimensionIds }),
+        },
       };
     }
     case "mechanism": {
@@ -1201,18 +1477,62 @@ function normalizeBlock(value: unknown): ReportBlock {
         : [];
       const title = asString(record["title"]);
       return {
-        kind: "mechanism",
-        ...(title === undefined ? {} : { title }),
-        input: asString(record["input"]) ?? "",
-        intermediate: asString(record["intermediate"]) ?? "",
-        steps,
-        output: asString(record["output"]) ?? "",
-        tradeoff: asString(record["tradeoff"]) ?? "",
-        failure: asString(record["failure"]) ?? "",
-        claimIds,
+        ok: true,
+        block: {
+          kind: "mechanism",
+          ...(title === undefined ? {} : { title }),
+          input: asString(record["input"]) ?? "",
+          intermediate: asString(record["intermediate"]) ?? "",
+          steps,
+          output: asString(record["output"]) ?? "",
+          tradeoff: asString(record["tradeoff"]) ?? "",
+          failure: asString(record["failure"]) ?? "",
+          claimIds,
+        },
       };
     }
     default:
-      return { kind: "paragraph", text, claimIds };
+      return { ok: true, block: { kind: "paragraph", text, claimIds } };
   }
+}
+
+/** A section's blocks, read in order, refusing the first one that cannot be read as declared. */
+function readSection(
+  value: unknown,
+  path: string,
+  subjectNames: ReadonlyMap<string, string>,
+): { readonly ok: true; readonly section: ReportSection } | { readonly ok: false; readonly problems: readonly BlockProblem[] } {
+  const record = asRecord(value);
+  if (record === undefined) {
+    return { ok: false, problems: [{ path, problem: "章节不是对象", guidance: "章节形状：{id,title,blocks}。" }] };
+  }
+  const id = asString(record["id"]);
+  if (id === undefined) {
+    return {
+      ok: false,
+      problems: [
+        {
+          path: `${path}.id`,
+          problem: "章节缺少 id",
+          guidance:
+            "每次 {part:'write'} 都必须带 section.id（overview / mental-model / mechanism / representative / comparison / synthesis / limitations / reading 之一）；没有 id 的这一节不会被保存。",
+        },
+      ],
+    };
+  }
+  const title = asString(record["title"]);
+  if (title === undefined) {
+    return { ok: false, problems: [{ path: `${path}.title`, problem: "章节缺少 title", guidance: "章节形状：{id,title,blocks}。" }] };
+  }
+  const declared = record["blocks"];
+  if (!Array.isArray(declared) || declared.length === 0) {
+    return { ok: false, problems: [{ path: `${path}.blocks`, problem: "章节没有 blocks", guidance: "章节必须有内容块。" }] };
+  }
+  const blocks: ReportBlock[] = [];
+  for (const [index, block] of declared.entries()) {
+    const read = readBlock(block, `${path}.blocks[${String(index)}]`, subjectNames);
+    if (!read.ok) return { ok: false, problems: read.problems };
+    blocks.push(read.block);
+  }
+  return { ok: true, section: { id, title, blocks } };
 }
