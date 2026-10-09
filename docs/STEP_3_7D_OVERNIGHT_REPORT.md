@@ -229,8 +229,11 @@ P0 优先于 P1 的顺序被遵守：报告生成能力在动设置与 UI 之前
 | `7a56e2c` | `feat(research-ui): offer to resume the report, not to start over` |
 | `2a9a961` | `feat(research): let the settings page change what it claims to change` |
 | `9cbfd12` | `refactor(research-ui): make the progress a status and the decision a decision` |
+| `35e5cf4` | `docs(research): record the recovery round, its evidence and what is still open` |
+| `13c2f9a` | `docs(research): state the browser-test flake as measured, not as assumed` |
+| `d6481ab` | `feat(research-ui): say what the converter decides and what it will not promise` |
 
-- **HEAD：`9cbfd126f4c6151090e8d97948ae23b6248907e6`**（本报告与 handoff / review 追加会再产生一个 `docs` 提交）。
+- **HEAD：`d6481ab8463330f83e949d2d43b2f1425d9fcb3f`**，工作区干净（仅 `.scratch/` 为 gitignored 的本地目录）。
 - Working tree：除 `.scratch/`（gitignored）外无未提交改动。
 - **未 Push**。未 reset / rebase / amend 任何已发布提交。
 - 提交内容检查：不含 API Key / Token、不含 `.scratch` 数据、不含数据库、不含截图与用户原始文档、不含临时日志。
