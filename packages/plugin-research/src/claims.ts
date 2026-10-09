@@ -129,8 +129,60 @@ const COST_FAMILIES: readonly { readonly id: string; readonly pattern: RegExp }[
   { id: "money", pattern: /\$|usd|eur|cost per|pricing|price/i },
 ]);
 
+/**
+ * Language that puts a ranking phrase *under refusal* rather than stating it.
+ *
+ * The product's own contract tells a writer to do exactly this —「分口径陈述，
+ * 不能合成一个『更便宜』的判断」— and the first version of this check read that
+ * sentence as a ranking, because a lexicon that only looks for 「更便宜」 cannot
+ * tell "A 更便宜" from "不能得出谁更便宜的判断". Both are about a ranking; only
+ * one asserts one.
+ */
+const RANKING_REFUSAL_PATTERNS: readonly RegExp[] = Object.freeze([
+  /不[能否可该应得会宜足再需]/,
+  /未[能尝有取得找给报获证实]/,
+  /没有/,
+  /无法/,
+  /无从/,
+  /难以/,
+  /缺乏/,
+  /缺少/,
+  /不足以/,
+  /不要/,
+  /勿/,
+  /拒绝/,
+  /避免/,
+  /禁止/,
+  /\b(?:cannot|can't|can not|do(?:es)? not|did not|doesn't|don't|didn't|is not|are not|not|never|without|unable to|rather than|instead of|refus\w+ to)\b/i,
+  // "no method outperforms the other" refuses; "there is no doubt that A
+  // outperforms B" does not. The noun after `no` is what tells them apart, so
+  // the pattern names the nouns a refusal is actually made of.
+  /\bno\s+(?:method|approach|system|model|evidence|study|source|paper|result|measurement|comparison|ranking|data|number)\b/i,
+]);
+
+/**
+ * Where a clause ends, for the purpose of deciding what a refusal refuses.
+ *
+ * A negation governs its own clause and no further:「不能得出谁更便宜的判断，
+ * 但 A 比 B 更便宜」refuses one ranking and states another, and a check that
+ * exempted the whole paragraph on sight of「不能」would wave the second one
+ * through. Sentence punctuation and the comma both end a clause; 、does not,
+ * because it joins items *inside* one, which is exactly where a refusal keeps
+ * the objects it refuses about.
+ */
+const CLAUSE_BREAK = /[。；;！？!?\n，,]/;
+
 export function assertsRanking(text: string): boolean {
-  return RANKING_PATTERNS.some((pattern) => pattern.test(text));
+  for (const clause of text.split(CLAUSE_BREAK)) {
+    for (const pattern of RANKING_PATTERNS) {
+      const found = pattern.exec(clause);
+      if (found === null) continue;
+      const before = clause.slice(0, found.index);
+      if (RANKING_REFUSAL_PATTERNS.some((refusal) => refusal.test(before))) continue;
+      return true;
+    }
+  }
+  return false;
 }
 
 function hasExplicitCondition(text: string): boolean {
