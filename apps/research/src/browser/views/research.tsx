@@ -262,10 +262,44 @@ function Matrix({ bundle }: { readonly bundle: TaskBundle }) {
   );
 }
 
+/**
+ * What the report button offers, and what it is called.
+ *
+ * The button is one control with three honest answers: a report exists and is
+ * opened elsewhere; an attempt failed or left a draft, so the useful action is
+ * to resume over the material that is already there; or nothing has been
+ * written yet, and generating the report is the first attempt. A pass that is
+ * in flight disables it rather than offering a second one — the server refuses
+ * a second pass anyway, and a button that lies about that is worse than a
+ * button that waits.
+ */
+export function reportActionOf(bundle: TaskBundle): { readonly label: string; readonly hint: string; readonly disabled: boolean } {
+  const generation = bundle.reportGeneration;
+  if (bundle.hasReport || generation.status === "validated") {
+    return { label: "报告已生成", hint: "报告已保存；修改请走 Edit 提案", disabled: true };
+  }
+  if (generation.status === "accepted" || generation.status === "running") {
+    return { label: "正在生成报告", hint: generation.userMessage, disabled: true };
+  }
+  if (generation.canResume) {
+    const outstanding = generation.draft?.outstanding ?? 0;
+    return {
+      label: "使用现有资料恢复报告",
+      hint:
+        outstanding > 0
+          ? `用已有材料继续，只处理这 ${String(outstanding)} 项未通过的问题；不会再检索`
+          : "用已有材料继续撰写；不会再检索，也不会消耗研究预算",
+      disabled: false,
+    };
+  }
+  return { label: "撰写报告", hint: "基于已确认的对象与范围撰写报告；不会重新检索", disabled: false };
+}
+
 function GapList({ bundle }: { readonly bundle: TaskBundle }) {
   const { act, busy, openDock, setSelection } = useApp();
   if (bundle.gaps.length === 0) return null;
   const roundsLeft = bundle.budget.maxGapRounds - bundle.usage.gapRounds;
+  const reportAction = reportActionOf(bundle);
   return (
     <div style={{ marginTop: 26 }}>
       <div className="rp-section-head">
@@ -314,20 +348,34 @@ function GapList({ bundle }: { readonly bundle: TaskBundle }) {
             </Button>
           </span>
         </Tooltip>
-        <Tooltip label="先补查，再决定要不要写进报告" withArrow={false}>
+        {/*
+          One button, and what it says depends on what actually exists.
+          「恢复报告」 is the default whenever there is something to resume — a
+          saved draft, or an attempt that failed — because that is the action
+          that reuses the material already read. It is never the action that
+          searches again: starting the research over is 「重新研究」 below, and
+          keeping the two apart is what stops a failed report from costing the
+          reader a second pass over their sources.
+        */}
+        <Tooltip label={reportAction.hint} withArrow={false}>
           <span>
             <Button
               leftSection={<FileText size={15} />}
-              disabled={busy || !bundle.task.confirmed || bundle.hasReport}
+              disabled={busy || !bundle.task.confirmed || reportAction.disabled}
               onClick={() => {
-                void act(() => api.report(bundle.task.id), "撰写报告");
+                void act(() => api.report(bundle.task.id), reportAction.label);
               }}
               data-testid="report-button"
             >
-              {bundle.hasReport ? "报告已生成" : "撰写报告"}
+              {reportAction.label}
             </Button>
           </span>
         </Tooltip>
+        {bundle.reportGeneration.status === "failed" || bundle.reportGeneration.status === "draft_saved" ? (
+          <span className="rp-note" data-testid="report-recovery-note" style={{ alignSelf: "center", maxWidth: 520 }}>
+            {bundle.reportGeneration.userMessage}
+          </span>
+        ) : null}
         {bundle.hasReport && (
           <Button
             variant="subtle"

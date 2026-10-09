@@ -13,7 +13,8 @@
     "tests/trust-ux.test.ts",
     "tests/intent-view.test.ts",
     "tests/document-library-view.test.ts",
-    "tests/research-progress-view.test.ts"
+    "tests/research-progress-view.test.ts",
+    "tests/report-recovery-view.test.ts"
   ],
   "//": "The root exclude (which keeps the browser half out of the Node project) is inherited and would silently drop this project's whole include; overriding it here is what makes the include real.",
   "exclude": ["dist"]

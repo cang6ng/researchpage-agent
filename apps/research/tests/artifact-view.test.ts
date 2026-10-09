@@ -322,6 +322,25 @@ function bundleFixture(): TaskBundle {
     hasReport: true,
     documents: [],
     intent: null,
+    /**
+     * The report's own state. These fixtures are about what the reader sees of
+     * research, and a project with no report yet is the honest default.
+     */
+    reportGeneration: {
+      status: "idle" as const,
+      displayName: "尚未开始",
+      userMessage: "还没有开始撰写报告；材料已经就绪，可以直接生成。",
+      stage: null,
+      startedAt: null,
+      endedAt: null,
+      resumes: 0,
+      repairs: 0,
+      failure: null,
+      draft: null,
+      canResume: false,
+      reportId: null,
+      blockedBy: null,
+    },
     busy: false,
   };
 }

@@ -485,6 +485,14 @@ export interface TaskBundle {
   } | null;
   /** Where the research really is, and why it is waiting. No percentage. */
   readonly progress: ProgressView;
+  /**
+   * Where the *report* is, as one of the states a reader can act on.
+   *
+   * `validated` is the only value that means a report exists. Every other value
+   * says what would move it forward, and a failure says it in the safe
+   * vocabulary the model layer classified — never in a provider's own words.
+   */
+  readonly reportGeneration: ReportGenerationView;
   /** The reader-facing activity history, oldest first; stored, not in memory. */
   readonly activityLog: readonly ActivityEventView[];
   /**
@@ -513,6 +521,36 @@ export interface ActivityEventView {
   readonly provider?: string;
   readonly attempt?: number;
   readonly nextRetryAt?: string | null;
+}
+
+/**
+ * Where the report is, in the four states that used to be one sentence.
+ *
+ * A request that was accepted is not a report being written; a draft that was
+ * written is not a report; only `validated` means a report exists and can be
+ * opened. `canResume` is the recovery the page offers by default — it reuses
+ * the material that is already there — and `blockedBy` says why it is not on
+ * offer when it is not.
+ */
+export interface ReportGenerationView {
+  readonly status: "idle" | "accepted" | "running" | "draft_saved" | "validated" | "failed";
+  readonly displayName: string;
+  readonly userMessage: string;
+  readonly stage: "report" | "synthesis" | null;
+  readonly startedAt: string | null;
+  readonly endedAt: string | null;
+  readonly resumes: number;
+  readonly repairs: number;
+  readonly failure: {
+    readonly category: string;
+    readonly code: string;
+    readonly problem: string;
+    readonly guidance: string;
+  } | null;
+  readonly draft: { readonly sections: number; readonly claims: number; readonly outstanding: number } | null;
+  readonly canResume: boolean;
+  readonly reportId: string | null;
+  readonly blockedBy: "report_exists" | "brief_unconfirmed" | "busy" | null;
 }
 
 /** The research stages a reader watches, in the product's own words. */

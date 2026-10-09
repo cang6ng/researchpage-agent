@@ -1156,7 +1156,7 @@ export function AppProvider({ children }: { readonly children: ReactNode }) {
         if (current(captured)) await poller.refresh();
         return true;
       } catch (error) {
-        if (current(captured)) say("error", error instanceof Error ? error.message : `${what}失败`);
+        if (current(captured)) say("error", refusalText(error, `${what}失败`));
         return false;
       } finally {
         setWorking(false);
@@ -1348,13 +1348,25 @@ export function currentReportOf(bundle: TaskBundle | null): TaskBundle["reports"
   return bundle.reports.find((report) => report.isCurrent) ?? null;
 }
 
-/** The sentence a conversion refusal is shown with, problem first. */
-function conversionProblemOf(error: unknown, fallback: string): string {
+/**
+ * The sentence a refusal is shown with: what happened, then what to do.
+ *
+ * A route that refuses says both — 「这个项目已经在生成报告了。」 and the action
+ * that would move it forward — and an action that showed only the first half
+ * left the reader to guess the second. A refusal nobody can act on is a refusal
+ * they will simply retry.
+ */
+function refusalText(error: unknown, fallback: string): string {
   if (error instanceof ApiError) {
     const guidance = error.guidance;
     return guidance === undefined ? error.message : `${error.message}${error.message.endsWith("。") ? "" : "。"}${guidance}`;
   }
   return error instanceof Error ? error.message : fallback;
+}
+
+/** The sentence a conversion refusal is shown with, problem first. */
+function conversionProblemOf(error: unknown, fallback: string): string {
+  return refusalText(error, fallback);
 }
 
 export function useApp(): AppState {
