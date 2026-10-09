@@ -8,6 +8,10 @@
 - Upstream sealed baseline：`c5f97ba63f719ec81030746f3eb67fe7c538e01f`；见 [UPSTREAM_BASELINE.md](./UPSTREAM_BASELINE.md)。未修改 upstream，未引入 Phase 5。
 - 实施依据：[COMPETITION_SPEC.md](./COMPETITION_SPEC.md)、`ResearchPage_Product_Redesign.md`（§6/§8/§17/§23）、`What Makes a Great AI-Native Research Artifact?`（§6/§11–13/§17）。
 
+## Current Status（2026-10-09）
+
+- **Step 3.7D Overnight Recovery 已完成（P0 报告生成恢复 + P1-A 设置 + P1-B 体验）**：真实用户验收失败的三条主线全部落地。**P0**：比较表解析器不再把真实模型写出的字符串数组行读成空行（根因已用真实 `save_report` 参数复现，修复后真实报告的比较表 6 列 × 3 行、0 空格）；Q08 不再把「不能合成一个『更便宜』的判断」读成肯定排名（子句级否定）；后续连续 INTERNAL_ERROR 的根因确认是**模型服务 `HTTP 402 Insufficient Balance`**（不是产品缺陷，账户充值后复测 200），并为此建立安全错误分类（`context_build` / `model_request` / `tool_schema` / `validation` / `storage` / `runtime_unknown` + 固定 code + 操作建议，不泄漏 provider 正文 / 凭据 / URL / 堆栈）；报告恢复成为独立状态机（四态：受理 / 生成中 / 草稿已保存未校验 / 已校验入库），有服务器互斥、不覆盖正式报告、一次有界修复且不重复同一失败指令，前端默认动作是「使用现有资料恢复报告」而不是重新研究。**真实验收**：真实 DeepSeek 生成并保存了新报告 `rep_818ea3ad126f548b`（8 节 / 9 claim / `validation.ok=true` / 12 项质量检查），HTML 200（26 632 B），PDF 导出 200（576 830 B，`exp_96194710990b7ff8` / `rev_5542c9061ddecfe9`）。**P1-A**：研究预算成为真实设置（服务端区间校验、创建时冻结、旧任务与重试不变、重启后仍生效，浏览器实测 6→9 保存后重启仍为 9），检索来源顺序真实生效且不允许全部关闭，能力清单由服务端派生（含 3 条「暂未实现」），MinerU 面板写明 10 MiB / Flash 20 页 / Token 未验证。**模型网页配置与 MinerU Token 网页写入未实现**，页面如实标注。**P1-B**：Intent 页宽屏两栏（对话 / 方向确认卡）、提问与理由分层且理由默认折叠、输入框固定在对话列；Research Progress 摘要优先、活动详情默认折叠并按类型分组、无百分比与 ETA、失败优先给恢复入口。验证：`pnpm typecheck` 三 project 通过、`pnpm build:research` 通过、离线全量 **2240 passed / 24 skipped / 0 failed**、真实浏览器实测（1440 / 1366 / 1100）。完整报告见 [STEP_3_7D_OVERNIGHT_REPORT.md](./STEP_3_7D_OVERNIGHT_REPORT.md)，Sol 审查的逐项关闭见 [STEP_3_7D_USER_REVIEW.md](./STEP_3_7D_USER_REVIEW.md) 附录。**本轮未 Push。**
+
 ## Current Status（2026-10-08）
 
 - **Step 3.7D（Intent-First 入口、文档库与转换 UI、真实研究进度）已完成**：首页不再创建任务卡——新建研究默认进入**方向澄清**（`#/i/<intentId>`），助手提问 → 用户回答 → 用户改方向 → 用户确认，确认之后服务端才建立任务卡，页面**等待 taskId 真正出现**再跳研究范围（202 不是项目）；Markdown 可以随主题一起提交并在首页做 fatal UTF-8 / 512 KiB / envelope 校验，PDF/DOCX 走**默认未勾选**的第三方上传授权 → 真实 `POST /documents/convert`（raw octet-stream）→ Job（排队/解析/入库/失败/重试，attempts 与 guidance 都来自服务端）→ 文档库；文档库可以改用途（至少一个，按 revision 冲突可恢复）、可以把 ready 且标为 `research_source` 的文档**显式**加入研究来源（`user-provided` / 未读取，不自动产生证据）；研究页第一屏换成服务端 `progress` / `attempt` / `discovery` / `activityLog` 驱动的真实进度与按 gate 出现的 Retry（保留材料、不做百分比）。前端新增 `polling.ts`（scope generation + abort + 单飞 + dirty 补读 + 退避 + hidden 暂停）、`intent-logic.ts`、`upload-logic.ts`；新增 `verify-intent-documents.mjs` 真实浏览器 gate（真实 Chrome + 真实 DeepSeek：首页 → 两轮问答 → 方向编辑/确认 → 真实任务卡 → 确认 Brief → 研究 → 报告工作区，22/22 通过，并记录 Network 证明「新建没有 POST /tasks」）；旧 gate 在真实报告上通过（见下：Ask / 补查 / Edit / 提案接受 / 冻结 / 样式对照 / 来源全部 PASS）。见下「Step 3.7D」。**本轮未 Push。**
@@ -1356,3 +1360,16 @@ bundle 新增 `presentation`，六个字段各自回答一个问题，都由真�
 - 真实 Demo（两主题）：`RESEARCHPAGE_REAL_NETWORK=1 RESEARCHPAGE_KEEP_ARTIFACTS=1 npx vitest run apps/research/tests/real-demo.e2e.test.ts`（换主题用 `RESEARCHPAGE_DEMO_TOPIC`）。
 - 真实 PDF：`RESEARCHPAGE_REAL_NETWORK=1 npx vitest run packages/plugin-research/tests/render-pdf.test.ts`。
 - 页面 gate：`node apps/research/scripts/verify-workspace.mjs --url <product url>`（对 v2 报告实测 9/9 PASS）。
+
+## Step 3.7D Overnight Recovery 的验证入口
+
+- 表格契约（真实数组行、规范形状、宽度不符、缺 section.id、未知 block、空白格）：`npx vitest run packages/plugin-research/tests/report-table-contract.test.ts`。
+- 排名词表（否定 / 肯定 / 混合表述，以及成本口径与 Q09 仍然保留）：`npx vitest run packages/plugin-research/tests/report-ranking-lexicon.test.ts`。
+- 系统提示词预算守卫（提示词超过 Host 的 8 KiB 预算会让服务**无法启动**）：`npx vitest run apps/research/tests/prompt-budget.test.ts`。
+- 报告恢复与四态（HTTP 200 语义、互斥、不覆盖正式报告、恢复不重新检索、分类后的失败原因）：`npx vitest run apps/research/tests/report-recovery-api.test.ts apps/research/tests/report-recovery-view.test.ts`。
+- 研究预算与检索来源设置（区间拒绝、创建时冻结、重试不变、重启恢复、来源顺序真实生效）：`npx vitest run packages/plugin-research/tests/product-settings.test.ts apps/research/tests/settings-api.test.ts`。
+- 进度摘要与 Intent 布局（摘要优先、活动默认折叠、按类型分组、两栏与折叠的方向卡、理由默认折叠）：`npx vitest run apps/research/tests/research-progress-view.test.ts apps/research/tests/intent-view.test.ts`。
+- 真实端到端验收（隔离目录 + 隔离端口 + 真实 DeepSeek + 真实 arXiv/OpenAlex；结束时核对 `reports` 表行、HTML 与 PDF）：先 `pnpm build:research`，再以 `--port 8899 --data <隔离目录>` 启动 `apps/research/dist/research-server.mjs`，然后 `node .scratch/overnight-goal-20261009/real-acceptance.mjs --port 8899 --data <隔离目录>`。脚本不随仓库提交（在 `.scratch/` 下），做法与输出见 [STEP_3_7D_OVERNIGHT_REPORT.md](./STEP_3_7D_OVERNIGHT_REPORT.md) §6。
+- 离线全量、类型检查与构建：`pnpm typecheck`、`pnpm build:research`、`npx vitest run`。
+- 已知的既有 flaky（与本次改动无关，单独重跑即过）：`apps/web/tests/shell-m5-approval.browser.test.ts` 在整仓并行跑时偶发 CDP 超时（本轮单独重跑 8/8 通过）。
+- 本机注意：用户 8791 服务的 `.scratch/my-run-data` 全程只读（`sqlite3` `mode=ro&immutable=1`、`node:sqlite` `readOnly`），实验在 `.scratch/overnight-goal-20261009/` 的隔离副本与端口上进行。
