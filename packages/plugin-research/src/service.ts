@@ -24,6 +24,7 @@ import type {
   DiscoveryTelemetry,
   EditActionOutcome,
   ReportDraftState,
+  ReportGenerationState,
   ReportFrame,
   Evidence,
   ExportArtifact,
@@ -1044,6 +1045,20 @@ export interface ResearchService {
    * before it is asked to conclude anything.
    */
   previewDraftValidation(taskId: string): ValidationResult | null;
+  /**
+   * Opens a new attempt at producing the report.
+   *
+   * Calling this is what distinguishes "the user asked for a report" from
+   * "a report exists": it clears the previous attempt's failure so a reader is
+   * never shown a stale reason, and it counts a resumption when there is
+   * already a draft to resume from. It refuses while a report already exists,
+   * because a saved report is edited through a proposal, never rewritten.
+   */
+  beginReportGeneration(taskId: string, input: { readonly stage: "report" | "synthesis"; readonly resume: boolean }): ReportGenerationState | Refusal;
+  /** Moves the current attempt along. A no-op when no attempt is open. */
+  recordReportStage(taskId: string, patch: Partial<ReportGenerationState>): ReportGenerationState | undefined;
+  /** The current attempt, or `null` when the task has none. */
+  reportGenerationOf(taskId: string): ReportGenerationState | null;
   state(taskId: string): WorkspaceState;
   cellsOf(taskId: string): readonly CellView[];
   sourcesOf(taskId: string): readonly Source[];
@@ -4349,6 +4364,45 @@ export function createResearchService(options: ResearchServiceOptions): Research
     },
 
     reportDraftOf: (taskId) => requireTask(taskId).reportDraft,
+
+    beginReportGeneration(taskId, input) {
+      const task = requireTask(taskId);
+      // A saved report is never rewritten in place: changing it is the user's
+      // decision, made through a proposal they accept. Recovery therefore
+      // refuses rather than producing a second version nobody asked for.
+      if (task.currentReportId !== null) {
+        return {
+          ok: false,
+          conflict: true,
+          problems: [`任务 ${taskId} 已经有正式报告 ${task.currentReportId}，不会被重新生成覆盖`],
+          guidance: "修改已有报告请走 Edit：提出修改提案，由用户在界面上接受后产生新版本。",
+        };
+      }
+      const state: ReportGenerationState = {
+        attemptId: newId(ID_PREFIX.run),
+        status: "running",
+        stage: input.stage,
+        startedAt: isoNow(),
+        endedAt: null,
+        failure: null,
+        resumes: (task.reportGeneration?.resumes ?? 0) + (input.resume ? 1 : 0),
+        repairs: task.reportGeneration?.repairs ?? 0,
+        repairSignature: task.reportGeneration?.repairSignature ?? null,
+      };
+      updateTask(task, { status: "researching", error: null, reportGeneration: state });
+      return state;
+    },
+
+    recordReportStage(taskId, patch) {
+      const task = repo.getTask(taskId);
+      const current = task?.reportGeneration;
+      if (task === undefined || current === undefined || current === null) return undefined;
+      const next: ReportGenerationState = { ...current, ...patch };
+      updateTask(task, { reportGeneration: next });
+      return next;
+    },
+
+    reportGenerationOf: (taskId) => requireTask(taskId).reportGeneration ?? null,
 
     previewDraftValidation(taskId) {
       const task = requireTask(taskId);

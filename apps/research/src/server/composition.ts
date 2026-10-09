@@ -36,6 +36,7 @@ import { createResearchContextBuilder } from "./context-builder.js";
 import { createConversionManager, type ConversionManager } from "./conversions.js";
 import { exportTaskReportPdf } from "./export.js";
 import { mineruSettingsFrom } from "./mineru.js";
+import { classifyModelFailure, createFailureLedger } from "./model-failures.js";
 import { createResearchRouter } from "./routes.js";
 import { createResearchRunner, type ResearchRunner } from "./runner.js";
 
@@ -100,6 +101,7 @@ export interface ResearchApp {
   readonly service: ResearchService;
   readonly runner: ResearchRunner;
   /** The PDF/DOCX converter's job manager, as the routes and tests use it. */
+  /** The application's own model-failure classification, for the routes that report it. */
   readonly conversions: ConversionManager;
   readonly repository: ResearchRepository;
   close(): Promise<void>;
@@ -123,23 +125,34 @@ export async function startResearchApp(options: ResearchAppOptions): Promise<Res
   const contextBuilder = createResearchContextBuilder({ service });
   const modelSettings = options.model ?? { provider: "offline", model: "offline" };
 
+  const failures = createFailureLedger();
+
   /**
-   * Wraps the composed client so the *application's* log says what failed.
+   * Wraps the composed client so the *application* can say what failed.
    *
    * The host classifies a model failure on the wire by design — a client learns
-   * "the run failed", never a provider's words — but the operator running the
-   * product still needs the reason, and the adapter's own message is a fixed,
-   * non-secret classification. It is logged here and nowhere else.
+   * "the run failed", never a provider's words — but a reader of the product
+   * still needs to know whether the model service refused the request or the
+   * network dropped it, because the two call for different actions. The
+   * adapter's own message is a fixed, non-secret classification, so it is
+   * classified here into a safe category and recorded for the runner that
+   * started the stage. The wrapper is also the operator's log line, and it logs
+   * the *classified* sentence, never the raw one.
    */
   const withFailureLog = (client: ModelClient): ModelClient => ({
     limits: client.limits,
     stream: (request, context) => {
-      const inner = client.stream(request, context);
       return (async function* () {
         try {
-          yield* inner;
+          // The call that opens the stream is inside the try as well: an adapter
+          // that refuses synchronously is refused for the same reason as one
+          // whose stream ends in an error, and the reader is owed the same
+          // classification either way.
+          yield* client.stream(request, context);
         } catch (error) {
-          log(`[app] model step failed: ${error instanceof Error ? error.message : String(error)}`);
+          const failure = classifyModelFailure(error);
+          failures.record(context.sessionId, error);
+          log(`[app] model step failed: ${failure.code} (${failure.category})`);
           throw error;
         }
       })();
@@ -226,6 +239,7 @@ export async function startResearchApp(options: ResearchAppOptions): Promise<Res
   const runner = createResearchRunner({
     client,
     service,
+    failures,
     exportPdf: async (taskId) => {
       const outcome = await exportTaskReportPdf({
         service,

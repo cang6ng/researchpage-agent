@@ -22,6 +22,7 @@
 
 import type {
   CellStatus,
+  ReportGenerationFailure,
   ReportTask,
   ReportValidation,
   ResearchActivityEvent,
@@ -332,6 +333,156 @@ export function presentationOf(input: PresentationInput): PresentationReadout {
     reportReview: reportReviewOf(input.task),
     artifactQuality: artifactQualityOf(input.validation),
     sourceRoles: sourceRolesOf(input.sources),
+  };
+}
+
+/**
+ * Where the report is, as one of the states a reader can act on.
+ *
+ * Four states were being reported as one sentence —「没有保存有效报告」— and they
+ * are not the same fact: a request that was accepted is not a report being
+ * written, a draft that was written is not a report, and only a validated and
+ * stored report is a report. `validated` is the only value that means success;
+ * every other value says what would move it forward, and says it in words that
+ * come from the failure classification rather than from an exception.
+ */
+export type ReportGenerationStatus = "idle" | "accepted" | "running" | "draft_saved" | "validated" | "failed";
+
+export interface ReportGenerationProjection {
+  readonly status: ReportGenerationStatus;
+  readonly displayName: string;
+  readonly userMessage: string;
+  readonly stage: "report" | "synthesis" | null;
+  readonly startedAt: string | null;
+  readonly endedAt: string | null;
+  readonly resumes: number;
+  readonly repairs: number;
+  /** The safe, classified reason this attempt failed, if it did. */
+  readonly failure: ReportGenerationFailure | null;
+  /** What the saved draft already holds, counted rather than quoted. */
+  readonly draft: { readonly sections: number; readonly claims: number; readonly outstanding: number } | null;
+  /** Whether resuming would reuse existing material rather than searching again. */
+  readonly canResume: boolean;
+  /** Non-null only once a report is validated and stored. */
+  readonly reportId: string | null;
+  /** Why a resume is not available, when it is not. */
+  readonly blockedBy: "report_exists" | "brief_unconfirmed" | "busy" | null;
+}
+
+const REPORT_STATUS_WORDS: Readonly<Record<ReportGenerationStatus, string>> = Object.freeze({
+  idle: "尚未开始",
+  accepted: "已受理",
+  running: "正在生成报告",
+  draft_saved: "草稿已保存（尚未通过校验）",
+  validated: "报告已通过校验并保存",
+  failed: "报告生成失败",
+});
+
+export interface ReportGenerationInput {
+  readonly task: ReportTask;
+  /** The stage of the run actually executing, if one is. */
+  readonly runningStage: string | null;
+  readonly draft: { readonly sections: number; readonly claims: number; readonly outstanding: number } | null;
+  readonly busy: boolean;
+}
+
+export function reportGenerationOf(input: ReportGenerationInput): ReportGenerationProjection {
+  const reportId = input.task.currentReportId;
+  const generation = input.task.reportGeneration ?? null;
+  const base = {
+    stage: generation === null ? null : generation.stage,
+    startedAt: generation?.startedAt ?? null,
+    endedAt: generation?.endedAt ?? null,
+    resumes: generation?.resumes ?? 0,
+    repairs: generation?.repairs ?? 0,
+    failure: generation?.failure ?? null,
+    draft: input.draft,
+    reportId,
+  };
+
+  // A stored report is the only success, and it outranks everything else: a
+  // stale attempt record can never make a saved report look unfinished.
+  if (reportId !== null) {
+    return {
+      ...base,
+      status: "validated",
+      displayName: REPORT_STATUS_WORDS.validated,
+      userMessage: `报告 ${reportId} 已通过校验并保存；修改请走 Edit 提案。`,
+      canResume: false,
+      blockedBy: "report_exists",
+    };
+  }
+
+  if (input.task.confirmedAt === null) {
+    return {
+      ...base,
+      status: "idle",
+      displayName: REPORT_STATUS_WORDS.idle,
+      userMessage: "研究简报还没有确认；确认后才能开始撰写报告。",
+      canResume: false,
+      blockedBy: "brief_unconfirmed",
+    };
+  }
+
+  if (input.busy || (generation !== null && generation.status === "running")) {
+    const accepted = input.runningStage === null;
+    return {
+      ...base,
+      status: accepted ? "accepted" : "running",
+      displayName: accepted ? REPORT_STATUS_WORDS.accepted : REPORT_STATUS_WORDS.running,
+      userMessage: accepted
+        ? "报告请求已受理，正在排队；这不代表报告已经生成。"
+        : `正在${base.stage === "synthesis" ? "综合与校验" : "撰写章节"}；完成前不会有正式报告。`,
+      canResume: false,
+      blockedBy: "busy",
+    };
+  }
+
+  // A written draft outranks the attempt that produced it: what the reader has
+  // is a document that did not pass validation — not "nothing" — and the
+  // failure that stopped the pass is reported *with* it rather than instead of
+  // it. What this projection has to keep apart is "no report exists" from "a
+  // report exists"; a draft is the first of those, and it says how close it is.
+  if (input.draft !== null) {
+    const outstanding = input.draft.outstanding;
+    const failure = generation?.failure ?? null;
+    return {
+      ...base,
+      status: "draft_saved",
+      displayName: REPORT_STATUS_WORDS.draft_saved,
+      userMessage:
+        failure !== null
+          ? `草稿已保存但没有通过校验，最近一次执行也没有完成：${failure.problem} ${failure.guidance}`
+          : outstanding === 0
+            ? "草稿已经写齐，但还没有通过校验；用现有资料恢复报告即可继续，不需要重新检索。"
+            : `草稿已保存，但仍有 ${outstanding} 项校验问题没有解决；用现有资料恢复报告只会针对这些问题。`,
+      canResume: true,
+      blockedBy: null,
+    };
+  }
+
+  if (generation !== null && generation.status === "failed") {
+    const failure = generation.failure;
+    return {
+      ...base,
+      status: "failed",
+      displayName: REPORT_STATUS_WORDS.failed,
+      userMessage:
+        failure === null
+          ? "报告生成失败，而且还没有写出可用的草稿；已读材料都保留着，可以用现有资料重试报告，不需要重新检索。"
+          : `${failure.problem} ${failure.guidance}`,
+      canResume: true,
+      blockedBy: null,
+    };
+  }
+
+  return {
+    ...base,
+    status: "idle",
+    displayName: REPORT_STATUS_WORDS.idle,
+    userMessage: "还没有开始撰写报告；材料已经就绪，可以直接生成。",
+    canResume: false,
+    blockedBy: null,
   };
 }
 

@@ -33,6 +33,7 @@ import type {
   ResearchService,
   ResearchStage,
 } from "@every-dagent/plugin-research";
+import { createFailureLedger, unclassifiedFailure, type FailureLedger, type SafeFailure } from "./model-failures.js";
 import {
   EDIT_RESEARCH_BUDGET,
   GUIDE_MAX_DECISIONS,
@@ -53,6 +54,14 @@ import {
 export interface ResearchRunnerOptions {
   readonly client: Client;
   readonly service: ResearchService;
+  /**
+   * The application's record of what the model layer actually failed with.
+   *
+   * A failed run reaches this runner as a masked code, so the reason is read
+   * back from the one component that saw it. Without it a stage can only be
+   * reported as「运行失败」, which is what made the real incident unreadable.
+   */
+  readonly failures?: FailureLedger;
   /** The longest one stage may take before it is cancelled, in ms. */
   readonly stageTimeoutMs?: number;
   /** Called when the runner wants to export the report the moment it exists. */
@@ -112,6 +121,15 @@ export interface ResearchRunner {
   startGapRound(taskId: string): void;
   /** Write and save the report. */
   startReport(taskId: string): void;
+  /**
+   * Whether this task already has a report pass in flight.
+   *
+   * The server-side half of the double-click guard: a second click while the
+   * first report is still being written must be refused, because two passes
+   * writing one draft is how the second one's sections silently replace the
+   * first one's work.
+   */
+  hasReportWork(taskId: string): boolean;
   /**
    * Asks the assistant something, or asks it for a scoped edit.
    *
@@ -423,6 +441,14 @@ export function stageInstruction(input: {
   readonly stage: "synthesis";
   readonly task: ReportTask;
   readonly reportBrief: string;
+  /**
+   * The obligations still unmet, when this pass is a repair rather than a write.
+   *
+   * A repair pass is told exactly what the latest validation objected to, so it
+   * edits the offending part instead of being asked for the same report again —
+   * which is what an unread, repeated failure used to produce.
+   */
+  readonly repair?: readonly string[];
   readonly documents?: readonly DocumentContext[];
 }): string;
 export function stageInstruction(input: {
@@ -446,6 +472,7 @@ export function stageInstruction(input: {
   readonly instruction?: string;
   readonly targetSectionId?: string;
   readonly reportBrief?: string;
+  readonly repair?: readonly string[];
   readonly guideTarget?: GuideTarget;
   readonly answered?: number;
   readonly recentDecisions?: readonly GuideDecisionContext[];
@@ -650,7 +677,27 @@ export function stageInstruction(input: {
         "本阶段不要调用 finalize，也不要写 comparison / synthesis / limitations：剩余章节由下一个阶段完成。",
         "写完这些章节后，用一两句话说明你提交了什么，然后停止。",
       ].join("\n");
-    case "synthesis":
+    case "synthesis": {
+      const repair = input.repair ?? [];
+      if (repair.length > 0) {
+        // The repair pass. It is deliberately narrow: the draft already holds
+        // everything the model wrote, and only the objections below are open.
+        // Being asked for the whole report again is what made the old loop
+        // unreadable — the same objection came back, and the answer never
+        // changed because nothing said which part of it was wrong.
+        return [
+          "这份报告已经写好了一部分草稿，但没有通过校验。现在只修正下面这些未满足的义务，不要重写其它章节，也不要重新检索。",
+          "本次校验指出的问题：",
+          ...repair.map((problem, index) => `${String(index + 1)}) ${problem}`),
+          '用 {part:"write", section:{id,title,blocks}} 整节重新提交被指出的那一节，或用 {part:"write", claims:[...]} 修正被指出的 claim；',
+          '表格形状：{kind:"table",columns,columnDimensions,rowSubjects,rows:[{cells:[{text,claimIds}]}]}；每行的格数必须与 columns 一致，数组行只接受 ["对象名", "第 1 格", …, "第 N 格"]。',
+          "每一格都要写一个有界判断，或写明「证据不足 / 有限可比 / 不可直接比较 / 未找到公开依据」：空白格不等于缺口声明。",
+          "不要为了通过校验删掉诚实写出的缺口与限制：写成 callout(tone=\"gap\") 的缺口是合格的，删掉它们不合格。",
+          '修正后再次 {part:"finalize"}；若仍有 problems，只修被指出的那一项。',
+          `比较对象：${subjects}；研究维度：${dimensions}；`,
+          ...documentLines,
+        ].join("\n");
+      }
       return [
         "第一阶段已完成。现在写第二部分并校验发布：在共同条件下比较、跨来源综合、写明缺口。",
         input.reportBrief ?? "",
@@ -667,6 +714,7 @@ export function stageInstruction(input: {
         "- 性能与成本判断要带 conditions（comparability / costStage），不可比就并列报告，不要排名；",
         "综合判断的最低标准：**它比逐篇摘要多给出了什么认识**——共性、关键差异、trade-off、冲突或研究空白——并且这些认识能回到各对象的证据。",
       ].join("\n");
+    }
     case "ask":
       return [
         "用户提出了一个问题。请只使用当前项目已有材料回答，不要写入任何正式数据。",
@@ -709,6 +757,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
   const { client, service } = options;
   const stageTimeoutMs = options.stageTimeoutMs ?? 9 * 60 * 1000;
   const log = options.log ?? ((): void => undefined);
+  const failures: FailureLedger = options.failures ?? createFailureLedger();
 
   const queue: StageRequest[] = [];
   let active: Promise<void> | undefined;
@@ -859,6 +908,13 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       // instruction itself — which is the only channel this stage has.
       log(`[runner] intent turn retry: ${request.retryHint}`);
     }
+    // Both report stages belong to one attempt at producing the report, and
+    // that attempt has to exist before either runs: it is what says the report
+    // is being written, and what bounds the repair pass a refusal may spend.
+    if (request.taskId !== null && (request.stage === "report" || request.stage === "synthesis")) {
+      ensureReportAttempt(request.stage, request.taskId);
+    }
+
     if (request.taskId !== null && task !== undefined) {
       // The reader's own account of the run starts here, in their vocabulary:
       // 「开始撰写报告」is a fact about the product, while the stage id is not.
@@ -910,6 +966,10 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       service.recordRun({ ...record, ...patch, endedAt: patch.endedAt ?? new Date().toISOString() });
     };
 
+    // The instant the stage began, so a failure is read back from the ledger
+    // only when it was recorded *during* this stage. A stale entry is never
+    // attributed to a later run.
+    const startedAtMs = Date.now();
     let runId: string;
     try {
       const started = await client.runs.start({
@@ -932,6 +992,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
 
     const readsBefore = request.taskId === null ? 0 : readSourceCount(request.taskId);
     let runFailed = false;
+    let stageFailure: SafeFailure | null = null;
     const deadline = Date.now() + stageTimeoutMs;
     for (;;) {
       await new Promise((resolve) => {
@@ -953,10 +1014,17 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         // change what an earlier action is said to have answered.
         const outcome =
           request.userText === undefined ? undefined : service.actionOutcomeOf(request.sessionId, request.userText);
+        // A failed stage is reported in the product's own safe vocabulary: the
+        // category comes from the model layer's record of what it saw, never
+        // from the host's masked answer, which deliberately says nothing.
+        stageFailure =
+          state.status === "completed" ? null : (failures.read(request.sessionId, startedAtMs) ?? unclassifiedFailure());
         const note =
           state.status === "completed"
             ? `${stageLabel(request.stage)}：完成`
-            : `${stageLabel(request.stage)}：${state.error ?? state.status}`;
+            : stageFailure === null
+              ? `${stageLabel(request.stage)}：${state.error ?? state.status}`
+              : `${stageLabel(request.stage)}：失败 — ${stageFailure.problem}`;
         finish({
           status: state.status === "completed" ? "completed" : "failed",
           note,
@@ -1013,7 +1081,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     // The action is over, so the permission it carried is over too: a later run
     // gets its own grant, and nothing that is still settling can keep writing.
     if (!runFailed) service.clearGrant(request.sessionId);
-    await afterStage(request, readsBefore, runFailed);
+    await afterStage(request, readsBefore, runFailed, stageFailure);
   }
 
   /**
@@ -1100,6 +1168,48 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       attempts: records.length,
       failures: records.filter((record) => record.status === "failed" || record.status === "interrupted").length,
     };
+  }
+
+  /**
+   * How many repair passes one report attempt may spend.
+   *
+   * One. A repair is aimed at a specific objection, and a second pass at the
+   * same objection would spend a model call to produce the same refusal — which
+   * is exactly the loop a real project got stuck in.
+   */
+  const MAX_REPORT_REPAIRS = 1;
+
+  /**
+   * Opens the report attempt this stage belongs to, when none is open.
+   *
+   * The automatic pipeline reaches report and synthesis without going through
+   * the button, so nothing else would open one — and without an attempt there is
+   * no place to record which objection a repair already answered, which is what
+   * bounded it. An explicit request opens its own attempt first (it counts a
+   * resumption and clears a previous failure); this only covers the path that
+   * has no request behind it.
+   */
+  function ensureReportAttempt(stage: "report" | "synthesis", taskId: string): void {
+    const task = service.getTask(taskId);
+    if (task === undefined || task.currentReportId !== null) return;
+    if (task.reportGeneration !== undefined && task.reportGeneration !== null) return;
+    service.beginReportGeneration(taskId, { stage, resume: task.reportDraft !== null });
+  }
+
+  /**
+   * What a validation objected to, as a comparable signature.
+   *
+   * Only the check the objection came from is kept, not its wording: two passes
+   * that are refused for the same reason are the same pass, and re-running it
+   * costs a model call and changes nothing. When the reason changes — a new
+   * objection appears, or the old one is gone — the signature changes with it,
+   * and one more repair is worth spending.
+   */
+  function repairSignatureOf(problems: readonly string[]): string {
+    const checks = problems
+      .map((problem) => /^(Q\d+)/.exec(problem.trim())?.[1] ?? problem.slice(0, 24))
+      .sort();
+    return checks.join("|");
   }
 
   /** What each program-driven stage is allowed to do while it runs. */
@@ -1236,7 +1346,12 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
   }
 
   /** What the program does once a stage settles: the next bounded step, or a stop. */
-  async function afterStage(request: StageRequest, readsBefore: number, runFailed: boolean): Promise<void> {
+  async function afterStage(
+    request: StageRequest,
+    readsBefore: number,
+    runFailed: boolean,
+    failure: SafeFailure | null,
+  ): Promise<void> {
     // The conversation stage is examined before the task guard below: it runs
     // before any task exists, which is exactly why its outcome needs looking at.
     if (request.stage === "intent") {
@@ -1259,8 +1374,9 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           // Nothing was read, so there is nothing to assess or report on. The
           // task keeps its materials and the workspace offers a retry — and the
           // reason says what actually happened, because a search service that
-          // refused to answer is not a topic that lacks literature.
-          service.failTask(task.id, researchFailureCopy(task));
+          // refused to answer is not a topic that lacks literature, and a model
+          // service that refused the request is not a topic either.
+          service.failTask(task.id, failure === null ? researchFailureCopy(task) : `${failure.problem} ${failure.guidance}`);
           return;
         }
         // A task that already has a report is never re-written by research:
@@ -1337,6 +1453,15 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         // that deserves its own instruction rather than being the last paragraph
         // of whatever section happened to be open.
         if (settled.currentReportId === null) {
+          // A report stage that ended without a saved report is either a stage
+          // that failed outright or one that wrote sections and left the
+          // obligation to synthesis. Both are recorded, because the difference
+          // is the difference between「恢复报告」and「重试一次失败」.
+          service.recordReportStage(settled.id, {
+            stage: "synthesis",
+            status: runFailed ? "failed" : "draft_saved",
+            ...(runFailed ? { endedAt: new Date().toISOString(), failure } : {}),
+          });
           enqueue({
             taskId: settled.id,
             sessionId,
@@ -1351,6 +1476,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           });
           return;
         }
+        service.recordReportStage(settled.id, { status: "validated", endedAt: new Date().toISOString(), failure: null });
         await afterReportSaved(settled);
         return;
       }
@@ -1361,12 +1487,50 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           // The draft's own outstanding obligations are the most useful thing to
           // leave in the log: the pass ended, and this says what it still owed.
           const preview = service.previewDraftValidation(settled.id);
-          log(
-            `[runner] report was not saved for ${settled.id}: ${(preview?.problems ?? ["草稿校验未通过"]).slice(0, 6).join("；")}`,
+          const obligations = preview?.problems ?? ["草稿校验未通过"];
+          log(`[runner] report was not saved for ${settled.id}: ${obligations.slice(0, 6).join("；")}`);
+          const signature = repairSignatureOf(obligations);
+          const previous = settled.reportGeneration ?? null;
+          // One bounded repair pass, aimed at what this validation actually
+          // still objects to. A pass asked to fix an objection it already failed
+          // to fix is a pass that will fail the same way, so the same signature
+          // is never repaired twice — and the decision is taken from the state
+          // the record *confirmed*, never from the one it was asked to write.
+          // An attempt that cannot be recorded is a repair that cannot be
+          // bounded, so it is not spent: the pipeline stops instead of looping.
+          const canRepair =
+            !runFailed && previous !== null && previous.repairs < MAX_REPORT_REPAIRS && previous.repairSignature !== signature;
+          const recorded = service.recordReportStage(settled.id, {
+            ...(canRepair
+              ? { status: "running" as const, repairs: previous.repairs + 1, repairSignature: signature }
+              : { status: "failed" as const, endedAt: new Date().toISOString(), failure, repairSignature: signature }),
+          });
+          if (canRepair && recorded !== undefined && recorded.repairs === previous.repairs + 1) {
+            log(`[runner] repairing the report draft for ${settled.id}: ${obligations.slice(0, 3).join("；")}`);
+            enqueue({
+              taskId: settled.id,
+              sessionId,
+              stage: "synthesis",
+              instruction: stageInstruction({
+                stage: "synthesis",
+                task: settled,
+                reportBrief: synthesisBrief(settled.id),
+                documents: taskDocumentsOf(settled.id),
+                repair: obligations.slice(0, 6),
+              }),
+              grant: STAGE_GRANTS.synthesis,
+            });
+            return;
+          }
+          service.failTask(
+            settled.id,
+            failure === null
+              ? "报告阶段结束但没有保存有效报告；已有材料与草稿都保留着，可以用「使用现有资料恢复报告」继续，不需要重新检索。"
+              : `${failure.problem} ${failure.guidance}`,
           );
-          service.failTask(settled.id, "报告阶段结束但没有保存有效报告；可以在工作台重新生成。");
           return;
         }
+        service.recordReportStage(settled.id, { status: "validated", endedAt: new Date().toISOString(), failure: null });
         await afterReportSaved(settled);
         return;
       }
@@ -1475,6 +1639,11 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     startReport(taskId) {
       const task = service.getTask(taskId);
       if (task === undefined) return;
+      // The attempt is opened before the stage is queued, so a request that was
+      // accepted, a stage that is running and a draft that was written but not
+      // validated are three different facts from the first millisecond — not
+      // one「report」that only becomes true at the end.
+      service.beginReportGeneration(taskId, { stage: "report", resume: task.reportDraft !== null });
       enqueue({
         taskId,
         sessionId: task.sessionId,
@@ -1482,6 +1651,13 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         instruction: stageInstruction({ stage: "report", task, documents: taskDocumentsOf(taskId) }),
         grant: STAGE_GRANTS.report,
       });
+    },
+
+    hasReportWork(taskId) {
+      const isReportStage = (request: StageRequest | undefined): boolean =>
+        request?.taskId === taskId && (request.stage === "report" || request.stage === "synthesis");
+      if (isReportStage(activeRequest)) return true;
+      return queue.some((request) => isReportStage(request));
     },
 
     startAssistant(taskId, input) {

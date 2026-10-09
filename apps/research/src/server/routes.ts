@@ -46,7 +46,7 @@ import {
 import { publicProblem, type ConversionManager, type ConversionProblem } from "./conversions.js";
 import { exportRevisionPdf, exportTaskReportPdf, renderHtmlOf, revisionHtmlOf } from "./export.js";
 import { MINERU_FLASH_MAX_BYTES, MINERU_FLASH_MAX_PAGES } from "./mineru.js";
-import { presentationOf, researchProgressOf } from "./presentation.js";
+import { presentationOf, reportGenerationOf, researchProgressOf } from "./presentation.js";
 import type { ResearchRunner } from "./runner.js";
 
 const MAX_BODY_BYTES = 32 * 1024;
@@ -358,7 +358,7 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 /** The whole workspace state for one task: what the UI polls. */
-function taskBundle(service: ResearchService, taskId: string, busy: boolean): unknown {
+function taskBundle(service: ResearchService, taskId: string, busy: boolean, reportBusy = false): unknown {
   const task = service.getTask(taskId);
   if (task === undefined) return undefined;
   const cells = service.cellsOf(taskId);
@@ -366,6 +366,18 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
   const current = task.currentReportId === null ? undefined : reports.find((report) => report.id === task.currentReportId);
   const revisions = service.revisionsOf(taskId);
   const proposals = service.proposalsOf(taskId);
+  // What the draft already holds, counted. The outstanding obligations come
+  // from the same validator the finalize path runs, so「还有 N 项」is the real
+  // number rather than an estimate of it.
+  const draft = service.reportDraftOf(taskId);
+  const draftSummary =
+    draft === null
+      ? null
+      : {
+          sections: draft.sections.length,
+          claims: draft.claims.length,
+          outstanding: service.previewDraftValidation(taskId)?.problems.length ?? 0,
+        };
   return {
     task: {
       id: task.id,
@@ -619,6 +631,18 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean): un
       pendingProposal: proposals.some((proposal) => proposal.status === "pending"),
       runningStage: service.runsOf(taskId).find((record) => record.status === "running")?.stage ?? null,
       validation: current?.validation ?? null,
+    }),
+    /**
+     * Where the report itself is, in the four states that were being reported
+     * as one. `validated` is the only one that means a report exists; the rest
+     * each say what would move it forward, and a failure says it in the safe
+     * vocabulary the model layer classified rather than in a provider's words.
+     */
+    reportGeneration: reportGenerationOf({
+      task,
+      runningStage: service.runsOf(taskId).find((record) => record.status === "running")?.stage ?? null,
+      draft: draftSummary,
+      busy: reportBusy,
     }),
     busy,
   };
@@ -1447,14 +1471,14 @@ export function createResearchRouter(
         sendJson(response, 200, { pending: pendingTopics.has(sessionId), task: null, busy: busyState() });
         return;
       }
-      sendJson(response, 200, { pending: false, task: taskBundle(service, task.id, busyState()) });
+      sendJson(response, 200, { pending: false, task: taskBundle(service, task.id, busyState(), runner.hasReportWork(task.id)) });
       return;
     }
 
     // GET /api/research/tasks/:id — the whole workspace bundle.
     const getTaskId = taskIdOf(path);
     if (getTaskId !== undefined && method === "GET") {
-      const bundle = taskBundle(service, getTaskId, busyState());
+      const bundle = taskBundle(service, getTaskId, busyState(), runner.hasReportWork(getTaskId));
       if (bundle === undefined) {
         sendJson(response, 404, { error: "任务不存在" });
         return;
@@ -1678,8 +1702,51 @@ export function createResearchRouter(
         sendJson(response, 404, { error: "任务不存在" });
         return;
       }
+      // The guards a button cannot provide. A report is produced once, from
+      // confirmed material, by one pass at a time; a client that clicks twice,
+      // or that asks for a report on a project it has not confirmed, is told
+      // why instead of being queued behind itself.
+      if (task.currentReportId !== null) {
+        sendJson(response, 409, {
+          ok: false,
+          reason: "report_exists",
+          error: `这个项目已经有正式报告（${task.currentReportId}），不会被重新生成覆盖。`,
+          guidance: "修改已有报告请使用 Edit：提出修改提案，由用户接受后产生新版本。",
+          reportId: task.currentReportId,
+        });
+        return;
+      }
+      if (task.confirmedAt === null) {
+        sendJson(response, 409, {
+          ok: false,
+          reason: "brief_unconfirmed",
+          error: "研究简报还没有确认，不能开始撰写报告。",
+          guidance: "请先在项目页确认研究简报；确认后报告会基于已确认的对象与范围撰写。",
+        });
+        return;
+      }
+      if (runner.hasReportWork(reportId2)) {
+        sendJson(response, 409, {
+          ok: false,
+          reason: "report_busy",
+          error: "这个项目已经在生成报告了。",
+          guidance: "报告正在进行中；它会在研究状态里显示进度，完成或失败后都可以在这里看到结果。",
+          generation: service.reportGenerationOf(reportId2),
+        });
+        return;
+      }
       runner.startReport(reportId2);
-      sendJson(response, 202, { ok: true, started: "report" });
+      const draft = service.reportDraftOf(reportId2);
+      sendJson(response, 202, {
+        ok: true,
+        started: "report",
+        // 202 is "accepted", and the workspace says exactly that. It is not a
+        // report: `reportId` stays null until one is validated and stored.
+        reportId: null,
+        resumed: draft !== null,
+        draft: draft === null ? null : { sections: draft.sections.map((section) => section.id), claims: draft.claims.length },
+        generation: service.reportGenerationOf(reportId2),
+      });
       return;
     }
 

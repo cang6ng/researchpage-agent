@@ -36,6 +36,8 @@ export type {
   ReportClaim,
   ReportDraftState,
   ReportFrame,
+  ReportGenerationFailure,
+  ReportGenerationState,
   ReportGapNote,
   ReportReviewFlag,
   ReportSection,

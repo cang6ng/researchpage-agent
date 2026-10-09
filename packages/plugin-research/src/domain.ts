@@ -332,6 +332,14 @@ export interface ReportTask {
   /** The report being accumulated, or `null` when none is in progress. */
   readonly reportDraft: ReportDraftState | null;
   /**
+   * What the current attempt at producing the report is doing.
+   *
+   * Absent on tasks written before this record existed; a task with a saved
+   * report is read as `validated` and one without as idle, so an old project
+   * keeps working without being backfilled.
+   */
+  readonly reportGeneration?: ReportGenerationState | null;
+  /**
    * Set when material arrived after the current report was saved.
    *
    * New evidence marks the working report as worth another look; it never edits
@@ -667,6 +675,55 @@ export interface ReportDraftState {
   readonly claims: readonly ReportClaim[];
   readonly sections: readonly ReportSection[];
   readonly updatedAt: string;
+}
+
+/**
+ * What one attempt at producing the report is doing.
+ *
+ * The product used to have exactly one thing to say about a report that failed
+ * —「没有保存有效报告」— and it was said for four different situations: a request
+ * that was accepted, a stage that is running, a draft that was written but did
+ * not validate, and a report that was validated and stored. Only the last is a
+ * report. This record is what keeps them apart, and it is also what makes
+ * recovery a *resumption*: `resumeCount` says whether the model is being asked
+ * for the whole report again or only for what the latest validation still
+ * objects to, and `repairSignature` is the last objection, so a pass that would
+ * repeat an instruction already known to fail stops instead of looping.
+ */
+export interface ReportGenerationState {
+  readonly attemptId: string;
+  readonly status: "running" | "draft_saved" | "validated" | "failed";
+  /** The stage this attempt is in, for the progress view. */
+  readonly stage: "report" | "synthesis";
+  readonly startedAt: string;
+  readonly endedAt: string | null;
+  /**
+   * The last safe reason this attempt failed, if it did.
+   *
+   * Only the closed vocabulary of `SafeFailure` is stored: a category, a fixed
+   * code, and two sentences written for a reader. Never a provider's words.
+   */
+  readonly failure: ReportGenerationFailure | null;
+  /** How many times the report has been resumed from existing material. */
+  readonly resumes: number;
+  /** How many bounded repair passes have been spent on this report. */
+  readonly repairs: number;
+  /**
+   * The objection the last repair pass was asked to fix.
+   *
+   * A pass that is asked to fix the same thing twice is a pass that will fail
+   * the same way, so the runner compares this before spending another one. It
+   * is a signature — the check ids and their count — not the problems' text.
+   */
+  readonly repairSignature: string | null;
+}
+
+/** The safe vocabulary a report failure is published in. */
+export interface ReportGenerationFailure {
+  readonly category: string;
+  readonly code: string;
+  readonly problem: string;
+  readonly guidance: string;
 }
 
 /**
