@@ -69,12 +69,15 @@ describe("the ranking lexicon", () => {
     expect(assertsRanking("这些数字不能合成一个「更便宜」的判断。")).toBe(false);
     expect(assertsRanking("没有依据表明 A 优于 B。")).toBe(false);
     expect(assertsRanking("The numbers are not comparable, so no method outperforms the other.")).toBe(false);
+    expect(assertsRanking("A does not outperform B.")).toBe(false);
   });
 
   it("still reads a stated ranking as one", () => {
     expect(assertsRanking("MethodA 比 MethodB 更便宜。")).toBe(true);
     expect(assertsRanking("MethodA 优于 MethodB。")).toBe(true);
     expect(assertsRanking("MethodB outperforms MethodA on multi-hop retrieval.")).toBe(true);
+    // 不如 states a disadvantage rather than refusing one.
+    expect(assertsRanking("GraphRAG 不如 LightRAG。")).toBe(true);
   });
 
   it("does not let one refusal exempt a ranking stated beside it", () => {
@@ -89,6 +92,78 @@ describe("the ranking lexicon", () => {
     // 「A、B 两个对象都不更便宜」is one clause; splitting on 、 would put the
     // ranking word outside the refusal's reach.
     expect(assertsRanking("不能对 A、B 给出更便宜的判断。")).toBe(false);
+  });
+});
+
+describe("what a refusal actually refuses", () => {
+  // The three sentences an independent review found being waved through: each
+  // contains a refusal word, and each asserts a ranking. The refusal has to
+  // reach the ranking predicate to count.
+  it("does not exempt a ranking because an unrelated phrase is negated", () => {
+    expect(assertsRanking("无法处理中文的 GraphRAG 优于 LightRAG。")).toBe(true);
+  });
+
+  it("does not exempt the second half of a sentence turned by but/however/yet", () => {
+    expect(assertsRanking("GraphRAG is not open source but outperforms LightRAG.")).toBe(true);
+    expect(assertsRanking("GraphRAG is not open source, yet it outperforms LightRAG.")).toBe(true);
+    expect(assertsRanking("GraphRAG is closed source, however it outperforms LightRAG.")).toBe(true);
+  });
+
+  it("does not exempt a second ranking in the same clause", () => {
+    expect(assertsRanking("不能判断 A 更便宜但 B 更便宜。")).toBe(true);
+    expect(assertsRanking("不能得出谁更便宜的结论，A 更便宜。")).toBe(true);
+    expect(assertsRanking("无法比较两篇的设置然而 MethodA 的延迟更低。")).toBe(true);
+    expect(assertsRanking("不能判断 A 更便宜 and B is faster than A.")).toBe(true);
+  });
+
+  it("reads a refusal whose object is the objects' names", () => {
+    const scope = { subjectNames: new Map([["sub_graphrag", "GraphRAG"], ["sub_lightrag", "LightRAG"]]) };
+    expect(assertsRanking("不能对 GraphRAG、LightRAG 给出更便宜的判断。", scope)).toBe(false);
+    expect(assertsRanking("不能判断 GraphRAG 优于 LightRAG。", scope)).toBe(false);
+    // …and the scope does not turn a refusal of something unrelated into a
+    // refusal of the ranking.
+    expect(assertsRanking("GraphRAG 无法处理中文语料却优于 LightRAG。", scope)).toBe(true);
+  });
+
+  it("does not read a double negation as a refusal", () => {
+    expect(assertsRanking("不能不说 A 优于 B。")).toBe(true);
+    expect(assertsRanking("There is no doubt that A outperforms B.")).toBe(true);
+  });
+});
+
+/**
+ * Where a refusal stops.
+ *
+ * The exemption a refusal earns is the exemption for the ranking it names. An
+ * independent review found four sentences that used a refusal's words to cover a
+ * ranking the refusal does not reach, and each of them is here, in the report's
+ * own vocabulary: a refusal that is itself denied, an English noun phrase whose
+ * tail ran to the end of the sentence, and two「no evidence」openings that
+ * disclaim evidence and then state a winner anyway.
+ */
+describe("the reach of a refusal", () => {
+  const scope = { subjectNames: new Map([["sub_graphrag", "GraphRAG"], ["sub_lightrag", "LightRAG"]]) };
+
+  it("does not let a negated refusal excuse the ranking it denies", () => {
+    // 「并非不能判断……」denies the refusal, which states that the ranking can be
+    // judged — a ranking asserted by a sentence whose first word disclaims one.
+    expect(assertsRanking("并非不能判断 GraphRAG 优于 LightRAG。", scope)).toBe(true);
+    expect(assertsRanking("并不是无法判断 MethodA 比 MethodB 更便宜。")).toBe(true);
+    expect(assertsRanking("不能说没有证据表明 MethodA 优于 MethodB。")).toBe(true);
+  });
+
+  it("does not let an English refusal swallow the predicate that follows its noun", () => {
+    expect(assertsRanking("No method outperforms GraphRAG and LightRAG outperforms GraphRAG.")).toBe(true);
+    expect(assertsRanking("No model beats GraphRAG and GraphRAG outperforms LightRAG.")).toBe(true);
+    expect(assertsRanking("No evidence was collected so GraphRAG outperforms LightRAG.")).toBe(true);
+    expect(assertsRanking("No evidence was collected so GraphRAG 优于 LightRAG。")).toBe(true);
+  });
+
+  it("keeps the refusals those sentences were imitating", () => {
+    expect(assertsRanking("No method outperforms the other.")).toBe(false);
+    expect(assertsRanking("The numbers are not comparable, so no method outperforms the other.")).toBe(false);
+    expect(assertsRanking("没有依据表明 GraphRAG 优于 LightRAG。", scope)).toBe(false);
+    expect(assertsRanking("报告不能判断 GraphRAG 优于 LightRAG。", scope)).toBe(false);
   });
 });
 

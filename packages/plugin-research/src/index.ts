@@ -108,6 +108,7 @@ export {
   type ClaimAdequacy,
   type ClaimContext,
   type ClaimVerdict,
+  type RankingScope,
 } from "./claims.js";
 
 export {

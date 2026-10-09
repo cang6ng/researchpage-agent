@@ -1234,32 +1234,64 @@ function bad(path: string, problem: string, guidance: string): BlockRead {
   return { ok: false, problems: [{ path, problem, guidance }] };
 }
 
-/** What a declaration's own text compares as, for matching a label to a subject. */
-function comparable(value: string): string {
-  return value
-    .replace(/[\s\u3000（）()【】[\]{}「」『』：:、，,。.．\-—_/\\|·"'“”‘’]/g, "")
-    .toLowerCase();
+/**
+ * A task's subjects, as the identity check needs them.
+ *
+ * The previous version compared a row label with its declaration after deleting
+ * every separator and asking whether one string *contained* the other. That is
+ * how「GraphRAG 2」was accepted as「GraphRAG」and a version's content was stored
+ * under its parent's identity: a width check passing is not the same thing as
+ * the objects corresponding. Identity here is exact — an id matches itself, and
+ * a name matches the one subject it is the name of. Nothing is inferred from a
+ * substring, and a declaration that names no subject, or two, is refused
+ * instead of guessed at.
+ */
+interface SubjectIndex {
+  readonly ids: ReadonlySet<string>;
+  readonly idsByName: ReadonlyMap<string, readonly string[]>;
 }
 
 /**
- * Whether a legacy array row's leading element really names this row's subject.
+ * What a name compares as.
  *
- * The check exists so that "the first element is the object's name" is a
- * *verified* reading rather than an assumption: the label must match the
- * subject the row declares, by its id or by the name the task card gives it. A
- * row whose label matches nothing is refused with its path instead of having
- * one string dropped out of it.
+ * Unicode form, runs of whitespace and ASCII letter case are normalised, and
+ * nothing else: digits, dots, dashes, underscores, brackets and version
+ * suffixes all stay, because「v1.0」and「v10」are different objects.
  */
-function labelNamesSubject(label: string, declared: string, subjectNames: ReadonlyMap<string, string>): boolean {
-  const wanted = comparable(label);
-  if (wanted.length === 0) return false;
-  const named = subjectNames.get(declared.trim());
-  const candidates = named === undefined ? [declared] : [declared, named];
-  return candidates.some((candidate) => {
-    const known = comparable(candidate);
-    if (known.length === 0) return false;
-    return known === wanted || known.includes(wanted) || wanted.includes(known);
-  });
+function normalizedName(value: string): string {
+  return value
+    .normalize("NFKC")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
+function subjectIndexOf(subjectNames: ReadonlyMap<string, string>): SubjectIndex {
+  const ids = new Set<string>();
+  const idsByName = new Map<string, string[]>();
+  for (const [id, name] of subjectNames) {
+    ids.add(id);
+    const key = normalizedName(name);
+    if (key.length === 0) continue;
+    const known = idsByName.get(key) ?? [];
+    if (!known.includes(id)) known.push(id);
+    idsByName.set(key, known);
+  }
+  return { ids, idsByName };
+}
+
+/** The subject a declaration names, or undefined when it names none or more than one. */
+function resolveSubject(declaration: string, index: SubjectIndex): string | undefined {
+  const raw = declaration.trim();
+  if (raw.length === 0) return undefined;
+  if (index.ids.has(raw)) return raw;
+  const named = index.idsByName.get(normalizedName(raw)) ?? [];
+  return named.length === 1 ? named[0] : undefined;
+}
+
+/** The task's objects, written for the refusal that has to name them. */
+function subjectCatalogue(subjectNames: ReadonlyMap<string, string>): string {
+  return [...subjectNames].map(([id, name]) => `${id}（${name}）`).join("、");
 }
 
 /**
@@ -1326,11 +1358,32 @@ function readTable(record: Record<string, unknown>, path: string, subjectNames: 
     ? record["rowSubjects"].map((item) => (typeof item === "string" && item.trim().length > 0 ? item.trim() : null))
     : undefined;
 
+  // Every declared row identity is resolved before any row is read: a row whose
+  // object cannot be named exactly is refused here rather than stored under a
+  // guess, and the refusal names the objects the task does have.
+  const subjectIndex = subjectIndexOf(subjectNames);
+  const rowIdentities: (string | null)[] = [];
+  for (const [index, declared] of (declaredSubjects ?? []).entries()) {
+    if (declared === null) {
+      rowIdentities.push(null);
+      continue;
+    }
+    const resolved = resolveSubject(declared, subjectIndex);
+    if (resolved === undefined) {
+      return bad(
+        `${path}.rowSubjects[${String(index)}]`,
+        `rowSubjects[${String(index)}]「${declared}」不是本次任务的对象 id，也不是某个对象的唯一名称`,
+        `rowSubjects 写任务卡里的对象 id。本次任务的对象：${subjectCatalogue(subjectNames)}。同名对象无法区分时必须用 id。`,
+      );
+    }
+    rowIdentities.push(resolved);
+  }
+
   const rows: { cells: readonly { text: string; claimIds: readonly string[] }[] }[] = [];
   const rowSubjects: (string | null)[] = [];
   for (const [index, declared] of declaredRows.entries()) {
     const rowPath = `${path}.rows[${String(index)}]`;
-    const declaredSubject = declaredSubjects?.[index] ?? null;
+    const declaredSubject = rowIdentities[index] ?? null;
 
     if (Array.isArray(declared)) {
       if (declared.length === columns.length + 1) {
@@ -1338,7 +1391,8 @@ function readTable(record: Record<string, unknown>, path: string, subjectNames: 
         if (label === undefined) {
           return bad(`${rowPath}[0]`, "数组行的第 1 个元素不是对象名", `第 1 个元素必须是该行对象的名称。${LEGACY_TABLE_ROW_NOTE}`);
         }
-        if (declaredSubject !== null && !labelNamesSubject(label, declaredSubject, subjectNames)) {
+        const labelSubject = resolveSubject(label, subjectIndex);
+        if (declaredSubject !== null && labelSubject !== declaredSubject) {
           return bad(
             `${rowPath}[0]`,
             `数组行的对象名「${label}」与 rowSubjects[${String(index)}]「${declaredSubject}」不是同一个对象`,
@@ -1348,7 +1402,10 @@ function readTable(record: Record<string, unknown>, path: string, subjectNames: 
         const cells = readCells(declared.slice(1), rowPath, 1);
         if (!cells.ok) return { ok: false, problems: cells.problems };
         rows.push({ cells: cells.cells });
-        rowSubjects.push(declaredSubject ?? label);
+        // A label that resolves to exactly one subject is stored as that
+        // subject's id; one that does not is kept as written, so the identity a
+        // reader sees is still the identity the document was written with.
+        rowSubjects.push(declaredSubject ?? labelSubject ?? label);
         continue;
       }
       if (declared.length === columns.length) {

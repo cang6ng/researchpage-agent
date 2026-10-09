@@ -408,3 +408,193 @@ describe("the report table contract", () => {
     }
   });
 });
+
+/**
+ * Object identity, at the version boundaries it was broken at.
+ *
+ * A row's label used to be accepted when it *contained* the declared subject's
+ * name (or was contained by it), after every separator had been deleted — so a
+ * task comparing「GraphRAG」with「GraphRAG 2」stored the newer version's content
+ * under the older version's name, and the width check passed while the objects
+ * did not correspond. Identity here is exact: an id, or a name that is that
+ * subject's own.
+ */
+describe("the report table's object identity", () => {
+  function openTask(subjectNames: readonly string[]): Harness {
+    const repo = openResearchRepository({ location: ":memory:" });
+    const service = createResearchService({ repo });
+    service.issueGrant({ sessionId: SESSION, intent: "card", taskId: null });
+    const proposed = service.proposeTask(SESSION, {
+      topic: "图结构化检索方案的选型评估",
+      purpose: "技术选型",
+      audience: "工程决策者",
+      focus: [],
+      exclusions: "",
+      lengthTarget: "约 5 页",
+      subjects: subjectNames.map((name) => ({ name })),
+      dimensions: DIMENSIONS.map((dimension) => ({ name: dimension.name, question: dimension.question })),
+    });
+    if (!proposed.ok) throw new Error(`card refused: ${proposed.problems.join("; ")}`);
+    const task = proposed.task;
+    service.confirmTask(task.id);
+    service.clearGrant(SESSION);
+    service.issueGrant({ sessionId: SESSION, intent: "draft", taskId: task.id, allowResearch: false });
+    const tools = createResearchTools(service);
+    const taskId = task.id;
+    return {
+      repo,
+      service,
+      tools,
+      taskId,
+      async save(input: unknown): Promise<string> {
+        const tool = tools.byName["save_report"];
+        if (tool === undefined) throw new Error("save_report is missing");
+        const result = await tool.execute(input, { sessionId: SESSION, signal: new AbortController().signal });
+        return typeof result === "string" ? result : JSON.stringify(result);
+      },
+      draftTable() {
+        const draft = service.reportDraftOf(taskId);
+        const section = draft?.sections.find((candidate) => candidate.id === "comparison");
+        const block = section?.blocks.find((candidate) => candidate.kind === "table");
+        return block?.kind === "table" ? block : undefined;
+      },
+      close() {
+        repo.close();
+      },
+    };
+  }
+
+  /** A table section, written the way a model writes one. */
+  function sectionWith(block: unknown): Record<string, unknown> {
+    return { part: "write", section: { id: "comparison", title: "条件化比较", blocks: [block] } };
+  }
+
+  it("refuses the cross-version row that used to be stored under the other object", async () => {
+    // The reproduction from the independent review: the task has GraphRAG and
+    // GraphRAG 2, the row declares GraphRAG, and the array opens with GraphRAG 2.
+    const harness = openTask(["GraphRAG", "GraphRAG 2"]);
+    try {
+      const subjects = harness.service.state(harness.taskId).subjects;
+      const older = subjects.find((subject) => subject.name === "GraphRAG")?.id ?? "";
+      const newer = subjects.find((subject) => subject.name === "GraphRAG 2")?.id ?? "";
+      expect(older).not.toBe("");
+      expect(newer).not.toBe("");
+
+      const refused = JSON.parse(
+        await harness.save(
+          sectionWith({ kind: "table", columns: ["成本"], rowSubjects: [older], rows: [["GraphRAG 2", "GraphRAG 2 的正文被标为 GraphRAG"]] }),
+        ),
+      ) as { ok: boolean; fields: { path: string }[]; problems: string[] };
+      expect(refused.ok).toBe(false);
+      expect(refused.fields[0]?.path).toBe("section.blocks[0].rows[0][0]");
+      expect(refused.problems[0]).toContain(older);
+      // The refusal leaves no draft behind: the wrong identity was never stored.
+      expect(harness.draftTable()).toBeUndefined();
+
+      //…and the same row with the label its declaration names is accepted.
+      const accepted = JSON.parse(
+        await harness.save(sectionWith({ kind: "table", columns: ["成本"], rowSubjects: [older], rows: [["GraphRAG", "证据不足"]] })),
+      ) as { ok: boolean };
+      expect(accepted.ok).toBe(true);
+      expect(harness.draftTable()?.rowSubjects?.[0]).toBe(older);
+
+      // The exact id is an identity too, including for the newer version.
+      const byId = JSON.parse(
+        await harness.save(sectionWith({ kind: "table", columns: ["成本"], rowSubjects: [newer], rows: [[newer, "证据不足"]] })),
+      ) as { ok: boolean };
+      expect(byId.ok).toBe(true);
+      expect(harness.draftTable()?.rowSubjects?.[0]).toBe(newer);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("does not read a version suffix as the object it is a suffix of", async () => {
+    const harness = openTask(["v1.0", "v10"]);
+    try {
+      const [v1, v10] = harness.service.state(harness.taskId).subjects.map((subject) => subject.id);
+      const refused = JSON.parse(
+        await harness.save(sectionWith({ kind: "table", columns: ["成本"], rowSubjects: [v1], rows: [["v10", "证据不足"]] })),
+      ) as { ok: boolean };
+      expect(refused.ok).toBe(false);
+      const accepted = JSON.parse(
+        await harness.save(sectionWith({ kind: "table", columns: ["成本"], rowSubjects: [v10], rows: [["v10", "证据不足"]] })),
+      ) as { ok: boolean };
+      expect(accepted.ok).toBe(true);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("refuses a declaration that names no subject of this task", async () => {
+    const harness = openTask(["GraphRAG", "GraphRAG 2"]);
+    try {
+      const refused = JSON.parse(
+        await harness.save(sectionWith({ kind: "table", columns: ["成本"], rowSubjects: ["sub_invented"], rows: [{ cells: [{ text: "证据不足" }] }] })),
+      ) as { ok: boolean; fields: { path: string }[] };
+      expect(refused.ok).toBe(false);
+      expect(refused.fields[0]?.path).toBe("section.blocks[0].rowSubjects[0]");
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("refuses a name that could be two subjects, and takes the id that cannot", async () => {
+    // The two names normalise to the same string (a full-width letter), so the
+    // name is not an identity: only the id says which object the row is.
+    const harness = openTask(["GraphRAG", "ＧraphRAG"]);
+    try {
+      const subjects = harness.service.state(harness.taskId).subjects;
+      const ids = subjects.map((subject) => subject.id);
+      expect(ids.length).toBe(2);
+      const refused = JSON.parse(
+        await harness.save(sectionWith({ kind: "table", columns: ["成本"], rowSubjects: ["GraphRAG"], rows: [{ cells: [{ text: "证据不足" }] }] })),
+      ) as { ok: boolean };
+      expect(refused.ok).toBe(false);
+      const accepted = JSON.parse(
+        await harness.save(
+          sectionWith({ kind: "table", columns: ["成本"], rowSubjects: [ids[1] ?? ""], rows: [[ids[1] ?? "", "证据不足"]] }),
+        ),
+      ) as { ok: boolean };
+      expect(accepted.ok).toBe(true);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("treats full-width brackets as the same name they are", async () => {
+    const harness = open();
+    try {
+      const id = harness.service.state(harness.taskId).subjects.find((subject) => subject.name === "GraphRAG（微软路线）")?.id ?? "";
+      const halfWidth = JSON.parse(
+        await harness.save(sectionWith({ kind: "table", columns: ["成本"], rowSubjects: [id], rows: [["GraphRAG(微软路线)", "证据不足"]] })),
+      ) as { ok: boolean };
+      expect(halfWidth.ok).toBe(true);
+      expect(harness.draftTable()?.rowSubjects?.[0]).toBe(id);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("resolves an undeclared legacy label to its object, and keeps one that names nothing", async () => {
+    const harness = open();
+    try {
+      const newer = harness.service.state(harness.taskId).subjects.find((subject) => subject.name === "GraphRAG（微软路线）")?.id ?? "";
+      const resolved = JSON.parse(
+        await harness.save(sectionWith({ kind: "table", columns: ["成本"], rows: [["GraphRAG（微软路线）", "证据不足"]] })),
+      ) as { ok: boolean };
+      expect(resolved.ok).toBe(true);
+      expect(harness.draftTable()?.rowSubjects?.[0]).toBe(newer);
+
+      // A label naming no subject of this task is kept as written rather than
+      // guessed at, and Q05 still reports it.
+      const kept = JSON.parse(
+        await harness.save(sectionWith({ kind: "table", columns: ["成本"], rows: [["从未声明过的对象", "证据不足"]] })),
+      ) as { ok: boolean };
+      expect(kept.ok).toBe(true);
+      expect(harness.draftTable()?.rowSubjects?.[0]).toBe("从未声明过的对象");
+    } finally {
+      harness.close();
+    }
+  });
+});

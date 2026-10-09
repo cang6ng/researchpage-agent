@@ -166,6 +166,29 @@ describe("discovery: classified failures and bounded retries (A, B, C, F, G, H)"
     expect(attempts[0]?.status).toBe(429);
   });
 
+  it("I. asks only the providers the settings kept, so a switch that is off costs nothing", async () => {
+    // The order is the product's own decision about which services to call, and
+    // "off" has to mean "not called" — a settings page that says a provider is
+    // disabled while the search still reaches it would be a switch that lies.
+    const network = scriptedNetwork({
+      arxiv: [xml(arxivFeed("2404.16130"))],
+      openalex: [json(openAlexBody("W1", "https://doi.org/10.48550/arxiv.2404.16130", "Only Provider", "2404.16130"))],
+    });
+    const outcome = await searchSources("GraphRAG summarization", {
+      limit: 5,
+      fetchImpl: network.fetch,
+      sleep: sleepRecorder([]),
+      providers: ["openalex"],
+      breaker: new ProviderCircuitBreaker(),
+    });
+
+    expect(network.calls.length).toBeGreaterThan(0);
+    expect(network.calls.every((url) => url.includes("openalex.org"))).toBe(true);
+    expect(network.calls.some((url) => url.includes("arxiv.org"))).toBe(false);
+    expect(outcome.provider).toBe("openalex");
+    expect(outcome.candidates.length).toBe(1);
+  });
+
   it("B. gives up on arXiv after two rate limits and answers from the fallback", async () => {
     const network = scriptedNetwork({
       arxiv: [new Response("", { status: 429, headers: { "retry-after": "3" } })],

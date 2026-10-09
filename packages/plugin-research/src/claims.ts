@@ -130,6 +130,36 @@ const COST_FAMILIES: readonly { readonly id: string; readonly pattern: RegExp }[
 ]);
 
 /**
+ * Where a clause ends, for the purpose of deciding what a refusal refuses.
+ *
+ * A negation governs its own clause and no further:「不能得出谁更便宜的判断，
+ * 但 A 比 B 更便宜」refuses one ranking and states another, and a check that
+ * exempted the whole paragraph on sight of「不能」would wave the second one
+ * through. Sentence punctuation and the comma both end a clause, and so does an
+ * adversative conjunction —「GraphRAG is not open source but outperforms
+ * LightRAG」is one sentence and two claims. 、does not end a clause, because it
+ * joins items *inside* one, which is exactly where a refusal keeps the objects
+ * it refuses about. 但是 is tried before 但 so the longer breakword wins.
+ */
+const CLAUSE_BREAK = /[。；;！？!?\n，,]|但是|然而|不过|但|却|\b(?:but|however|yet)\b/i;
+
+/**
+ * The words a refusal uses to name the objects it refuses about.
+ *
+ * A refusal construction is only honoured when what sits between its verb and
+ * the ranking predicate is an *object* — a name this task declares, or one of
+ * these placeholders — and nothing else. 「无法处理中文的 GraphRAG 优于
+ * LightRAG」contains a refusal word and asserts a ranking: the verb the refusal
+ * is attached to is「处理」, which judges nothing. Accepting any text there would
+ * put that sentence back on the exempt list.
+ */
+const PLACEHOLDER_OBJECTS: readonly string[] = Object.freeze([
+  "A", "B", "C", "a", "b", "c", "甲", "乙", "丙",
+  "二者", "两者", "双方", "谁", "哪个", "哪一个", "哪一方", "何者", "对方", "彼此",
+  "the other", "either", "both", "neither", "them", "they", "it", "one", "two",
+]);
+
+/**
  * Language that puts a ranking phrase *under refusal* rather than stating it.
  *
  * The product's own contract tells a writer to do exactly this —「分口径陈述，
@@ -137,49 +167,186 @@ const COST_FAMILIES: readonly { readonly id: string; readonly pattern: RegExp }[
  * sentence as a ranking, because a lexicon that only looks for 「更便宜」 cannot
  * tell "A 更便宜" from "不能得出谁更便宜的判断". Both are about a ranking; only
  * one asserts one.
+ *
+ * The correction is that a refusal governs the ranking *it names* and nothing
+ * further. Four constructions reach the predicate and are read as refusals:
+ *
+ *  - a negation directly in front of it (「A 不优于 B」/「A does not outperform B」);
+ *  - a judgement verb whose object is the predicate (「不能合成一个更便宜的
+ *    判断」/「不能对 A、B 给出更便宜的判断」);
+ *  - an evidential phrase (「没有依据表明 A 优于 B」);
+ *  - the English「no method outperforms the other」.
+ *
+ * Everything shorter is read as a ranking, because a false refusal is how an
+ * unsupported ranking gets published — and a sentence that cannot be parsed
+ * confidently is a ranking until proven otherwise. Three further rules say where
+ * a refusal stops, because an exemption that reaches too far is the same defect
+ * in a quieter spelling:
+ *
+ *  - it ends at the next ranking predicate:「No method outperforms GraphRAG and
+ *    LightRAG outperforms GraphRAG」refuses the first ranking and states the
+ *    second, and the second is not covered by the first one's words;
+ *  - it must be adjacent to the predicate it refuses, not merely somewhere
+ *    earlier in the clause:「No evidence was collected so GraphRAG outperforms
+ *    LightRAG」asserts the ranking its own first half disclaims;
+ *  - it may not itself be negated:「并非不能判断 GraphRAG 优于 LightRAG」denies the
+ *    refusal, which leaves the ranking standing.
  */
-const RANKING_REFUSAL_PATTERNS: readonly RegExp[] = Object.freeze([
-  /不[能否可该应得会宜足再需]/,
-  /未[能尝有取得找给报获证实]/,
-  /没有/,
-  /无法/,
-  /无从/,
-  /难以/,
-  /缺乏/,
-  /缺少/,
-  /不足以/,
-  /不要/,
-  /勿/,
-  /拒绝/,
-  /避免/,
-  /禁止/,
-  /\b(?:cannot|can't|can not|do(?:es)? not|did not|doesn't|don't|didn't|is not|are not|not|never|without|unable to|rather than|instead of|refus\w+ to)\b/i,
-  // "no method outperforms the other" refuses; "there is no doubt that A
-  // outperforms B" does not. The noun after `no` is what tells them apart, so
-  // the pattern names the nouns a refusal is actually made of.
-  /\bno\s+(?:method|approach|system|model|evidence|study|source|paper|result|measurement|comparison|ranking|data|number)\b/i,
-]);
+const DIRECT_NEGATION =
+  /(?:不[能否可该应得会宜足再需用是]?|未[能尝有取得找给报获证实]?|没有|无法|无从|难以|没法|无|非|别|勿)(?:\s|都|也|并|再|从|完全|根本|始终|从来|仍|仍然|已经|曾|可能|能够|会|直接)*["'“”‘’「」『』\s]*$/u;
+
+const REFUSAL_VERB =
+  "(?:不足以|不能|不可|不该|不应|不得|不会|不宜|不足|不再|无需|无法|无从|未能|未[能尝有取得找给报获证实]?|难以|没法|没有|缺乏|缺少)";
+
+const JUDGEMENT_VERB = "(?:判断|认定|得出|证明|合成|给出|做出|形成|支持|表明|说明|断言)";
+
+const JUDGEMENT_QUANTIFIER = "(?:一个|一种|任何|谁|哪个|哪一个|哪一方|哪一种|何者|什么)";
+
+/** How far a refusal's own topic phrase (「对 A、B」) may reach. */
+const TOPIC_PHRASE = "(?:(?:对|针对|就|把)\\s*[^，。；;！？!?\\n]{0,30}?\\s*)?";
+
+const EVIDENTIAL_HEAD =
+  "(?:(?:没有|并无|未有|毫无|缺乏|缺少|无)\\s*(?:任何)?\\s*(?:依据|证据|资料|数据|来源|研究|材料|记录)\\s*(?:能|能够|可以|可|足以)?\\s*(?:表明|证明|支持|说明|显示|找到|得出|给出))";
 
 /**
- * Where a clause ends, for the purpose of deciding what a refusal refuses.
+ * The English「no method outperforms the other」construction, and its limit.
  *
- * A negation governs its own clause and no further:「不能得出谁更便宜的判断，
- * 但 A 比 B 更便宜」refuses one ranking and states another, and a check that
- * exempted the whole paragraph on sight of「不能」would wave the second one
- * through. Sentence punctuation and the comma both end a clause; 、does not,
- * because it joins items *inside* one, which is exactly where a refusal keeps
- * the objects it refuses about.
+ * The noun phrase has to be the subject the ranking predicate is attached to:
+ * only quotes and whitespace may stand between them. A tail that reached
+ * further — the first version allowed any run of text up to the next sentence
+ * mark — swallowed whatever stood in front of the predicate, including the
+ * second half of「No evidence was collected so GraphRAG outperforms LightRAG」.
  */
-const CLAUSE_BREAK = /[。；;！？!?\n，,]/;
+const ENGLISH_NOUN_REFUSAL =
+  /\bno\s+(?:method|approach|system|model|evidence|study|source|paper|result|measurement|comparison|ranking|data|number)\b["'“”‘’「」『』\s]*$/i;
 
-export function assertsRanking(text: string): boolean {
+const ENGLISH_DIRECT_NEGATION = /\b(?:not|never|no|cannot|can't|don't|doesn't|didn't|isn't|aren't|won't)\s*$/i;
+
+/**
+ * Whether the refusal a matcher found is itself under a negation.
+ *
+ * 「并非不能判断 A 优于 B」does not refuse the ranking; it denies the refusal,
+ * which is to say it states that the ranking *can* be judged. The same reading
+ * covers「不是不能判断……」and the English「it is not the case that no method
+ * outperforms……」, so a refusal that begins right after one of these words is
+ * not an exemption at all. The bridge between the two negations is the short
+ * closed set a second negation is actually spelled through —「不能说没有证据
+ * 表明……」— and nothing else may stand there.
+ */
+const NEGATION_LEAD =
+  /(?:并非|并不是|不是|不|未|没有|无|非|别|勿|not|never|no)(?:(?:是|为|会|能|可以|可能|说|认为|算|意味|代表|说明|表示|得))*\s*["'“”‘’「」『』]*$/iu;
+
+/** The subject names and ids a refusal may name between its verb and the predicate. */
+export interface RankingScope {
+  /** Subject id → name, for the refusals that name the objects they refuse about. */
+  readonly subjectNames?: ReadonlyMap<string, string>;
+}
+
+function escapeRegExp(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** One alternation of object tokens; ASCII words are kept from matching inside longer ones. */
+function objectAlternation(words: readonly string[]): string {
+  const parts = [...new Set(words.filter((word) => word.trim().length > 0))]
+    .sort((left, right) => right.length - left.length)
+    .map((word) => {
+      const escaped = escapeRegExp(word.trim());
+      return /^[ -~]+$/.test(word.trim()) ? `(?<![A-Za-z0-9])${escaped}(?![A-Za-z0-9])` : escaped;
+    });
+  return parts.length === 0 ? "(?!)" : `(?:${parts.join("|")})`;
+}
+
+/** The refusal constructions, with the objects of the current claim's task substituted in. */
+function refusalMatchers(scope: RankingScope | undefined): readonly RegExp[] {
+  const declared: string[] = [];
+  for (const [id, name] of scope?.subjectNames ?? []) declared.push(id, name);
+  const filler = `(?:${objectAlternation([...PLACEHOLDER_OBJECTS, ...declared])}|["'“”‘’「」『』]|\\s)*`;
+  return [
+    DIRECT_NEGATION,
+    new RegExp(`${REFUSAL_VERB}\\s*${TOPIC_PHRASE}${JUDGEMENT_VERB}\\s*(?:${JUDGEMENT_QUANTIFIER})?\\s*${filler}$`, "u"),
+    new RegExp(`${EVIDENTIAL_HEAD}\\s*${filler}$`, "u"),
+    ENGLISH_NOUN_REFUSAL,
+    ENGLISH_DIRECT_NEGATION,
+  ];
+}
+
+interface Range {
+  readonly start: number;
+  readonly end: number;
+}
+
+/**
+ * Every ranking predicate in the clause, overlapped ranges merged.
+ *
+ * The first version of this check read only the *first* match of each pattern,
+ * so a clause that ranked twice was judged on its first ranking alone. Each
+ * pattern gets its own copy with `g` — never the shared frozen one, whose
+ * `lastIndex` would leak between claims — and all matches are collected.
+ */
+function rankingRanges(clause: string): readonly Range[] {
+  const found: Range[] = [];
+  for (const pattern of RANKING_PATTERNS) {
+    const local = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+    let match = local.exec(clause);
+    while (match !== null) {
+      found.push({ start: match.index, end: match.index + match[0].length });
+      if (match[0].length === 0) local.lastIndex += 1;
+      match = local.exec(clause);
+    }
+  }
+  found.sort((left, right) => left.start - right.start || left.end - right.end);
+  const merged: Range[] = [];
+  for (const range of found) {
+    const last = merged[merged.length - 1];
+    if (last !== undefined && range.start < last.end) {
+      merged[merged.length - 1] = { start: last.start, end: Math.max(last.end, range.end) };
+      continue;
+    }
+    merged.push(range);
+  }
+  return merged;
+}
+
+/**
+ * Whether a refusal covers the ranking predicate that begins at `start`.
+ *
+ * The text a refusal is read from runs from `from` — the end of the previous
+ * ranking predicate in this clause, or the start of the clause — to the
+ * predicate itself. Both ends matter: a refusal earns its exemption only where
+ * it is, which is why one that states a ranking first does not hand that ranking
+ * to the next predicate, and why a refusal whose own start is negated is no
+ * refusal at all.
+ */
+function isRefused(clause: string, from: number, start: number, matchers: readonly RegExp[]): boolean {
+  const region = clause.slice(from, start);
+  return matchers.some((matcher) => {
+    const local = new RegExp(matcher.source, matcher.flags.includes("g") ? matcher.flags : `${matcher.flags}g`);
+    let match = local.exec(region);
+    while (match !== null) {
+      if (!NEGATION_LEAD.test(region.slice(0, match.index))) return true;
+      if (match[0].length === 0) local.lastIndex += 1;
+      match = local.exec(region);
+    }
+    return false;
+  });
+}
+
+/**
+ * Whether the text asserts a ranking rather than refusing one.
+ *
+ * Every ranking predicate in every clause is checked on its own: one covered
+ * predicate does not cover the next one, in the same clause or in a later one.
+ * The task's subjects may be passed in so that a refusal naming them —「不能对
+ * GraphRAG、LightRAG 给出更便宜的判断」— is read as the refusal it is.
+ */
+export function assertsRanking(text: string, scope?: RankingScope): boolean {
+  const matchers = refusalMatchers(scope);
   for (const clause of text.split(CLAUSE_BREAK)) {
-    for (const pattern of RANKING_PATTERNS) {
-      const found = pattern.exec(clause);
-      if (found === null) continue;
-      const before = clause.slice(0, found.index);
-      if (RANKING_REFUSAL_PATTERNS.some((refusal) => refusal.test(before))) continue;
-      return true;
+    let previousEnd = 0;
+    for (const range of rankingRanges(clause)) {
+      if (!isRefused(clause, previousEnd, range.start, matchers)) return true;
+      previousEnd = range.end;
     }
   }
   return false;
@@ -245,7 +412,7 @@ export function validateClaimContract(claim: ReportClaim, context: ClaimContext)
   const conditions = claim.conditions ?? {};
   const label = `claim ${claim.id}（${claimType}）`;
 
-  const ranking = assertsRanking(claim.text);
+  const ranking = assertsRanking(claim.text, { subjectNames: context.subjectNames });
   const subjectsWithEvidence = new Set(cited.flatMap(evidenceSubjects));
   const missingEvidenceFor = subjects.filter((subjectId) => !subjectsWithEvidence.has(subjectId));
 

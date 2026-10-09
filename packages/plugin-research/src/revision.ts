@@ -34,8 +34,27 @@ import { hashOf } from "./hash.js";
 import { evidenceUsedBy } from "./report.js";
 import { newId } from "./repository.js";
 
-/** Named so an old file can say which program produced it. */
-export const RENDERER = Object.freeze({ name: "researchpage-report-html", version: "2.0.0" });
+/**
+ * Named so an old file can say which program produced it.
+ *
+ * The version moves when the *document* changes: 2.1.0 widened the comparison
+ * table's layout and stopped moving a row's first cell into a heading, which
+ * changes what a reader sees without changing a byte of the report's content.
+ */
+export const RENDERER = Object.freeze({ name: "researchpage-report-html", version: "2.1.0" });
+
+/**
+ * A renderer stamp as a revision carries it.
+ *
+ * The version is a string rather than the literal the current renderer happens
+ * to have: a revision frozen by an earlier build records *that* build's version,
+ * and a reader has to be able to compare the two without the type refusing to
+ * represent one of them.
+ */
+export interface RendererStamp {
+  readonly name: string;
+  readonly version: string;
+}
 
 /** The default theme; v1 renders one theme, and switching one is a later step. */
 export const DEFAULT_THEME_ID = "editorial";
@@ -126,7 +145,7 @@ export interface FrozenRevision {
   readonly gapsCaptured: boolean;
   readonly gaps: readonly FrozenGap[];
   readonly themeId: string;
-  readonly renderer: typeof RENDERER;
+  readonly renderer: RendererStamp;
   readonly createdAt: string;
 }
 

@@ -724,6 +724,13 @@ export interface ReportGenerationFailure {
   readonly code: string;
   readonly problem: string;
   readonly guidance: string;
+  /**
+   * Whether the model layer established that this failure may be retried.
+   *
+   * Absent is old JSON and means false: a record written before this field
+   * existed carries no claim about retryability, and no claim is not permission.
+   */
+  readonly retryable?: boolean;
 }
 
 /**

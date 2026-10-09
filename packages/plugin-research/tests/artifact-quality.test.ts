@@ -658,6 +658,80 @@ describe("artifact quality: the ten acceptance scenarios", () => {
   });
 });
 
+describe("the ranking lexicon's scope, through the whole validator", () => {
+  /** The cost claim's own text replaced, leaving every other obligation as it was. */
+  function withCostText(text: string): ReturnType<typeof validate> {
+    const claims = baseClaims().map((claim) => (claim.id === "clm_cost" ? { ...claim, text } : claim));
+    return validate({ ...baseDraft(), claims });
+  }
+
+  function q08(result: ReturnType<typeof validate>): { readonly result?: string; readonly detail?: string } {
+    return result.checks.find((check) => check.id === "Q08") ?? {};
+  }
+
+  // The three sentences an independent review found being published: each has a
+  // refusal word in it, each states a ranking, and the claim declares its
+  // numbers are not comparable. Publishing them is the defect; refusing them is
+  // the fix.
+  it("refuses the counterexample that negates something unrelated to the ranking", () => {
+    const result = withCostText("无法处理中文的 MethodA 优于 MethodB。");
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toContain("Q08");
+    expect(q08(result).result).toBe("fail");
+  });
+
+  it("refuses the counterexample whose ranking follows an adversative but", () => {
+    const result = withCostText("MethodA is not open source but outperforms MethodB.");
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toContain("Q08");
+    expect(q08(result).result).toBe("fail");
+  });
+
+  it("refuses the counterexample that states a second ranking in the same clause", () => {
+    const result = withCostText("不能判断 MethodA 更便宜但 MethodB 更便宜。");
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toContain("Q08");
+    expect(q08(result).result).toBe("fail");
+  });
+
+  it("keeps a control ranking refused, so the fix did not loosen the rule", () => {
+    const result = withCostText("MethodA 优于 MethodB。");
+    expect(result.ok).toBe(false);
+    expect(q08(result).result).toBe("fail");
+  });
+
+  it("keeps the honest refusal passing", () => {
+    const refusal = withCostText("在索引阶段只能分口径陈述，不能合成一个更便宜的判断。");
+    expect(refusal.problems.filter((problem) => problem.includes("Q08"))).toEqual([]);
+    // Q08 may still carry the incomparability warning; what it must not carry
+    // is the ranking failure.
+    expect(q08(refusal).result).not.toBe("fail");
+  });
+
+  it("keeps the real draft's cost sentence passing", () => {
+    // Verbatim from the run whose cost claim was refused by the first lexicon.
+    const real =
+      "索引成本只能分口径陈述，不能合成一个“更便宜”的判断。在 HippoRAG 2 论文自身口径内：" +
+      "token/调用量上它低于 GraphRAG 与 LightRAG；索引时间上快于二者、但慢于 RAPTOR 与 HippoRAG；" +
+      "显存上因 fact embedding 而高于基线。两篇的来源、语料与度量项不同，因此不能合并为一张跨来源的成本排名。";
+    const result = withCostText(real);
+    expect(result.problems.filter((problem) => problem.includes("Q08"))).toEqual([]);
+    expect(q08(result).result).not.toBe("fail");
+  });
+
+  it("keeps Q09's evidence requirement independent of the ranking lexicon", () => {
+    // A refusal is not a licence: the same claim with a fabricated citation is
+    // still refused, so the lexicon's scope cannot be used to launder evidence.
+    const draft = baseDraft();
+    const claims = draft.claims.map((claim) =>
+      claim.id === "clm_cost" ? { ...claim, text: "不能合成一个更便宜的判断。", evidenceIds: ["ev_fabricated"] } : claim,
+    );
+    const result = validate({ ...draft, claims });
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toContain("ev_fabricated");
+  });
+});
+
 describe("claim adequacy is derived, not asserted", () => {
   function context(assessments: readonly SupportAssessment[] = []): ClaimContext {
     return {

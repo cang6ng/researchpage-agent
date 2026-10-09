@@ -300,4 +300,21 @@ describe("report validation", () => {
     expect(result.ok).toBe(false);
     expect(result.problems.join(" ")).toContain("clm_missing");
   });
+
+  it("refuses a claim that refuses a ranking and still cites nothing", () => {
+    // The ranking lexicon decides whether a sentence *asserts* a ranking; it is
+    // not a way past the truth boundary. A sentence that refuses one is still a
+    // claim, and a claim still needs evidence that resolves.
+    const draft = draftWith(["ev_missing"]);
+    const result = validateReport({
+      ...input,
+      draft: {
+        ...draft,
+        claims: draft.claims.map((claim) => ({ ...claim, text: "不能合成一个更便宜的判断。" })),
+      },
+      evidence: [valid],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toContain("ev_missing");
+  });
 });

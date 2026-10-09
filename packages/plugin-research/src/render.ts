@@ -11,7 +11,7 @@
 import type { MatrixCell, Report, ReportBlock, ReportFrame, ReportGapNote, ReportTask } from "./domain.js";
 import { scopeLabel } from "./evidence.js";
 import { buildCitations, locatorLabel, type CitationEvidence, type CitationSource, type Citations } from "./report.js";
-import type { FrozenRevision } from "./revision.js";
+import { RENDERER, type FrozenRevision } from "./revision.js";
 
 export function escapeHtml(text: string): string {
   return text
@@ -68,10 +68,23 @@ ul.list li, ol.list li { margin-bottom: 6px; }
 sup.cite { font-size: 11px; color: #3452d6; vertical-align: super; }
 sup.cite a { color: inherit; text-decoration: none; }
 sup.cite--synthesis { color: #8a5a00; font-size: 10.5px; }
-table.matrix { width: 100%; border-collapse: collapse; margin: 6px 0 16px; font-size: 13.5px; }
-table.matrix th, table.matrix td { border: 1px solid #d9d9de; padding: 7px 9px; vertical-align: top; text-align: left; }
+table.matrix { width: 100%; max-width: 100%; table-layout: fixed; border-collapse: collapse; margin: 6px 0 16px; font-size: 13.5px; }
+table.matrix th, table.matrix td {
+  min-width: 0;
+  border: 1px solid #d9d9de;
+  padding: 7px 9px;
+  vertical-align: top;
+  text-align: left;
+  /* A cell wraps. The old rule forbade it in the first column, which is how a
+     long cell grew to the width of the page and pushed every other column off
+     the printed sheet. */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 table.matrix thead th { background: #f2f3f6; font-weight: 600; }
-table.matrix tbody th { background: #fafbfc; font-weight: 600; white-space: nowrap; }
+table.matrix tbody th { background: #fafbfc; font-weight: 600; }
+table.matrix th.matrix__object { width: 12%; }
 table.verify { font-size: 12.5px; }
 table.verify td, table.verify th { padding: 5px 8px; }
 .verify__ref { white-space: nowrap; color: #3452d6; }
@@ -89,7 +102,13 @@ table.verify td, table.verify th { padding: 5px 8px; }
 .callout__dims { display: block; margin-top: 4px; font-size: 12px; color: #5c5c62; }
 section { break-inside: auto; }
 h2.section { break-after: avoid; }
-table.matrix, .callout, .mechanism { break-inside: avoid; }
+/* A table may break across pages: its header repeats and its rows stay whole
+   as far as the page allows. Forbidding the break is what produced a table
+   clipped at the foot of a page, and a clipped comparison is a comparison a
+   reader cannot check. */
+table.matrix, table.matrix tbody, table.matrix tr { break-inside: auto; }
+table.matrix thead { display: table-header-group; }
+.callout, .mechanism { break-inside: avoid; }
 ol.references { padding-left: 20px; }
 ol.references li { margin-bottom: 10px; }
 .reference__title { font-weight: 600; }
@@ -102,6 +121,15 @@ ol.references li { margin-bottom: 10px; }
   .report { max-width: none; padding: 0; }
   .report__title { font-size: 19pt; }
   a { color: #1c1c1e; }
+  /* Printing repeats the header on every page the table reaches, and lets a
+     tall row start on one page and finish on the next. What it must not do —
+     and no longer can — is clip the columns: the table is laid out to the page
+     width and every cell wraps. */
+  table.matrix { break-inside: auto; page-break-inside: auto; }
+  table.matrix thead { display: table-header-group; }
+  table.matrix tbody { display: table-row-group; }
+  table.matrix tr { break-inside: auto; page-break-inside: auto; }
+  .callout, .mechanism { break-inside: avoid; page-break-inside: avoid; }
 }
 `;
 
@@ -120,7 +148,14 @@ function citationSup(numbers: readonly number[], synthesis = false): string {
   return `<sup class="cite">${links}</sup>${synthesis ? `<sup class="cite cite--synthesis">⟨综合判断⟩</sup>` : ""}`;
 }
 
-function renderBlocks(blocks: readonly ReportBlock[], citations: Citations, claims: ClaimsById): string {
+function renderBlocks(
+  blocks: readonly ReportBlock[],
+  citations: Citations,
+  claims: ClaimsById,
+  subjectNames: ReadonlyMap<string, string>,
+  dimensionNames: ReadonlyMap<string, string>,
+): string {
+  void dimensionNames;
   const parts: string[] = [];
   for (const block of blocks) {
     switch (block.kind) {
@@ -142,20 +177,35 @@ function renderBlocks(blocks: readonly ReportBlock[], citations: Citations, clai
         break;
       }
       case "table": {
-        const head = `<thead><tr>${block.columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("")}</tr></thead>`;
+        const rowSubjects = block.rowSubjects ?? [];
+        // Whether this table names its rows at all, and whether every row has
+        // an identity. A table that declares any object gets an object column;
+        // one that declares none is not given a made-up one, and a row that
+        // declares nothing says so instead of borrowing its first cell's text.
+        const declaresObjects = rowSubjects.some((subject) => typeof subject === "string" && subject.length > 0);
+        const partial = declaresObjects && rowSubjects.some((subject) => typeof subject !== "string" || subject.length === 0);
+        const head = `<thead><tr>${[
+          ...(declaresObjects ? ['<th scope="col">对象</th>'] : []),
+          ...block.columns.map((column) => `<th scope="col">${escapeHtml(column)}</th>`),
+        ].join("")}</tr></thead>`;
         const body = block.rows
-          .map(
-            (row) =>
-              `<tr>${row.cells
-                .map(
-                  (cell, index) =>
-                    `<${index === 0 ? "th" : "td"}>${escapeHtml(cell.text)}${citationSup(
-                      numbersOf(citations, cell.claimIds),
-                      anySynthesis(cell.claimIds, claims),
-                    )}</${index === 0 ? "th" : "td"}>`,
-                )
-                .join("")}</tr>`,
-          )
+          .map((row, rowIndex) => {
+            // Every written cell is a cell: the row's identity is printed in its
+            // own column, so no cell's text is ever moved into a heading — which
+            // is what used to leave the rest of a long row off the page.
+            const cells = row.cells
+              .map(
+                (cell) =>
+                  `<td>${escapeHtml(cell.text)}${citationSup(
+                    numbersOf(citations, cell.claimIds),
+                    anySynthesis(cell.claimIds, claims),
+                  )}</td>`,
+              )
+              .join("");
+            const label = declaresObjects ? rowObjectLabel(rowSubjects[rowIndex] ?? null, subjectNames, partial) : "";
+            const heading = declaresObjects ? `<th scope="row" class="matrix__object">${escapeHtml(label)}</th>` : "";
+            return `<tr>${heading}${cells}</tr>`;
+          })
           .join("");
         // A comparison table states its own frame: which dimension each column
         // answers and which object each row is. That is what lets a reader see
@@ -166,7 +216,9 @@ function renderBlocks(blocks: readonly ReportBlock[], citations: Citations, clai
             : `<div class="table-note">列对应维度：${block.columns
                 .map((column, index) => `${escapeHtml(column)}=${escapeHtml(block.columnDimensions?.[index] ?? "（未声明）")}`)
                 .join("；")}</div>`;
-        parts.push(`<table class="matrix">${head}<tbody>${body}</tbody></table>${columnNote}`);
+        parts.push(
+          `<div class="matrix-wrap"><table class="matrix">${head}<tbody>${body}</tbody></table></div>${columnNote}`,
+        );
         break;
       }
       case "callout": {
@@ -174,7 +226,9 @@ function renderBlocks(blocks: readonly ReportBlock[], citations: Citations, clai
         const dimensions =
           block.dimensionIds === undefined || block.dimensionIds.length === 0
             ? ""
-            : `<span class="callout__dims">涉及维度：${block.dimensionIds.map((id) => escapeHtml(id)).join("、")}</span>`;
+            : `<span class="callout__dims">涉及维度：${block.dimensionIds
+                .map((id) => escapeHtml(dimensionNames.get(id) ?? id))
+                .join("、")}</span>`;
         parts.push(`<div class="callout callout--${block.tone}"><b>${label}</b>${escapeHtml(block.text)}${dimensions}</div>`);
         break;
       }
@@ -204,6 +258,20 @@ function renderBlocks(blocks: readonly ReportBlock[], citations: Citations, clai
     }
   }
   return parts.join("\n");
+}
+
+/**
+ * What a row's identity column says.
+ *
+ * The name is read from the task's own subjects — the ids the table declared —
+ * and an id this task does not have is printed as it was written rather than
+ * hidden. A row that declared nothing says so: a blank cell there would read as
+ * an object whose name was forgotten, which is a different claim from "this
+ * table did not name its rows".
+ */
+function rowObjectLabel(subjectId: string | null, subjectNames: ReadonlyMap<string, string>, partial: boolean): string {
+  if (typeof subjectId === "string" && subjectId.length > 0) return subjectNames.get(subjectId) ?? subjectId;
+  return partial ? "对象未声明" : "";
 }
 
 /** The claims by id, so a block can render whether a judgement is ours. */
@@ -326,6 +394,8 @@ export function renderReportHtml(input: RenderInput): string {
           section.blocks,
           citations,
           claims,
+          input.subjectNames,
+          input.dimensionNames,
         )}</section>`,
     )
     .join("\n");
@@ -423,11 +493,20 @@ export function renderRevisionHtml(input: { readonly revision: FrozenRevision; r
     dimensionNames,
     generatedAt: revision.createdAt,
   });
+  // The document states two facts a reader may need to compare: which renderer
+  // the revision was frozen by, and which one actually drew this file. They are
+  // the same string for a revision frozen today, and they are both printed when
+  // they differ, because "this file was produced by a different program than
+  // the record names" is exactly what a provenance line is for.
+  const frozenRenderer = `${revision.renderer.name}@${revision.renderer.version}`;
+  const currentRenderer = `${RENDERER.name}@${RENDERER.version}`;
   const stamp = [
     `冻结版本 R${revision.revision}`,
     `内容 hash ${revision.contentHash.slice(0, 19)}…`,
     revision.gapsCaptured ? "缺口快照：已记录" : "缺口快照：本版本未记录（旧版记录）",
-    `渲染器 ${revision.renderer.name}@${revision.renderer.version}`,
+    frozenRenderer === currentRenderer
+      ? `渲染器 ${currentRenderer}`
+      : `冻结记录渲染器 ${frozenRenderer} · 本次渲染 ${currentRenderer}`,
     `主题 ${revision.themeId}`,
     `冻结时间 ${revision.createdAt}`,
   ].join(" · ");

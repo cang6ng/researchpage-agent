@@ -806,6 +806,24 @@ export interface DocumentUploadResult {
 export interface ResearchService {
   /** The task a session is trusted to: the only way a tool finds its target. */
   taskForSession(sessionId: string): ReportTask | undefined;
+  /**
+   * Lets one of a project's own sessions act for it.
+   *
+   * A session whose run was interrupted by a process that died is blocked by
+   * the host — nothing in its record can say whether that run had produced
+   * effects — and a blocked session accepts no run. A project's work is not
+   * confined to a session, so the application continues it in a session of its
+   * own, and this is what makes the tools find the project there. The
+   * project's original session keeps its binding: this adds one, it does not
+   * move the task.
+   *
+   * The binding is what a tool resolves its task from, so it is guarded rather
+   * than overwritten: adopting a session that already carries another project
+   * throws (it would move that project's work to this one and this one's grants
+   * to that session), an empty session id throws, and adopting the same session
+   * for the same task twice does nothing.
+   */
+  adoptSessionForTask(taskId: string, sessionId: string): void;
   proposeTask(sessionId: string, card: ProposedCard): { readonly ok: true; readonly task: ReportTask; readonly created: boolean } | Refusal;
   /**
    * The user's decision to start research, taken on the current draft.
@@ -1035,6 +1053,10 @@ export interface ResearchService {
    * A full report does not fit in one step's output budget, so a model may
    * write it in parts. Accumulation is stored on the task, and only `finalize`
    * runs the validator — the same one the one-shot path uses.
+   *
+   * Every part is a write to the report and passes the same check as
+   * `saveReport`: the current session must hold the `report` capability for
+   * this task. `part` chooses a step, never a permission.
    */
   saveReportPart(taskId: string, part: ReportPart): SaveReportResult | Refusal;
   reportDraftOf(taskId: string): ReportDraftState | null;
@@ -1056,8 +1078,20 @@ export interface ResearchService {
    * because a saved report is edited through a proposal, never rewritten.
    */
   beginReportGeneration(taskId: string, input: { readonly stage: "report" | "synthesis"; readonly resume: boolean }): ReportGenerationState | Refusal;
-  /** Moves the current attempt along. A no-op when no attempt is open. */
-  recordReportStage(taskId: string, patch: Partial<ReportGenerationState>): ReportGenerationState | undefined;
+  /**
+   * Moves the current attempt along, when it is still the attempt the caller means.
+   *
+   * `expectedAttemptId` is what keeps a stage that was queued before a recovery
+   * from writing into the attempt that recovery opened: a callback that names an
+   * attempt which is no longer current is refused — the write does not happen —
+   * rather than moving a state it never owned. Absent means "no expectation",
+   * which is how the paths that just opened the attempt call it.
+   */
+  recordReportStage(
+    taskId: string,
+    patch: Partial<ReportGenerationState>,
+    expectedAttemptId?: string,
+  ): ReportGenerationState | undefined;
   /** The current attempt, or `null` when the task has none. */
   reportGenerationOf(taskId: string): ReportGenerationState | null;
   /**
@@ -2909,6 +2943,28 @@ export function createResearchService(options: ResearchServiceOptions): Research
   return {
     taskForSession: (sessionId) => repo.taskForSession(sessionId),
 
+    adoptSessionForTask(taskId, sessionId) {
+      // The task has to exist: a session may be adopted by a project, never by
+      // an id somebody typed.
+      requireTask(taskId);
+      if (sessionId.trim().length === 0) {
+        throw new Error("会话 id 不能为空：没有会话就没有可核对的身份，任务不会被接到任何地方");
+      }
+      const bound = repo.taskForSession(sessionId);
+      // A session that already works on another project is not a carrier for
+      // this one. The binding *is* the identity a tool resolves its task from,
+      // so moving it would hand this project's grants to that session — grants
+      // are keyed by session — and would let a recovery read and write a project
+      // it was never given. Adoption adds a binding; it never takes one over.
+      if (bound !== undefined && bound.id !== taskId) {
+        throw new Error(`会话 ${sessionId} 已绑定任务 ${bound.id}，不能改绑到任务 ${taskId}`);
+      }
+      // Adopting the same session again is what a runner that re-runs a stage
+      // does; that is already the state this call asks for.
+      if (bound !== undefined) return;
+      repo.bindSession(sessionId, taskId);
+    },
+
     proposeTask(sessionId, card) {
       const refusal = requireSessionCapability(sessionId, "card");
       if (refusal !== undefined) return refusal;
@@ -4327,6 +4383,16 @@ export function createResearchService(options: ResearchServiceOptions): Research
 
     saveReportPart(taskId, part) {
       let task = requireTask(taskId);
+      // The permission boundary comes before every write this function makes:
+      // `start`, `write`, `clear` and `finalize` are the same act on the same
+      // object — the report's own text — and a run that may not save a report
+      // may not accumulate one either. A draft is not a private scratchpad: the
+      // next report stage is handed it as the work in progress and `finalize`
+      // seals it into a version. Without this check an Ask run (capabilities
+      // `[]`, scope「只读取材料回答问题，不写入任何正式数据」) could persist a
+      // draft that a later authorized pass would accept as its own.
+      const authRefusal = requireTaskCapability(taskId, "report");
+      if (authRefusal !== undefined) return authRefusal;
       const current: ReportDraftState =
         task.reportDraft ?? { title: "", summary: "", claims: [], sections: [], updatedAt: isoNow() };
 
@@ -4421,10 +4487,14 @@ export function createResearchService(options: ResearchServiceOptions): Research
       return state;
     },
 
-    recordReportStage(taskId, patch) {
+    recordReportStage(taskId, patch, expectedAttemptId) {
       const task = repo.getTask(taskId);
       const current = task?.reportGeneration;
       if (task === undefined || current === undefined || current === null) return undefined;
+      // The attempt guard, checked before anything is written: a stage whose
+      // attempt has been superseded cannot move the state of the one that
+      // replaced it, and it is not allowed to close it either.
+      if (expectedAttemptId !== undefined && current.attemptId !== expectedAttemptId) return undefined;
       const next: ReportGenerationState = { ...current, ...patch };
       updateTask(task, { reportGeneration: next });
       return next;
