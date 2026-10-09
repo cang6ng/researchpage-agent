@@ -1,0 +1,9 @@
+# Delivered files that Windows itself parses.
+#
+# `启动 ResearchPage.cmd` is read line by line by cmd.exe, which mis-parses a
+# batch file whose lines end in LF (it chops them mid-line and then runs the
+# fragments: «'m' 不是内部或外部命令»), so this file must arrive with CRLF no
+# matter how it was obtained — clone, checkout with autocrlf=false, or a
+# downloaded archive.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
