@@ -265,6 +265,15 @@ function MineruPanel({ settings }: { readonly settings: SettingsBundle }) {
       <Row k="页数限制" help={`Flash 模式的页数上限为 ${String(limits.flashMaxPages)} 页；Token 模式按服务响应，本产品尚未验证具体上限。`}>
         Flash {limits.flashMaxPages} 页 · Token 未验证
       </Row>
+      <Row
+        k="OCR"
+        help="由 MinerU 服务端自行决定：带文字层的 PDF 走文字提取，纯图像扫描件会走识别。本产品不传 enable_ocr / language，也不提供 OCR 开关，因此不承诺任何扫描件都能识别。"
+      >
+        <span className="rp-chip rp-chip--limited">服务端自动 · 无开关</span>
+      </Row>
+      <Row k="文件格式" help="本轮只开放 PDF 与 DOCX 两个入口；MinerU 自身还能处理图片与 Office 表格，但产品没有开放。">
+        {limits.formats.join(" / ")}（其它扩展名会被拒绝）
+      </Row>
       <Row k="MCP 适配器" help="使用官方 MinerU MCP 服务器，按次启动子进程，不长期驻留。">
         <span className="rp-mono" style={{ fontSize: 12.5, wordBreak: "break-all" }}>
           {settings.mineru.package ?? "未检测到 uvx"}
