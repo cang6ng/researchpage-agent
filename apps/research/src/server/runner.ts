@@ -39,6 +39,7 @@ import type {
 import {
   ABORTED_FAILURE,
   INTERRUPTED_FAILURE,
+  STEP_BUDGET_FAILURE,
   createFailureLedger,
   unclassifiedFailure,
   type FailureLedger,
@@ -769,10 +770,11 @@ export function stageInstruction(input: {
           "本次校验指出的问题：",
           ...repair.map((problem, index) => `${String(index + 1)}) ${problem}`),
           '用 {part:"write", section:{id,title,blocks}} 整节重新提交被指出的那一节，或用 {part:"write", claims:[...]} 修正被指出的 claim；',
+          "改 claim 时只改被指出那一条：混用了不同成本口径（tokens/calls、compute、money 等）的判断，必须按口径拆成并列陈述，或收窄成「在各自口径下……」——不能合成一个「更便宜 / 更贵」的排名；性能数字不可比时同理，只并列报告，不排名。",
           '表格形状：{kind:"table",columns,columnDimensions,rowSubjects,rows:[{cells:[{text,claimIds}]}]}；每行的格数必须与 columns 一致，数组行只接受 ["对象名", "第 1 格", …, "第 N 格"]。',
           "每一格都要写一个有界判断，或写明「证据不足 / 有限可比 / 不可直接比较 / 未找到公开依据」：空白格不等于缺口声明。",
           "不要为了通过校验删掉诚实写出的缺口与限制：写成 callout(tone=\"gap\") 的缺口是合格的，删掉它们不合格。",
-          '修正后再次 {part:"finalize"}；若仍有 problems，只修被指出的那一项。',
+          "顺序要求：先提交被指出的修正，最后一步必须是 {part:\"finalize\"}——不要在 finalize 之前继续加写不相关的内容；若 finalize 仍有 problems，只修被指出的那一项后再 finalize。",
           `比较对象：${subjects}；研究维度：${dimensions}；`,
           ...documentLines,
         ].join("\n");
@@ -1239,9 +1241,17 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
               request.userText === undefined ? undefined : service.actionOutcomeOf(sessionId, request.userText);
             // A failed stage is reported in the product's own safe vocabulary: the
             // category comes from the model layer's record of what it saw, never
-            // from the host's masked answer, which deliberately says nothing.
+            // from the host's masked answer, which deliberately says nothing — and
+            // a run the host stopped at the loop's step budget is its own reason,
+            // established here rather than looked up: no model error happened, so
+            // the ledger has nothing, and「原因未知」would send the reader after a
+            // provider problem that does not exist.
             stageFailure =
-              state.status === "completed" ? null : (failures.read(sessionId, startedAtMs) ?? unclassifiedFailure());
+              state.status === "completed"
+                ? null
+                : state.status === "limited"
+                  ? STEP_BUDGET_FAILURE
+                  : (failures.read(sessionId, startedAtMs) ?? unclassifiedFailure());
             const note =
               state.status === "completed"
                 ? `${stageLabel(request.stage)}：完成`
@@ -1625,7 +1635,25 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     return service.documentContextOf({ taskId }, TASK_DOCUMENT_CHARS);
   }
 
-  /** What the program does once a stage settles: the next bounded step, or a stop. */
+  /**
+   * Whether a draft already holds the whole document.
+   *
+   * The two writer passes together cover every section the blueprint declares,
+   * so a draft that has them all is a document that only needs its objections
+   * answered — not another pass of writing. The check is against the task's own
+   * blueprint: a blueprint that declares fewer sections asks for fewer.
+   */
+  function draftIsComplete(task: ReportTask, draft: { readonly sections: readonly { readonly id: string }[] }): boolean {
+    const declared = new Set(task.structure.sections.map((section) => section.id));
+    const wanted = [...REPORT_PASS_SECTIONS, ...SYNTHESIS_PASS_SECTIONS].filter((id) => declared.has(id));
+    if (wanted.length === 0) return false;
+    const written = new Set(draft.sections.map((section) => section.id));
+    return wanted.every((id) => written.has(id));
+  }
+
+  /**
+   * What the program does once a stage settles: the next bounded step, or a stop.
+   */
   async function afterStage(
     request: StageRequest,
     readsBefore: number,
@@ -1793,14 +1821,28 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           // the record *confirmed*, never from the one it was asked to write.
           // An attempt that cannot be recorded is a repair that cannot be
           // bounded, so it is not spent: the pipeline stops instead of looping.
+          //
+          // A pass the loop stopped at its own step budget is the one failure
+          // that earns the repair: nothing was refused and nothing was wrong
+          // with the answer — the turn simply ran out, and the objections it was
+          // working through are still open. Without this the draft that came one
+          // step short of `finalize` had no way forward but a whole new request.
+          const stepBudgetStop = failure?.code === "run_step_budget";
           const canRepair =
-            !runFailed && previous !== null && previous.repairs < MAX_REPORT_REPAIRS && previous.repairSignature !== signature;
+            (!runFailed || stepBudgetStop) &&
+            previous !== null &&
+            previous.repairs < MAX_REPORT_REPAIRS &&
+            previous.repairSignature !== signature;
           const recorded = service.recordReportStage(
             settled.id,
             {
               ...(canRepair
                 ? { status: "running" as const, repairs: previous.repairs + 1, repairSignature: signature }
-                : { status: "failed" as const, endedAt: new Date().toISOString(), failure: publicFailure(failure), repairSignature: signature }),
+                // A failed attempt that spent no repair records no signature: the
+                // field means「the objection the last repair was asked to fix」,
+                // and claiming an objection was answered when no pass was asked
+                // to answer it is what closed the door on the recovery after it.
+                : { status: "failed" as const, endedAt: new Date().toISOString(), failure: publicFailure(failure) }),
             },
             attemptId,
           );
@@ -2051,11 +2093,20 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     startReport(taskId) {
       const task = service.getTask(taskId);
       if (task === undefined) return undefined;
-      // The attempt is opened before the stage is queued, so a request that was
-      // accepted, a stage that is running and a draft that was written but not
-      // validated are three different facts from the first millisecond — not
-      // one「report」that only becomes true at the end.
-      const opened = service.beginReportGeneration(taskId, { stage: "report", resume: task.reportDraft !== null });
+      // What this request resumes decides which pass it starts. A draft that
+      // already covers every section of the blueprint is the whole document —
+      // asking the model to write it again is what spends a pass's step budget
+      // on rewrites and runs out before `finalize`. So a recovery on a complete
+      // draft goes straight to the narrow pass: fix only what validation is
+      // still objecting to, then seal it. No searching, no rewriting of
+      // sections nobody complained about.
+      const draft = service.reportDraftOf(taskId);
+      const outstanding = service.previewDraftValidation(taskId)?.problems ?? [];
+      const targeted = draft !== null && draftIsComplete(task, draft);
+      const opened = service.beginReportGeneration(taskId, {
+        stage: targeted ? "synthesis" : "report",
+        resume: draft !== null,
+      });
       // A refused attempt is answered as a refusal, and nothing is queued: a
       // request that cannot start must not leave a `running` attempt behind, and
       // it must not be answered with a 202 that says work began.
@@ -2063,9 +2114,17 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       const queued = enqueue({
         taskId,
         sessionId: task.sessionId,
-        stage: "report",
-        instruction: stageInstruction({ stage: "report", task, documents: taskDocumentsOf(taskId) }),
-        grant: STAGE_GRANTS.report,
+        stage: targeted ? "synthesis" : "report",
+        instruction: targeted
+          ? stageInstruction({
+              stage: "synthesis",
+              task,
+              reportBrief: synthesisBrief(taskId),
+              repair: outstanding.slice(0, 6),
+              documents: taskDocumentsOf(taskId),
+            })
+          : stageInstruction({ stage: "report", task, documents: taskDocumentsOf(taskId) }),
+        grant: targeted ? STAGE_GRANTS.synthesis : STAGE_GRANTS.report,
         generationAttemptId: opened.attemptId,
       });
       if (queued) return opened;

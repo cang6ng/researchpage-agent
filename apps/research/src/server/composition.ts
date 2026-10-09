@@ -220,6 +220,12 @@ export async function startResearchApp(options: ResearchAppOptions): Promise<Res
       // task brief is *not* here — a per-session brief belongs to the context
       // builder, which is the seam that can read one and which the composition
       // below hands the host.
+      // The loop's own budget is bounded by the Core's own limits
+      // (`LOOP_RESOURCE_LIMITS`, twelve steps), and this composition asks for
+      // exactly that bound. A pass that needs more than one turn gets another
+      // *bounded* turn from the runner instead — the recovery path spends at
+      // most one extra pass — because widening this number is not something a
+      // product composition is allowed to do.
       host: { systemPrompt: RESEARCH_SYSTEM_PROMPT, loop: { maxSteps: 12, maxModelAttempts: 3 } },
       model: { provider: modelSettings.provider, model: modelSettings.model },
     },

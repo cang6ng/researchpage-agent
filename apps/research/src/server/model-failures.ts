@@ -73,6 +73,7 @@ export const FAILURE_CODES = [
   "run_interrupted",
   "storage_unavailable",
   "run_failed",
+  "run_step_budget",
 ] as const;
 
 export type FailureCode = (typeof FAILURE_CODES)[number];
@@ -225,6 +226,25 @@ export const INTERRUPTED_FAILURE: SafeFailure = Object.freeze({
   code: "run_interrupted",
   problem: "这次生成被应用重启打断了，没有留下可继续的痕迹。",
   guidance: "已读材料、草稿与预算都保留着，可以用「使用现有资料恢复报告」重新开始这次生成。",
+  retryable: false,
+});
+
+/**
+ * The failure a stage is reported as when the loop used up its own step budget.
+ *
+ * The Core stops a turn at `maxSteps` and the host records the run as `limited`.
+ * The model was answering and the work was in progress; what ran out is this
+ * product's own per-turn allowance, so this is a fact about the product's
+ * resource bound and not about the provider. Reporting it as an unknown cause
+ * sent the reader looking for a network or balance problem that did not exist,
+ * so it is named here — and because nothing was lost, the guidance points at
+ * the recovery that continues from what is already stored.
+ */
+export const STEP_BUDGET_FAILURE: SafeFailure = Object.freeze({
+  category: "runtime_unknown",
+  code: "run_step_budget",
+  problem: "这一步用满了单轮的步数预算，模型还没做完就被停下了。",
+  guidance: "已读材料与草稿都保留着；用「使用现有资料恢复报告」可以从现有草稿继续，不会重新检索。",
   retryable: false,
 });
 

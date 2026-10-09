@@ -4481,7 +4481,13 @@ export function createResearchService(options: ResearchServiceOptions): Research
         failure: null,
         resumes: (task.reportGeneration?.resumes ?? 0) + (input.resume ? 1 : 0),
         repairs: task.reportGeneration?.repairs ?? 0,
-        repairSignature: task.reportGeneration?.repairSignature ?? null,
+        // A resume is the user asking again for the same report, so the
+        // objection it is asked to answer is open again: the signature shares
+        // which objection a *spent* repair already failed to fix, and carrying
+        // it into a new attempt would refuse that attempt the one repair it has.
+        // What stays spent is the repair itself — `repairs` is carried over —
+        // which is what keeps the recovery bounded to one more pass.
+        repairSignature: input.resume ? null : (task.reportGeneration?.repairSignature ?? null),
       };
       updateTask(task, { status: "researching", error: null, reportGeneration: state });
       return state;
