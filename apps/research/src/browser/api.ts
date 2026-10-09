@@ -568,6 +568,82 @@ export interface ProgressView {
   readonly waitingUntil: string | null;
 }
 
+/* --------------------------------------------------------------- settings -- */
+
+/** One capability, as the server can be held to it. */
+export interface CapabilityView {
+  readonly id: string;
+  readonly name: string;
+  readonly implemented: boolean;
+  readonly configured: boolean;
+  readonly status: "integrated" | "reachable" | "unreachable" | "not_configured" | "not_checked" | "not_implemented";
+  readonly detail: string;
+  readonly checkedAt?: string | null;
+}
+
+/** The product's own settings, with the provenance of every number in force. */
+export interface SettingsBundle {
+  readonly revision: number;
+  readonly research: {
+    readonly value: {
+      readonly maxSearches: number;
+      readonly maxCandidatesPerSearch: number;
+      readonly maxReads: number;
+      readonly maxGapRounds: number;
+      readonly deadlineMs: number;
+    };
+    readonly source: "product-default" | "saved";
+    readonly limits: Readonly<Record<string, { readonly min: number; readonly max: number }>>;
+    readonly appliesTo: string;
+    readonly note: string;
+  };
+  readonly retrieval: {
+    readonly providers: readonly { readonly id: string; readonly name: string; readonly implemented: boolean; readonly configured: boolean; readonly enabled: boolean }[];
+    readonly order: readonly string[];
+    readonly source: "product-default" | "saved";
+    readonly fallback: boolean;
+    readonly note: string;
+  };
+  readonly capabilities: readonly CapabilityView[];
+  readonly mineru: {
+    readonly implemented: boolean;
+    readonly mode: "flash" | "token";
+    readonly tokenConfigured: boolean;
+    readonly tokenEditable: boolean;
+    readonly command: string | null;
+    readonly package: string | null;
+    readonly limits: {
+      readonly maxUploadBytes: number;
+      readonly maxUploadMiB: number;
+      readonly flashMaxPages: number;
+      readonly formats: readonly string[];
+    };
+    readonly note: string;
+    readonly readinessCheckedAt: string | null;
+    readonly thirdParty: string;
+  };
+  readonly model: {
+    readonly provider: string | null;
+    readonly model: string | null;
+    readonly source: string;
+    readonly editable: boolean;
+    readonly note: string;
+  };
+}
+
+/** What a settings save may change. Absent fields keep what is stored. */
+export interface SettingsPatch {
+  readonly expectedRevision?: number;
+  readonly research?: Partial<{
+    readonly maxSearches: number;
+    readonly maxCandidatesPerSearch: number;
+    readonly maxReads: number;
+    readonly maxGapRounds: number;
+    readonly deadlineMs: number;
+  }>;
+  readonly providers?: readonly string[];
+}
+
 /* ------------------------------------------------------------- readout -- */
 
 export interface PresentationReadout {
@@ -1184,6 +1260,9 @@ export interface DocumentUploadResult {
 
 export const api = {
   runtime: (): Promise<RuntimeView> => request("/api/research/runtime"),
+  settings: (): Promise<SettingsBundle> => request("/api/research/settings"),
+  updateSettings: (patch: SettingsPatch): Promise<SettingsBundle> =>
+    request("/api/research/settings", { method: "PATCH", body: JSON.stringify(patch) }),
   listTasks: (options?: { readonly signal?: AbortSignal }): Promise<{ readonly tasks: readonly TaskSummary[] }> =>
     request("/api/research/tasks", options),
   startTask: (topic: string): Promise<{ readonly sessionId: string }> =>

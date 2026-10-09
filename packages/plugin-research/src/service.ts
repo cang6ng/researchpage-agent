@@ -50,6 +50,7 @@ import type {
   AssessmentRelationship,
 } from "./domain.js";
 import { deriveCellCoverage, EMPTY_ACTION_DELTA, ID_PREFIX, needsAttention, suggestedFieldStates } from "./domain.js";
+import { budgetForNewTask, readSettingsWrite, settingsViewOf, type ProductSettingsView, type ResearchProviderName } from "./settings.js";
 import { blankCellLabel, blankCellsOfTable, tableGapsOf, BLANK_CELL_REMEDY } from "./artifact.js";
 import { deriveResearchResolution, proposalFailureCopy, proposalRepairCopy } from "./outcome.js";
 import { draftEvidence, pickParagraphs, scopeLabel, tokenize, verifyEvidenceText } from "./evidence.js";
@@ -1059,6 +1060,29 @@ export interface ResearchService {
   recordReportStage(taskId: string, patch: Partial<ReportGenerationState>): ReportGenerationState | undefined;
   /** The current attempt, or `null` when the task has none. */
   reportGenerationOf(taskId: string): ReportGenerationState | null;
+  /**
+   * The product's own settings, as they are now.
+   *
+   * Read-only and revisioned: every write publishes a new revision, so a page
+   * that saved and then re-read can tell whether it is looking at its own
+   * change or at one somebody else made.
+   */
+  settingsOf(): ProductSettingsView;
+  /**
+   * Validates and publishes a settings document.
+   *
+   * Nothing is written unless every field is legal; a refused write leaves the
+   * previous revision exactly as it was, which is what makes "saved" a fact
+   * rather than an intention.
+   */
+  updateSettings(input: unknown): { readonly ok: true; readonly view: ProductSettingsView } | Refusal;
+  /**
+   * The providers discovery is configured to ask, in order.
+   *
+   * The pipeline reads this per search rather than caching it, so a saved
+   * change reaches the next search — and only the next one.
+   */
+  retrievalProviders(): readonly ResearchProviderName[];
   state(taskId: string): WorkspaceState;
   cellsOf(taskId: string): readonly CellView[];
   sourcesOf(taskId: string): readonly Source[];
@@ -2947,7 +2971,7 @@ export function createResearchService(options: ResearchServiceOptions): Research
         return { ok: true, created: false, task: next };
       }
       const at = isoNow();
-      let task = createTask({ sessionId, card: normalized.value, now: at });
+      let task = createTask({ sessionId, card: normalized.value, now: at, budget: budgetForNewTask(settingsViewOf(repo.readProductSettings())) });
       if (intent !== undefined && direction !== null) {
         task = applyConfirmedDirection(task, intent, direction, at);
       }
@@ -3758,6 +3782,10 @@ export function createResearchService(options: ResearchServiceOptions): Research
             ? await searchSources(input.query, {
                 ...options.discovery,
                 limit,
+                // The order the product is configured to try. Read here rather
+                // than captured at construction, so a saved change reaches the
+                // next search and only the next one.
+                providers: settingsViewOf(repo.readProductSettings()).providers,
                 breaker: options.discovery?.breaker ?? breaker,
                 ...(input.signal === undefined ? {} : { signal: input.signal }),
                 // Inside a stage, what discovery does is what the reader is
@@ -4403,6 +4431,24 @@ export function createResearchService(options: ResearchServiceOptions): Research
     },
 
     reportGenerationOf: (taskId) => requireTask(taskId).reportGeneration ?? null,
+
+    settingsOf: () => settingsViewOf(repo.readProductSettings()),
+
+    updateSettings(input) {
+      const current = repo.readProductSettings();
+      const read = readSettingsWrite(input, current?.value ?? {});
+      if (!read.ok) {
+        return {
+          ok: false,
+          problems: read.problems.map((entry) => (entry.field.length === 0 ? entry.problem : `${entry.field}：${entry.problem}`)),
+          guidance: "设置没有保存：上面的字段不在允许范围内。研究预算只影响之后新建的项目，已有项目保持它创建时的预算。",
+        };
+      }
+      repo.writeProductSettings(read.value, isoNow());
+      return { ok: true, view: settingsViewOf(repo.readProductSettings()) };
+    },
+
+    retrievalProviders: () => settingsViewOf(repo.readProductSettings()).providers,
 
     previewDraftValidation(taskId) {
       const task = requireTask(taskId);

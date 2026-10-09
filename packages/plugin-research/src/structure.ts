@@ -12,6 +12,7 @@ import type {
   Dimension,
   MatrixCell,
   ReportTask,
+  ResearchBudget,
   ResearchSection,
   Subject,
 } from "./domain.js";
@@ -154,6 +155,14 @@ export function createTask(input: {
   readonly sessionId: string;
   readonly card: NormalizedCard;
   readonly now: string;
+  /**
+   * The budget the product's settings say a *new* project gets.
+   *
+   * It is copied here and never read again: from this moment the task's own
+   * numbers are the ones in force, so an operator who lowers the default does
+   * not shorten a project that already promised its reader a deadline.
+   */
+  readonly budget?: ResearchBudget;
 }): ReportTask {
   return {
     id: newId(ID_PREFIX.task),
@@ -178,7 +187,7 @@ export function createTask(input: {
     briefFieldStates: suggestedFieldStates(),
     briefUpdatedAt: input.now,
     guideClosed: null,
-    budget: DEFAULT_BUDGET,
+    budget: Object.freeze({ ...(input.budget ?? DEFAULT_BUDGET) }),
     usage: emptyUsage(),
     currentReportId: null,
     reportDraft: null,

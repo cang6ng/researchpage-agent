@@ -231,6 +231,21 @@ export {
 } from "./revision.js";
 
 export { openResearchRepository, newId, type ResearchRepository } from "./repository.js";
+export {
+  BUDGET_LIMITS,
+  budgetForNewTask,
+  DEFAULT_PROVIDER_ORDER,
+  DEFAULT_RESEARCH_DEFAULTS,
+  readSettingsWrite,
+  RESEARCH_PROVIDERS,
+  settingsViewOf,
+  type ProductSettingsValue,
+  type ProductSettingsView,
+  type ResearchDefaults,
+  type ResearchProviderName,
+  type SettingsProblem,
+  type SettingsWrite,
+} from "./settings.js";
 
 export {
   attemptArxiv,

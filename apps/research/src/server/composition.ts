@@ -279,6 +279,7 @@ export async function startResearchApp(options: ResearchAppOptions): Promise<Res
       },
       reportDir,
       model: modelSettings,
+      mineruMode: mineru.token === undefined ? "flash" : "token",
       ...(options.browserPath === undefined ? {} : { browserPath: options.browserPath }),
       log,
     },

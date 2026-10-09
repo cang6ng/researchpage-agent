@@ -2,17 +2,27 @@
  * Settings: small, complete, and honest.
  *
  * Everything here is either a real preference this build reads or a fact about
- * the instance the reader should not have to guess at — which model is running,
- * what the research budget is, whether a PDF can be rendered on this machine.
- * Where a capability does not exist yet, the page says so; it does not offer a
- * control that would do nothing.
+ * the instance the reader should not have to guess at. Two rules hold the page
+ * together.
+ *
+ * A control that does nothing is not offered. The research defaults are saved
+ * on the server and are read when a *new* project is created; the retrieval
+ * order is saved and read by the next search; and the page says which of those
+ * two facts each field is, because a number a reader can edit and the pipeline
+ * ignores is a claim about the product that is not true.
+ *
+ * A capability is described at its real status. "已实现 / 已配置 / 已探测" are
+ * different facts, and the third one has a time attached; an integration nobody
+ * has probed reads as「尚未检查」rather than as available. The two static
+ * sentences this page used to carry —「本地上传未接入」and「PDF 解析未接入」— were
+ * true of an earlier build and false of this one, which is why they are gone.
  */
 
-import { SegmentedControl } from "@mantine/core";
-import { BookText, Cpu, Download, FlaskConical, Plug, Settings2 } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { Alert, Button, NumberInput, SegmentedControl, Switch } from "@mantine/core";
+import { BookText, Cpu, Download, FlaskConical, Plug, RefreshCw, Save, Settings2 } from "lucide-react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 
-import { COMPARABILITY_LABELS } from "../api.js";
+import { api, COMPARABILITY_LABELS, type CapabilityView, type SettingsBundle } from "../api.js";
 import { useApp } from "../store.js";
 
 type Section = "general" | "model" | "research" | "sources" | "export";
@@ -37,9 +47,251 @@ function Row({ k, help, children }: { readonly k: string; readonly help?: string
   );
 }
 
+/** How a capability's status is worded, and how it looks. */
+const CAPABILITY: Readonly<Record<CapabilityView["status"], { readonly label: string; readonly chip: string }>> = Object.freeze({
+  integrated: { label: "已实现并可用", chip: "rp-chip--reviewed" },
+  reachable: { label: "已探测可用", chip: "rp-chip--reviewed" },
+  unreachable: { label: "服务不可达", chip: "rp-chip--conflict" },
+  not_configured: { label: "已实现但未配置", chip: "rp-chip--limited" },
+  not_checked: { label: "尚未检查", chip: "rp-chip--quiet" },
+  not_implemented: { label: "暂未实现", chip: "rp-chip--quiet" },
+});
+
+/** The research defaults, as a form that saves what it shows. */
+function ResearchForm({
+  settings,
+  onSaved,
+}: {
+  readonly settings: SettingsBundle;
+  readonly onSaved: (next: SettingsBundle) => void;
+}) {
+  const { act, busy } = useApp();
+  const [draft, setDraft] = useState(settings.research.value);
+  const [dirty, setDirty] = useState(false);
+  // A save that lands while the reader is editing must not silently discard
+  // what they typed: the server's answer replaces the form only when the form
+  // has nothing unsaved.
+  useEffect(() => {
+    if (!dirty) setDraft(settings.research.value);
+  }, [settings.research.value, dirty]);
+
+  const fields = [
+    { key: "maxSearches" as const, label: "检索次数", help: "一次研究最多发起多少次检索请求。" },
+    { key: "maxCandidatesPerSearch" as const, label: "每次候选数", help: "每次检索最多取回多少个候选来源。" },
+    { key: "maxReads" as const, label: "读取次数", help: "最多真实读取多少个来源；只有读过的来源才产生证据。" },
+    { key: "maxGapRounds" as const, label: "定向补查轮数", help: "围绕缺口最多补查几轮。" },
+    { key: "deadlineMs" as const, label: "研究动作时间预算（分钟）", help: "研究动作的时间上限，不是整份报告的完成时间。" },
+  ];
+
+  return (
+    <div className="rp-set-group">
+      <h2>研究</h2>
+      <p>
+        这些是<b>新项目默认</b>：项目创建时会把当时的数值冻结下来，此后修改默认值不会改动已有项目。
+        失败重试也保留该项目自己的预算。
+      </p>
+      {settings.research.source === "product-default" && (
+        <p style={{ color: "var(--rp-ink-3)", fontSize: 12.5 }}>当前显示的是产品默认值，尚未保存过自定义设置。</p>
+      )}
+      {fields.map((field) => {
+        const limits = settings.research.limits[field.key];
+        const value = field.key === "deadlineMs" ? Math.round(draft.deadlineMs / 60_000) : draft[field.key];
+        const min = field.key === "deadlineMs" ? Math.round(limits.min / 60_000) : limits.min;
+        const max = field.key === "deadlineMs" ? Math.round(limits.max / 60_000) : limits.max;
+        return (
+          <Row key={field.key} k={field.label} help={`${field.help}（允许 ${String(min)}–${String(max)}）`}>
+            <NumberInput
+              value={value}
+              min={min}
+              max={max}
+              allowDecimal={false}
+              clampBehavior="none"
+              style={{ maxWidth: 140 }}
+              onChange={(next) => {
+                const parsed = typeof next === "number" ? next : Number(next);
+                if (!Number.isFinite(parsed)) return;
+                setDirty(true);
+                setDraft((current) => ({
+                  ...current,
+                  [field.key]: field.key === "deadlineMs" ? Math.round(parsed) * 60_000 : Math.round(parsed),
+                }));
+              }}
+              data-testid={`setting-${field.key}`}
+            />
+          </Row>
+        );
+      })}
+      <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 14 }}>
+        <Button
+          leftSection={<Save size={15} />}
+          disabled={busy || !dirty}
+          onClick={() => {
+            void act(
+              async () => {
+                const next = await api.updateSettings({ expectedRevision: settings.revision, research: draft });
+                setDirty(false);
+                onSaved(next);
+              },
+              "保存研究预算",
+            );
+          }}
+          data-testid="save-research"
+        >
+          保存为新项目默认
+        </Button>
+        {dirty && <span style={{ fontSize: 12.5, color: "var(--rp-ink-3)" }}>有未保存的改动</span>}
+      </div>
+      <Row k="矩阵状态的判据" help="状态由证据与支持评估推导，不按数量评分。">
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <span>待查 · 有材料待核对 · 有限支持 · 已核对 · 冲突 / 不可比</span>
+          <span style={{ color: "var(--rp-ink-3)", fontSize: 12.5 }}>
+            「已核对」表示存在正文级、直接相关的支持评估，不表示结论已被证明为真。可比性用词：
+            {Object.values(COMPARABILITY_LABELS).join(" / ")}。
+          </span>
+        </div>
+      </Row>
+    </div>
+  );
+}
+
+/** The retrieval order, as a switch per provider with a floor of one. */
+function RetrievalForm({
+  settings,
+  onSaved,
+}: {
+  readonly settings: SettingsBundle;
+  readonly onSaved: (next: SettingsBundle) => void;
+}) {
+  const { act, busy } = useApp();
+  const [enabled, setEnabled] = useState<readonly string[]>(settings.retrieval.order);
+  const [dirty, setDirty] = useState(false);
+  useEffect(() => {
+    if (!dirty) setEnabled(settings.retrieval.order);
+  }, [settings.retrieval.order, dirty]);
+
+  return (
+    <div className="rp-set-group">
+      <h2>检索来源</h2>
+      <p>{settings.retrieval.note}</p>
+      {settings.retrieval.providers.map((provider) => {
+        const on = enabled.includes(provider.id);
+        const last = enabled.length === 1 && on;
+        return (
+          <Row
+            key={provider.id}
+            k={provider.name}
+            help={provider.id === "arxiv" ? "优先来源；读取时优先抽取 HTML 正文，必要时退回摘要页。" : "备用来源：前一个没有结果或不可用时才使用。"}
+          >
+            <span className="rp-factline">
+              <Switch
+                checked={on}
+                disabled={last || busy}
+                aria-label={provider.name}
+                data-testid={`provider-${provider.id}`}
+                onChange={(event) => {
+                  setDirty(true);
+                  setEnabled((current) =>
+                    event.currentTarget.checked ? [...current, provider.id] : current.filter((entry) => entry !== provider.id),
+                  );
+                }}
+              />
+              <span className={`rp-chip ${last ? "rp-chip--limited" : "rp-chip--reviewed"}`}>{last ? "最后一个，不能关闭" : "已启用"}</span>
+            </span>
+          </Row>
+        );
+      })}
+      <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 14 }}>
+        <Button
+          leftSection={<Save size={15} />}
+          disabled={busy || !dirty}
+          onClick={() => {
+            void act(
+              async () => {
+                const next = await api.updateSettings({ expectedRevision: settings.revision, providers: enabled });
+                setDirty(false);
+                onSaved(next);
+              },
+              "保存检索来源",
+            );
+          }}
+          data-testid="save-providers"
+        >
+          保存
+        </Button>
+        {dirty && <span style={{ fontSize: 12.5, color: "var(--rp-ink-3)" }}>有未保存的改动</span>}
+      </div>
+    </div>
+  );
+}
+
+/** MinerU's real state, its real limits, and the consent it requires. */
+function MineruPanel({ settings }: { readonly settings: SettingsBundle }) {
+  const { mineru, mineruChecked, checkMineru, busy } = useApp();
+  const limits = settings.mineru.limits;
+  return (
+    <div className="rp-set-group">
+      <h2>文档解析（MinerU）</h2>
+      <p>{settings.mineru.thirdParty}</p>
+      <Row k="当前模式" help="模式由服务端启动配置决定；Token 只注入转换子进程，不经过页面。">
+        <span className="rp-factline">
+          <span className={`rp-chip ${settings.mineru.mode === "token" ? "rp-chip--reviewed" : "rp-chip--limited"}`}>
+            {settings.mineru.mode === "token" ? "Token 模式" : "Flash 模式"}
+          </span>
+          {!settings.mineru.tokenEditable && <span style={{ fontSize: 12.5, color: "var(--rp-ink-3)" }}>页面暂不支持修改</span>}
+        </span>
+      </Row>
+      <Row k="在线服务" help="tools/list 成功只说明 MCP 服务器可用，不代表账户 Token 或解析额度已验证。">
+        <span className="rp-factline">
+          <span className={mineru === null ? "rp-chip rp-chip--quiet" : mineru.ok ? "rp-chip rp-chip--reviewed" : "rp-chip rp-chip--conflict"}>
+            {mineru === null ? (mineruChecked ? "不可用" : "尚未检查") : mineru.ok ? "已探测可用" : "服务不可达"}
+          </span>
+          <Button
+            variant="subtle"
+            size="compact-xs"
+            leftSection={<RefreshCw size={13} />}
+            disabled={busy}
+            onClick={() => {
+              void checkMineru();
+            }}
+            data-testid="check-mineru"
+          >
+            检查
+          </Button>
+        </span>
+      </Row>
+      <Row k="上传限制" help={`本产品对所有模式强制同一上限：${String(limits.maxUploadMiB)} MiB。配置 Token 不会提高它。`}>
+        {limits.maxUploadMiB} MiB · 仅 {limits.formats.join(" / ")}
+      </Row>
+      <Row k="页数限制" help={`Flash 模式的页数上限为 ${String(limits.flashMaxPages)} 页；Token 模式按服务响应，本产品尚未验证具体上限。`}>
+        Flash {limits.flashMaxPages} 页 · Token 未验证
+      </Row>
+      <Row k="MCP 适配器" help="使用官方 MinerU MCP 服务器，按次启动子进程，不长期驻留。">
+        <span className="rp-mono" style={{ fontSize: 12.5, wordBreak: "break-all" }}>
+          {settings.mineru.package ?? "未检测到 uvx"}
+        </span>
+      </Row>
+    </div>
+  );
+}
+
 export function SettingsView() {
-  const { runtime, themeId, setThemeId, bundle } = useApp();
+  const { runtime, themeId, setThemeId, bundle, act, busy } = useApp();
   const [section, setSection] = useState<Section>("general");
+  const [settings, setSettings] = useState<SettingsBundle | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setSettings(await api.settings());
+      setFailure(null);
+    } catch (error) {
+      setFailure(error instanceof Error ? error.message : "设置读取失败");
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   return (
     <div className="rp-settings">
@@ -62,6 +314,17 @@ export function SettingsView() {
       </nav>
 
       <div>
+        {failure !== null && (
+          <Alert color="yellow" title="设置没有读到" style={{ marginBottom: 16 }} data-testid="settings-failure">
+            {failure}
+            <div style={{ marginTop: 8 }}>
+              <Button variant="subtle" size="compact-xs" onClick={() => void load()}>
+                重新读取
+              </Button>
+            </div>
+          </Alert>
+        )}
+
         {section === "general" && (
           <div className="rp-set-group">
             <h2>通用</h2>
@@ -88,7 +351,7 @@ export function SettingsView() {
         {section === "model" && (
           <div className="rp-set-group">
             <h2>模型</h2>
-            <p>模型与凭据由服务端启动时决定，页面既不读取也不显示凭据本身。</p>
+            <p>{settings?.model.note ?? "模型与凭据由服务端启动时决定，页面既不读取也不显示凭据本身。"}</p>
             <Row k="运行中的模型">
               {runtime?.model == null ? (
                 "未连接到服务端"
@@ -102,6 +365,9 @@ export function SettingsView() {
             <Row k="凭据" help="凭据来自服务端环境变量，不会写入数据库、日志或页面。">
               由服务端持有
             </Row>
+            <Row k="网页配置" help="模型配置界面尚未实现：当前版本只能通过服务端启动配置与环境变量切换模型。">
+              <span className="rp-chip rp-chip--quiet">暂未实现</span>
+            </Row>
             <Row k="当前状态">
               <span className="rp-factline">
                 <span className={runtime?.busy === true ? "rp-dot rp-dot--busy" : "rp-dot rp-dot--live"} />
@@ -111,57 +377,44 @@ export function SettingsView() {
           </div>
         )}
 
-        {section === "research" && (
-          <div className="rp-set-group">
-            <h2>研究</h2>
-            <p>每个项目的预算在开始时固定，运行期间不会扩大；预算用完时，报告必须如实写出缺口。</p>
-            <Row k="检索" help={`每次检索最多返回 ${runtime?.budget.maxCandidatesPerSearch ?? 6} 个候选。`}>
-              最多 {runtime?.budget.maxSearches ?? bundle?.budget.maxSearches ?? 6} 次
-            </Row>
-            <Row k="读取" help="只有真正读取过的来源才会产生可引用证据。">
-              最多 {runtime?.budget.maxReads ?? bundle?.budget.maxReads ?? 10} 次
-            </Row>
-            <Row k="定向补查" help="补查围绕具体缺口进行，不重新做一遍检索。">
-              最多 {runtime?.budget.maxGapRounds ?? bundle?.budget.maxGapRounds ?? 2} 轮
-            </Row>
-            <Row k="单次运行时限">约 {Math.round((runtime?.budget.deadlineMs ?? 8 * 60_000) / 60_000)} 分钟</Row>
-            <Row k="矩阵状态的判据" help="状态由证据与支持评估推导，不按数量评分。">
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                <span>待查 · 有材料待核对 · 有限支持 · 已核对 · 冲突 / 不可比</span>
-                <span style={{ color: "var(--rp-ink-3)", fontSize: 12.5 }}>
-                  「已核对」表示存在正文级、直接相关的支持评估，不表示结论已被证明为真。可比性用词：
-                  {Object.values(COMPARABILITY_LABELS).join(" / ")}。
-                </span>
-              </div>
-            </Row>
-          </div>
-        )}
+        {section === "research" &&
+          (settings === null ? (
+            <div className="rp-set-group">
+              <h2>研究</h2>
+              <p>正在读取设置…</p>
+            </div>
+          ) : (
+            <ResearchForm settings={settings} onSaved={setSettings} />
+          ))}
 
         {section === "sources" && (
-          <div className="rp-set-group">
-            <h2>来源与集成</h2>
-            <p>本版本只接入了一个真实来源域；未接入的能力在这里如实标注，不提供假开关。</p>
-            <Row k="arXiv" help="检索候选来自 arXiv API；正文读取覆盖 arXiv 的 HTML 全文与摘要页。">
-              <span className="rp-factline">
-                <span className="rp-chip rp-chip--reviewed">已启用</span>
-                <span style={{ fontSize: 12.5, color: "var(--rp-ink-3)" }}>无需配置</span>
-              </span>
-            </Row>
-            <Row k="PDF 文档解析" help="PDF 正文暂不解析；读取范围会如实标注为元数据、摘要或正文节选。">
-              <span className="rp-chip rp-chip--quiet">未接入</span>
-            </Row>
-            <Row k="本地文件上传">
-              <span className="rp-chip rp-chip--quiet">未接入</span>
-            </Row>
-            <Row k="MCP / 外部工具">
-              <span className="rp-chip rp-chip--quiet">未接入</span>
-            </Row>
-            <Row k="数据位置" help="项目数据保存在本机；报告与导出文件也在同一个数据目录下。">
-              <span className="rp-mono" style={{ fontSize: 12.5, wordBreak: "break-all" }}>
-                {runtime?.dataDir ?? "—"}
-              </span>
-            </Row>
-          </div>
+          <>
+            {settings === null ? (
+              <div className="rp-set-group">
+                <h2>来源与集成</h2>
+                <p>正在读取设置…</p>
+              </div>
+            ) : (
+              <>
+                <RetrievalForm settings={settings} onSaved={setSettings} />
+                <div className="rp-set-group">
+                  <h2>能力清单</h2>
+                  <p>每一条都写明它现在的真实状态：已实现、已配置、已探测、不可达、尚未检查，或尚未实现。</p>
+                  {settings.capabilities.map((capability) => (
+                    <Row key={capability.id} k={capability.name} help={capability.detail}>
+                      <span className={`rp-chip ${CAPABILITY[capability.status].chip}`}>{CAPABILITY[capability.status].label}</span>
+                    </Row>
+                  ))}
+                  <Row k="数据位置" help="项目数据保存在本机；报告与导出文件也在同一个数据目录下。">
+                    <span className="rp-mono" style={{ fontSize: 12.5, wordBreak: "break-all" }}>
+                      {runtime?.dataDir ?? "—"}
+                    </span>
+                  </Row>
+                </div>
+                <MineruPanel settings={settings} />
+              </>
+            )}
+          </>
         )}
 
         {section === "export" && (
@@ -177,9 +430,7 @@ export function SettingsView() {
               ) : (
                 <span className="rp-factline">
                   <span className="rp-chip rp-chip--reviewed">可导出</span>
-                  <span className="rp-mono" style={{ fontSize: 12 }}>
-                    {runtime.pdfRenderer}
-                  </span>
+                  <span className="rp-mono" style={{ fontSize: 12 }}>{runtime.pdfRenderer}</span>
                 </span>
               )}
             </Row>
@@ -191,6 +442,9 @@ export function SettingsView() {
             </Row>
             <Row k="主题与 PDF" help="工作台内两套主题都由同一份结构化报告渲染；PDF 目前固定使用 Editorial 版式。">
               <span className="rp-chip rp-chip--limited">PDF 双主题待后续步骤</span>
+            </Row>
+            <Row k="当前项目" help="导出针对的是当前打开的项目；没有打开项目时按钮不会出现。">
+              {bundle === null ? "未打开项目" : bundle.hasReport ? "可导出当前报告" : "当前项目还没有正式报告"}
             </Row>
           </div>
         )}

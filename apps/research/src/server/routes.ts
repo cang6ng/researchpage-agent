@@ -45,7 +45,7 @@ import {
 } from "@every-dagent/plugin-research";
 import { publicProblem, type ConversionManager, type ConversionProblem } from "./conversions.js";
 import { exportRevisionPdf, exportTaskReportPdf, renderHtmlOf, revisionHtmlOf } from "./export.js";
-import { MINERU_FLASH_MAX_BYTES, MINERU_FLASH_MAX_PAGES } from "./mineru.js";
+import { MINERU_FLASH_MAX_BYTES, MINERU_FLASH_MAX_PAGES, MINERU_PACKAGE } from "./mineru.js";
 import { presentationOf, reportGenerationOf, researchProgressOf } from "./presentation.js";
 import type { ResearchRunner } from "./runner.js";
 
@@ -88,6 +88,14 @@ export interface ResearchRoutesOptions {
   readonly runner: ResearchRunner;
   /** PDF/DOCX → Markdown, as jobs. */
   readonly conversions: ConversionManager;
+  /**
+   * Which MinerU mode the converter really runs in.
+   *
+   * The composition owns this decision — it reads the environment and any
+   * caller-supplied override — so the settings document reports it as a fact it
+   * was handed rather than as one it guessed from an environment variable.
+   */
+  readonly mineruMode?: "flash" | "token";
   /** Creates one host session for a new research task. */
   readonly createSession: () => Promise<string>;
   readonly reportDir: string;
@@ -649,6 +657,128 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean, rep
 }
 
 let options: ResearchRoutesOptions;
+
+/**
+ * What the settings page is allowed to claim, as opposed to what it is told.
+ *
+ * Every entry here is a fact the product can be held to. `implemented` says the
+ * code path exists; `configured` says whatever it needs is present; `status`
+ * says what was actually observed and when — and "not checked" is its own
+ * answer, because a page that shows an unprobed integration as available has
+ * told the reader something nobody established.
+ *
+ * This is also where the page stops repeating what used to be static prose.
+ * "本地上传未接入" and "PDF 解析未接入" were true statements about an earlier build
+ * and false about this one, and a claim about capability is only worth reading
+ * if it is derived from the thing itself.
+ */
+function settingsBundleOf(current: ResearchRoutesOptions): Record<string, unknown> {
+  const settings = current.service.settingsOf();
+  // Deliberately not probed here. A readiness check starts a real MCP
+  // subprocess, and a settings *read* is a page load: making every load wait on
+  // a child process would make the page slow to answer a question that has
+  // nothing to do with the converter. What this document says about MinerU is
+  // what is *configured*; what was observed is the check's own answer, at the
+  // route that performs it.
+  // The mode the converter was actually started with, handed in by the
+  // composition that read it — not re-derived here from an environment variable
+  // that a caller may have replaced.
+  const mode = current.mineruMode ?? "flash";
+
+  const providers = settings.providers.map((provider) => ({
+    id: provider,
+    name: provider === "arxiv" ? "arXiv" : "OpenAlex",
+    implemented: true,
+    configured: true,
+    enabled: true,
+  }));
+
+  return {
+    revision: settings.revision,
+    research: {
+      value: settings.research,
+      source: settings.researchSource,
+      limits: settings.limits,
+      // Said where it binds: these numbers govern the *next* project, and a
+      // project already created keeps the budget it was created with.
+      appliesTo: "new-projects",
+      note: "研究预算在创建项目时冻结；已有项目与失败重试都保留它创建时的预算。",
+    },
+    retrieval: {
+      providers,
+      order: settings.providers,
+      source: settings.providersSource,
+      fallback: settings.providers.length > 1,
+      note:
+        settings.providers.length > 1
+          ? `按 ${settings.providers.join(" → ")} 顺序尝试：前一个没有结果或不可用时才换下一个。`
+          : `只使用 ${settings.providers.join("、")}；它不可用时没有备用来源。`,
+    },
+    capabilities: [
+      { id: "arxiv", name: "arXiv 检索", implemented: true, configured: true, status: "integrated", detail: "已实现并默认启用" },
+      { id: "openalex", name: "OpenAlex 检索", implemented: true, configured: true, status: "integrated", detail: "已实现；作为备用来源" },
+      {
+        id: "read-html",
+        name: "网页 / arXiv HTML 正文读取",
+        implemented: true,
+        configured: true,
+        status: "integrated",
+        detail: "优先抽取 HTML 正文，失败时退回摘要页；读取范围会如实记录为 full_text / abstract / metadata",
+      },
+      { id: "upload-markdown", name: "Markdown 本地上传", implemented: true, configured: true, status: "integrated", detail: "已实现并持久化" },
+      {
+        id: "convert-document",
+        name: "PDF / DOCX 上传与转换",
+        implemented: true,
+        // The converter is implemented and needs no credential to be *tried*,
+        // so "implemented" and "configured" are both yes; whether it is
+        // reachable is what the check answers, and that is not this document.
+        configured: true,
+        status: "not_checked",
+        checkedAt: null,
+        detail: "已实现：用官方 MinerU MCP 解析 PDF / DOCX。是否可用请用「检查」探测；探测会真的启动一次服务。",
+      },
+      { id: "document-source", name: "用户附件转为研究来源", implemented: true, configured: true, status: "integrated", detail: "需要用户显式标记为研究材料，之后仍须真实读取" },
+      // Not built. Saying so is the point: a settings page that is silent about
+      // a capability reads as though the capability exists.
+      { id: "remote-pdf", name: "远程 PDF 链接自动解析", implemented: false, configured: false, status: "not_implemented", detail: "暂未实现：读取不会把远程 PDF 自动送入转换" },
+      { id: "other-search", name: "其它搜索引擎", implemented: false, configured: false, status: "not_implemented", detail: "暂未实现" },
+      { id: "mcp-marketplace", name: "通用 MCP 平台", implemented: false, configured: false, status: "not_implemented", detail: "暂未实现" },
+    ],
+    mineru: {
+      implemented: true,
+      mode,
+      tokenConfigured: mode === "token",
+      tokenEditable: false,
+      command: null,
+      package: MINERU_PACKAGE,
+      // The limits this product really enforces, stated once and the same
+      // everywhere: the HTTP route, the conversion manager and the tool all
+      // refuse the same size, and a Token does not move it.
+      limits: {
+        maxUploadBytes: MAX_CONVERSION_UPLOAD_BYTES,
+        maxUploadMiB: Math.round(MAX_CONVERSION_UPLOAD_BYTES / 1024 / 1024),
+        flashMaxPages: MINERU_FLASH_MAX_PAGES,
+        formats: ["pdf", "docx"],
+      },
+      note:
+        "上传上限是所有模式共用的产品限制，配置 Token 不会提高它。" +
+        "tools/list 成功只说明 MCP 服务器可用，不代表账户 Token 或解析额度已验证。",
+      readinessCheckedAt: null,
+      thirdParty: "转换会把文件上传到 MinerU 的在线服务，需要用户明确同意后才会执行。",
+    },
+    model: {
+      provider: current.model?.provider ?? null,
+      model: current.model?.model ?? null,
+      // Where the model comes from, so the page never implies it is editable
+      // when it is not.
+      source: "server-environment",
+      editable: false,
+      note: "模型由服务端启动配置与 RESEARCHPAGE_MODEL / 环境变量决定；网页暂不支持修改。",
+    },
+  };
+}
+
 let pendingTopics = new Map<string, string>();
 
 /**
@@ -2127,6 +2257,41 @@ export function createResearchRouter(
         dataDir: routeOptions.reportDir,
         busy: busyState() || runner.busy || runner.queued > 0,
       });
+      return;
+    }
+
+    /**
+     * GET /api/research/settings — what is in force, and where it came from.
+     *
+     * Every field carries its provenance, because "the product's default" and
+     * "a value someone chose" are different facts, and a page that showed only
+     * the number would let a reader believe either one. Nothing here is a
+     * secret: no credential is in this document at all.
+     */
+    if (path === "/api/research/settings" && method === "GET") {
+      sendJson(response, 200, settingsBundleOf(routeOptions));
+      return;
+    }
+
+    if (path === "/api/research/settings" && method === "PATCH") {
+      const body = asRecord(await readBody(request));
+      const expected = body["expectedRevision"];
+      const current = service.settingsOf();
+      if (typeof expected === "number" && expected !== current.revision) {
+        sendJson(response, 409, {
+          error: "设置在别处已经改过了，本次没有保存。",
+          reason: "revision_conflict",
+          guidance: "页面显示的是服务端当前设置；确认后再保存。",
+          current: settingsBundleOf(routeOptions),
+        });
+        return;
+      }
+      const updated = service.updateSettings(body);
+      if (!updated.ok) {
+        sendJson(response, 409, { error: updated.problems.join("；"), problems: updated.problems, guidance: updated.guidance });
+        return;
+      }
+      sendJson(response, 200, { ok: true, ...settingsBundleOf(routeOptions) });
       return;
     }
 

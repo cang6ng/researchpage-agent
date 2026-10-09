@@ -35,6 +35,7 @@ import type { Proposal } from "./proposal.js";
 import type { FrozenRevision } from "./revision.js";
 import type { GuideQuestion } from "./brief.js";
 import type { IntentDraft } from "./intent.js";
+import type { ProductSettingsValue } from "./settings.js";
 import type { StoredDocument } from "./documents.js";
 
 export function newId(prefix: string): string {
@@ -149,6 +150,17 @@ export interface ResearchRepository {
    * validated against it. Either every statement lands or none does.
    */
   transact<T>(work: () => T): T;
+
+  /**
+   * The product's own settings, and the revision they are at.
+   *
+   * `undefined` means nothing has ever been saved, which is not the same as
+   * "the defaults were saved": the difference is what tells a reader whether
+   * the numbers in force are the product's or theirs.
+   */
+  readProductSettings(): { readonly revision: number; readonly value: ProductSettingsValue } | undefined;
+  /** Publishes a new revision. The caller has already validated it. */
+  writeProductSettings(value: ProductSettingsValue, at: string): number;
 
   close(): void;
 }
@@ -266,6 +278,12 @@ CREATE TABLE IF NOT EXISTS research_documents (
 CREATE INDEX IF NOT EXISTS research_documents_session ON research_documents (session_id);
 CREATE INDEX IF NOT EXISTS research_documents_task ON research_documents (task_id);
 CREATE INDEX IF NOT EXISTS research_documents_hash ON research_documents (session_id, content_hash);
+CREATE TABLE IF NOT EXISTS product_settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  revision INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `;
 
 export function openResearchRepository(options: { readonly location: string }): ResearchRepository {
@@ -614,6 +632,25 @@ export function openResearchRepository(options: { readonly location: string }): 
       }
     },
 
+    readProductSettings() {
+      const row = database.prepare("SELECT revision, payload FROM product_settings WHERE id = 1").get() as
+        | { revision: number; payload: string }
+        | undefined;
+      return row === undefined ? undefined : { revision: row.revision, value: readJson<ProductSettingsValue>(row.payload) };
+    },
+    writeProductSettings(value: ProductSettingsValue, at: string): number {
+      const current = database.prepare("SELECT revision FROM product_settings WHERE id = 1").get() as
+        | { revision: number }
+        | undefined;
+      const revision = (current?.revision ?? 0) + 1;
+      database
+        .prepare(
+          "INSERT INTO product_settings (id, revision, payload, updated_at) VALUES (1, ?, ?, ?) " +
+            "ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload, updated_at = excluded.updated_at",
+        )
+        .run(revision, JSON.stringify(value), at);
+      return revision;
+    },
     close(): void {
       database.close();
     },
