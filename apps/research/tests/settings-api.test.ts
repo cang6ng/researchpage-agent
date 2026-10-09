@@ -75,8 +75,28 @@ async function patch(path: string, payload: unknown): Promise<{ readonly status:
 interface SettingsShape {
   readonly revision: number;
   readonly research: { readonly value: Record<string, number>; readonly source: string; readonly limits: Record<string, { min: number; max: number }> };
-  readonly retrieval: { readonly order: readonly string[]; readonly source: string; readonly providers: readonly { id: string }[] };
-  readonly capabilities: readonly { id: string; status: string; implemented: boolean }[];
+  readonly retrieval: {
+    readonly order: readonly string[];
+    readonly source: string;
+    readonly note: string;
+    readonly providers: readonly {
+      readonly id: string;
+      readonly name: string;
+      readonly implemented: boolean;
+      readonly configured: boolean;
+      readonly enabled: boolean;
+      readonly orderIndex: number | null;
+      readonly health: { readonly status: string; readonly checkedAt: string | null };
+    }[];
+  };
+  readonly capabilities: readonly {
+    readonly id: string;
+    readonly status: string;
+    readonly implemented: boolean;
+    readonly enabled: boolean | null;
+    readonly orderIndex: number | null;
+    readonly health: { readonly status: string; readonly checkedAt: string | null } | null;
+  }[];
   readonly mineru: { readonly mode: string; readonly limits: { maxUploadMiB: number; flashMaxPages: number } };
   readonly model: { readonly provider: string | null; readonly editable: boolean };
 }
@@ -184,5 +204,107 @@ describe("the settings the page can actually change", () => {
     // And it is honest that there is no credential surface here at all.
     const settings = JSON.parse(raw) as SettingsShape;
     expect(settings.model.editable).toBe(false);
+  });
+});
+
+describe("the retrieval catalogue, switched both ways (F06/F07)", () => {
+  it("always publishes every provider, whether or not it is enabled", async () => {
+    // Start from the product's own order, whatever earlier cases left behind.
+    const initial = (await get("/api/research/settings")).body as unknown as SettingsShape;
+    const reset = await patch("/api/research/settings", { expectedRevision: initial.revision, providers: ["arxiv", "openalex"] });
+    expect(reset.status).toBe(200);
+    const before = (await get("/api/research/settings")).body as unknown as SettingsShape;
+    expect(before.retrieval.providers.map((provider) => provider.id)).toEqual(["arxiv", "openalex"]);
+    expect(before.retrieval.providers.every((provider) => provider.enabled)).toBe(true);
+    expect(before.retrieval.providers.map((provider) => provider.orderIndex)).toEqual([0, 1]);
+
+    // Switch arXiv off. The catalogue must still carry it: it is the entry that
+    // would turn it back on, and the state the reader is looking at.
+    const off = await patch("/api/research/settings", { expectedRevision: before.revision, providers: ["openalex"] });
+    expect(off.status).toBe(200);
+    const disabled = off.body as unknown as SettingsShape;
+    expect(disabled.retrieval.order).toEqual(["openalex"]);
+    const arxivOff = disabled.retrieval.providers.find((provider) => provider.id === "arxiv");
+    expect(arxivOff, "the disabled provider is still in the catalogue").toBeDefined();
+    expect(arxivOff?.enabled).toBe(false);
+    expect(arxivOff?.orderIndex).toBeNull();
+    expect(arxivOff?.implemented).toBe(true);
+    expect(disabled.retrieval.providers.find((provider) => provider.id === "openalex")?.orderIndex).toBe(0);
+    expect(disabled.retrieval.note).toContain("OpenAlex");
+    expect(disabled.retrieval.note).not.toContain("arXiv");
+
+    // Re-read, the way a reload does.
+    const reloaded = (await get("/api/research/settings")).body as unknown as SettingsShape;
+    expect(reloaded.retrieval.providers.map((provider) => provider.id)).toEqual(["arxiv", "openalex"]);
+    expect(reloaded.retrieval.providers.find((provider) => provider.id === "arxiv")?.enabled).toBe(false);
+
+    // And back on: appending is the other direction of the same control.
+    const on = await patch("/api/research/settings", { expectedRevision: reloaded.revision, providers: ["openalex", "arxiv"] });
+    expect(on.status).toBe(200);
+    const restored = on.body as unknown as SettingsShape;
+    expect(restored.retrieval.order).toEqual(["openalex", "arxiv"]);
+    expect(restored.retrieval.providers.find((provider) => provider.id === "arxiv")?.orderIndex).toBe(1);
+    const after = (await get("/api/research/settings")).body as unknown as SettingsShape;
+    expect(after.retrieval.providers.every((provider) => provider.enabled)).toBe(true);
+  });
+
+  it("keeps the protection that a save cannot switch every provider off, and that a stale write loses", async () => {
+    const current = (await get("/api/research/settings")).body as unknown as SettingsShape;
+    const empty = await patch("/api/research/settings", { expectedRevision: current.revision, providers: [] });
+    expect(empty.status).toBe(409);
+    expect(JSON.stringify(empty.body)).toContain("至少要保留一个检索来源");
+    const stillThere = (await get("/api/research/settings")).body as unknown as SettingsShape;
+    expect(stillThere.retrieval.order.length).toBeGreaterThan(0);
+    expect(stillThere.revision).toBe(current.revision);
+
+    const stale = await patch("/api/research/settings", { expectedRevision: current.revision - 1, providers: ["openalex"] });
+    expect(stale.status).toBe(409);
+  });
+
+  it("states enablement, order and health as three separate facts", async () => {
+    const settings = (await get("/api/research/settings")).body as unknown as SettingsShape;
+    const byId = new Map(settings.capabilities.map((capability) => [capability.id, capability]));
+
+    // A provider capability carries its own enablement and its place in the
+    // order — read from the order in force rather than assumed.
+    const enabledId = settings.retrieval.order[0] ?? "";
+    const active = byId.get(enabledId);
+    expect(active?.enabled).toBe(true);
+    expect(active?.orderIndex).toBe(0);
+    expect(active?.health?.status).toBe("not_checked");
+    expect(active?.health?.checkedAt).toBeNull();
+    // Every provider capability matches the catalogue entry of the same id.
+    for (const provider of settings.retrieval.providers) {
+      expect(byId.get(provider.id)?.enabled).toBe(provider.enabled);
+      expect(byId.get(provider.id)?.orderIndex).toBe(provider.orderIndex);
+    }
+
+    // A capability that is not a switch says so with null, not with false.
+    const upload = byId.get("upload-markdown");
+    expect(upload?.enabled).toBeNull();
+    expect(upload?.orderIndex).toBeNull();
+    // And one that needs no network has no health to report.
+    expect(upload?.health).toBeNull();
+
+    // MinerU has an explicit check; nothing has run it in this test, so its
+    // health is "not checked" — never "available" because it is implemented.
+    const convert = byId.get("convert-document");
+    expect(convert?.status).toBe("not_checked");
+    expect(convert?.health?.status).toBe("not_checked");
+    expect(convert?.health?.checkedAt).toBeNull();
+    expect(convert?.enabled).toBeNull();
+
+    // Nothing in the document claims a provider was probed.
+    expect(settings.retrieval.providers.every((provider) => provider.health.status === "not_checked")).toBe(true);
+    expect(settings.retrieval.providers.every((provider) => provider.health.checkedAt === null)).toBe(true);
+  });
+
+  it("does not probe anything to answer a page load", async () => {
+    // A settings read is a read: the snapshot it returns is the one it already
+    // had, and a provider's health stays unobserved across it.
+    const first = (await get("/api/research/settings")).body as unknown as SettingsShape;
+    const second = (await get("/api/research/settings")).body as unknown as SettingsShape;
+    expect(second.revision).toBe(first.revision);
+    expect(second.retrieval.providers.map((provider) => provider.health)).toEqual(first.retrieval.providers.map((provider) => provider.health));
   });
 });

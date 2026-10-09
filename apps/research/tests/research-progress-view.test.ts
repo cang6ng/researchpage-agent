@@ -72,6 +72,12 @@ function render(overrides: Partial<ResearchProgressProps> = {}): string {
   const props: ResearchProgressProps = {
     progress: progress(),
     attempt: { number: 2, startedAt: "2026-10-09T10:30:00.000Z", searches: 3, reads: 2, gapRounds: 1, reason: "用户确认任务后开始研究" },
+    // The durations the server states: research still in flight, no report
+    // attempt yet. A case about a frozen duration overrides these.
+    timing: {
+      research: { startedAt: "2026-10-09T10:30:00.000Z", endedAt: null, state: "running" },
+      report: { startedAt: null, endedAt: null, state: "idle" },
+    },
     discovery: {
       attemptedRequests: 4,
       successfulRequests: 3,
@@ -255,6 +261,48 @@ describe("what the panel must never say", () => {
   it("does not claim a stage list it was not given", () => {
     const markup = render({ progress: progress({ completedStages: [] }) });
     expect(markup).not.toContain("已完成过的阶段");
+  });
+});
+
+describe("the elapsed time a reader sees", () => {
+  const ten = "2026-10-09T10:00:00.000Z";
+  const tenTwo = "2026-10-09T10:02:00.000Z";
+  const tenFive = "2026-10-09T10:05:00.000Z";
+
+  it("shows a finished pass as its own duration, and keeps showing it", () => {
+    const finished = render({
+      timing: { research: { startedAt: ten, endedAt: tenTwo, state: "ended" }, report: { startedAt: null, endedAt: null, state: "idle" } },
+    });
+    expect(finished).toContain("2 分钟");
+    // The same record read again an hour later is the same sentence: the
+    // component never adds the current time to a term that has ended.
+    const reread = render({
+      timing: { research: { startedAt: ten, endedAt: tenTwo, state: "ended" }, report: { startedAt: null, endedAt: null, state: "idle" } },
+    });
+    expect(reread).toBe(finished);
+  });
+
+  it("names the report's own duration separately", () => {
+    const markup = render({
+      timing: { research: { startedAt: ten, endedAt: tenTwo, state: "ended" }, report: { startedAt: tenTwo, endedAt: tenFive, state: "ended" } },
+    });
+    expect(markup).toContain('data-testid="summary-report-elapsed"');
+    expect(markup).toContain("3 分钟");
+  });
+
+  it("says it cannot tell rather than inventing an end", () => {
+    const markup = render({
+      timing: { research: { startedAt: ten, endedAt: null, state: "unknown" }, report: { startedAt: null, endedAt: null, state: "idle" } },
+    });
+    expect(markup).toContain("无法确定");
+    expect(markup).not.toMatch(/已用时[^<]*分钟/);
+  });
+
+  it("reads the current time only while something is running", () => {
+    const running = render({
+      timing: { research: { startedAt: new Date(Date.now() - 60_000).toISOString(), endedAt: null, state: "running" }, report: { startedAt: null, endedAt: null, state: "idle" } },
+    });
+    expect(running).toMatch(/不到 1 分钟|1 分钟/);
   });
 });
 

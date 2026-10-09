@@ -27,13 +27,23 @@ import type {
   GrantOrigin,
   GuideTarget,
   MatrixCell,
+  Refusal,
+  ReportGenerationFailure,
+  ReportGenerationState,
   ReportTask,
   ResearchProgressStage,
   ResearchRunRecord,
   ResearchService,
   ResearchStage,
 } from "@every-dagent/plugin-research";
-import { createFailureLedger, unclassifiedFailure, type FailureLedger, type SafeFailure } from "./model-failures.js";
+import {
+  ABORTED_FAILURE,
+  INTERRUPTED_FAILURE,
+  createFailureLedger,
+  unclassifiedFailure,
+  type FailureLedger,
+  type SafeFailure,
+} from "./model-failures.js";
 import {
   EDIT_RESEARCH_BUDGET,
   GUIDE_MAX_DECISIONS,
@@ -66,6 +76,16 @@ export interface ResearchRunnerOptions {
   readonly stageTimeoutMs?: number;
   /** Called when the runner wants to export the report the moment it exists. */
   readonly exportPdf?: (taskId: string) => Promise<{ readonly ok: boolean; readonly failure?: string }>;
+  /**
+   * Opens a fresh session, for a task stage whose own session is blocked.
+   *
+   * A session whose run was interrupted by a process that died is blocked by
+   * the host — it cannot know whether that run had produced effects, and that
+   * is the right answer for a *conversation*. It is the wrong answer for a
+   * project: a report does not live in a session, and a refused session would
+   * leave a reader with material, a draft, and no way ever to finish them.
+   */
+  readonly createSession?: () => Promise<string>;
   readonly log?: (message: string) => void;
 }
 
@@ -120,7 +140,7 @@ export interface ResearchRunner {
   /** One targeted round at the current gaps. */
   startGapRound(taskId: string): void;
   /** Write and save the report. */
-  startReport(taskId: string): void;
+  startReport(taskId: string): ReportGenerationState | Refusal | undefined;
   /**
    * Whether this task already has a report pass in flight.
    *
@@ -130,6 +150,17 @@ export interface ResearchRunner {
    * first one's work.
    */
   hasReportWork(taskId: string): boolean;
+  /**
+   * Whether this task's automatic research pass still has work in flight.
+   *
+   * It is not a second name for「这个项目正忙」: an Ask, an Edit, a report
+   * recovery and a user-initiated补查 are all work on the same project, and
+   * none of them is the research pass. What this answers is whether the pass
+   * itself — the stage that searches, reads and assesses, and the gap rounds it
+   * decides on — is still running or waiting, which is what tells a reader
+   * whether the research clock is still ticking.
+   */
+  hasResearchWork(taskId: string): boolean;
   /**
    * Asks the assistant something, or asks it for a scoped edit.
    *
@@ -149,11 +180,18 @@ export interface ResearchRunner {
    * task that already has a report does not get a new one written at the end:
    * the material changes, the report is marked for review, and its text and
    * hash stay exactly as they were.
+   *
+   * It refuses, rather than queues, while the brief is unconfirmed: this is the
+   * entrance to the research pipeline, and that pipeline can end in a report
+   * written on a card the user never agreed to.
    */
   startResearchAction(
     taskId: string,
     input: { readonly text: string; readonly reading: string; readonly allowResearch?: boolean },
-  ): { readonly intent: "research"; readonly scope: string; readonly actionBudget: ActionBudgetView } | undefined;
+  ):
+    | { readonly intent: "research"; readonly scope: string; readonly actionBudget: ActionBudgetView }
+    | (Refusal & { readonly reason: "brief_unconfirmed" })
+    | undefined;
   /** Marks records left `running` by a previous process as interrupted. */
   reconcileInterrupted(): void;
   /**
@@ -230,6 +268,28 @@ interface StageRequest {
    * can show the collaboration as it happened rather than as a prompt.
    */
   readonly userText?: string;
+  /**
+   * The report attempt this stage belongs to.
+   *
+   * Both report stages belong to one attempt at producing a report, and the id
+   * travels with the request so every write it makes is checked against the
+   * attempt that is current — a stage queued before a recovery cannot move the
+   * attempt the recovery opened.
+   */
+  readonly generationAttemptId?: string;
+  /**
+   * How many automatic retries this *request* has already spent.
+   *
+   * Counted per request, not per stage record: what a retry needs to know is how
+   * many times **this ask** has been tried, and historical stage attempts say
+   * nothing about that — a project with three old failed passes would look
+   * exhausted, and a fresh request on the same stage would never retry once.
+   */
+  readonly retryAttempt?: number;
+  /** The instant this request's own deadline was fixed; a retry keeps it. */
+  readonly deadlineAt?: number;
+  /** Not before this instant: how a retry waits out its backoff. */
+  readonly notBeforeMs?: number;
 }
 
 const STAGE_LABELS: Readonly<Record<ResearchStage, string>> = Object.freeze({
@@ -248,6 +308,25 @@ const STAGE_LABELS: Readonly<Record<ResearchStage, string>> = Object.freeze({
 function stageLabel(stage: ResearchStage): string {
   return STAGE_LABELS[stage] ?? stage;
 }
+
+/**
+ * The answer every door into research gives while the brief is unconfirmed.
+ *
+ * Confirmation is the user's decision about *what* is being studied — the
+ * subjects, the dimensions, the scope — and research aims real queries at that
+ * decision. The pipeline behind a research pass can also end in a report, so a
+ * project nobody has confirmed must not enter it at all: the refusal is at the
+ * entrance rather than somewhere in the middle. `/report` has answered this way
+ * from the start; a user's own「补查」is the other door into the same pipeline,
+ * and it answers with the same word so the workspace can point at the brief.
+ */
+const BRIEF_UNCONFIRMED: Refusal & { readonly reason: "brief_unconfirmed" } = Object.freeze({
+  ok: false,
+  conflict: true,
+  reason: "brief_unconfirmed",
+  problems: ["这个项目的研究简报还没有确认，研究不会开始"],
+  guidance: "请先在项目页确认研究简报；确认后研究与报告都会基于你确认过的对象与范围进行。",
+});
 
 /** The reader-facing stage one internal stage run belongs to. */
 function progressStageOf(stage: ResearchStage): ResearchProgressStage {
@@ -788,10 +867,112 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     }
   }
 
-  function enqueue(request: StageRequest): void {
-    if (stopping) return;
+  function enqueue(request: StageRequest): boolean {
+    if (stopping) return false;
     queue.push(request);
     pump();
+    return true;
+  }
+
+  /**
+   * How long a retry waits before it is tried again.
+   *
+   * One second is the product's own answer to a rate limit that came without a
+   * `Retry-After`: long enough not to hit the same limit immediately, short
+   * enough that a reader watching the progress view sees a second attempt rather
+   * than a stall.
+   */
+  const RETRY_DELAY_MS = 1_000;
+  /**
+   * The longest wait a retry will honour.
+   *
+   * A provider that asks for longer than this is not asking for a retry — it is
+   * asking the caller to come back later, and a pipeline that sits on a thirty
+   * second wait while holding the queue is worse for the reader than an honest
+   * failure they can resume.
+   */
+  const MAX_RETRY_DELAY_MS = 30_000;
+  /** How often the queue re-checks a retry that is still waiting. */
+  const QUEUE_POLL_MS = 250;
+  /**
+   * The session each project's work runs in, when its own session is blocked.
+   *
+   * One carrier per project, kept for this process's lifetime: the session a
+   * stage opened is as good for the next stage as for the one that needed it,
+   * and opening one per stage would leave a trail of empty sessions.
+   */
+  const stageSessions = new Map<string, string>();
+
+  /**
+   * The session a stage runs in.
+   *
+   * A task stage normally runs in the task's own session. The exception is a
+   * session the host left blocked: a run interrupted by a process that died
+   * leaves the session unusable, because the host cannot tell whether that run
+   * had already produced effects. That is the right answer for a conversation
+   * and the wrong one for a project — a report does not live in a session — so
+   * a task stage opens a session of its own and carries the work there.
+   *
+   * The fallback is deliberately limited to task stages. A card or an intent
+   * turn *is* the session's conversation: moving it somewhere else would answer
+   * a question the user never asked, in a history they cannot see.
+   */
+  async function stageSessionOf(request: StageRequest): Promise<string> {
+    if (request.taskId === null || options.createSession === undefined) return request.sessionId;
+    const taskId = request.taskId;
+    // A carrier this runner already opened for the project is reused: one
+    // blocked session should not cost a new one per stage.
+    const carried = stageSessions.get(taskId);
+    if (carried !== undefined) return carried;
+    let blocked = false;
+    try {
+      const session = await client.sessions.get({ sessionId: request.sessionId });
+      blocked = session.session.status === "blocked";
+    } catch {
+      // A session this runner cannot read is not a verdict about it: the stage
+      // runs where it was asked to run, and the host answers for itself.
+      return request.sessionId;
+    }
+    if (!blocked) return request.sessionId;
+    try {
+      const fresh = await options.createSession();
+      // The project has to be reachable from the session the work really runs
+      // in: the tools resolve their task from the session, so the adoption is
+      // what makes the stage able to write at all.
+      service.adoptSessionForTask(taskId, fresh);
+      stageSessions.set(taskId, fresh);
+      log(`[runner] session ${request.sessionId} is blocked; ${taskId} continues in a session of its own`);
+      return fresh;
+    } catch {
+      return request.sessionId;
+    }
+  }
+
+  /** Whether a stage of the given kinds for this task is running or waiting. */
+  function stageInFlight(taskId: string, stages: readonly ResearchStage[]): boolean {
+    const matches = (request: StageRequest | undefined): boolean =>
+      request?.taskId === taskId && stages.includes(request.stage);
+    if (matches(activeRequest)) return true;
+    return queue.some((request) => matches(request));
+  }
+
+  function hasReportWorkFor(taskId: string): boolean {
+    return stageInFlight(taskId, ["report", "synthesis"]);
+  }
+
+  /**
+   * Whether the automatic research pass of this task has work in flight.
+   *
+   * The pass itself, and the rounds it decided on — not the user's own 补查,
+   * which carries their sentence and is an instruction rather than the pass.
+   */
+  function hasResearchWorkFor(taskId: string): boolean {
+    const matches = (request: StageRequest | undefined): boolean =>
+      request?.taskId === taskId &&
+      (request.stage === "research" || request.stage === "gap") &&
+      request.userText === undefined;
+    if (matches(activeRequest)) return true;
+    return queue.some((request) => matches(request));
   }
 
   function pump(): void {
@@ -799,9 +980,19 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       settleIdle();
       return;
     }
-    const request = queue.shift() as StageRequest;
-    activeRequest = request;
-    active = execute(request).finally(() => {
+    const next = queue[0] as StageRequest;
+    const waitMs = (next.notBeforeMs ?? 0) - Date.now();
+    if (waitMs > 0) {
+      // A retry waits without occupying the runner: the queue stays visible,
+      // `idle()` still means "something is pending", and a shutdown clears the
+      // queue the same way it clears any other pending work.
+      const timer = setTimeout(pump, Math.min(waitMs, QUEUE_POLL_MS));
+      timer.unref?.();
+      return;
+    }
+    queue.shift();
+    activeRequest = next;
+    active = execute(next).finally(() => {
       active = undefined;
       activeRequest = undefined;
       pump();
@@ -911,8 +1102,13 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     // Both report stages belong to one attempt at producing the report, and
     // that attempt has to exist before either runs: it is what says the report
     // is being written, and what bounds the repair pass a refusal may spend.
+    // A stage that arrived without one — the automatic pipeline's first report,
+    // or a recovery whose attempt was opened by the request — adopts the current
+    // attempt here, so every write it makes is checked against one identity.
+    let attemptId = request.generationAttemptId;
     if (request.taskId !== null && (request.stage === "report" || request.stage === "synthesis")) {
-      ensureReportAttempt(request.stage, request.taskId);
+      const opened = ensureReportAttempt(request.stage, request.taskId);
+      if (attemptId === undefined) attemptId = opened?.attemptId;
     }
 
     if (request.taskId !== null && task !== undefined) {
@@ -928,18 +1124,32 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
 
     // The permission this run acts under, minted here and nowhere earlier: the
     // stage decides what the run may write, not the model and not the prompt.
-    service.issueGrant({
-      sessionId: request.sessionId,
-      intent: request.grant.intent,
-      taskId: request.taskId,
-      targetType: request.grant.targetType,
-      targetId: request.grant.targetId,
-      scope: request.grant.scope,
-      allowResearch: request.grant.allowResearch,
-      ...(request.grant.origin === undefined ? {} : { origin: request.grant.origin }),
-      ...(request.grant.budget === undefined ? {} : { budget: request.grant.budget }),
-      ...(task === undefined || task.currentReportId === null ? {} : { baseReportId: task.currentReportId }),
-    });
+    //
+    // Which session it is minted for is decided here too. A project stage runs
+    // in the task's own session, unless that session was left *blocked* by a
+    // host that cannot know whether an interrupted run had produced effects —
+    // in which case a fresh session carries the work, because the project is
+    // the object and its report is not something a session owns.
+    const sessionId = await stageSessionOf(request);
+    const grantFor = (session: string): void => {
+      service.issueGrant({
+        sessionId: session,
+        intent: request.grant.intent,
+        taskId: request.taskId,
+        targetType: request.grant.targetType,
+        targetId: request.grant.targetId,
+        scope: request.grant.scope,
+        allowResearch: request.grant.allowResearch,
+        ...(request.grant.origin === undefined ? {} : { origin: request.grant.origin }),
+        ...(request.grant.budget === undefined ? {} : { budget: request.grant.budget }),
+        ...(task === undefined || task.currentReportId === null ? {} : { baseReportId: task.currentReportId }),
+      });
+    };
+    grantFor(sessionId);
+    // A stage carried into another session grants there *and* in the task's own
+    // session: the run needs the first, and every write the service authorizes
+    // is checked against the second — the session the project belongs to.
+    if (task !== undefined && sessionId !== task.sessionId) grantFor(task.sessionId);
 
     // Only a stage that belongs to a task is recorded as one of its runs: the
     // card stage runs before the task exists, and the workspace reads its
@@ -970,10 +1180,24 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     // only when it was recorded *during* this stage. A stale entry is never
     // attributed to a later run.
     const startedAtMs = Date.now();
-    let runId: string;
+    const readsBefore = request.taskId === null ? 0 : readSourceCount(request.taskId);
+    let runFailed = false;
+    let stageFailure: SafeFailure | null = null;
+    // A retry inherits the deadline the original request was given: two attempts
+    // at one stage are still one stage's worth of time, and a retry that reset
+    // the clock would let a failing provider hold a project open indefinitely.
+    const deadline = request.deadlineAt ?? Date.now() + stageTimeoutMs;
+    // A run that never starts is a stage that failed, not a stage that never
+    // happened: the host can refuse to open a run — a store that will not write,
+    // a session it rejects, a process already stopping — and the stage's own
+    // records have to end the same way they end for any other failure. What it
+    // must not do is leave behind the two things only this function can close: a
+    // grant that is still live for a run that does not exist, and a generation
+    // attempt left `running` with nobody to finish it.
+    let runId: string | null = null;
     try {
       const started = await client.runs.start({
-        sessionId: request.sessionId,
+        sessionId,
         submissionId: newId(ID_PREFIX.submission),
         text: request.instruction,
       });
@@ -987,101 +1211,158 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
       const reason = error instanceof Error ? error.message : "启动运行失败";
       finish({ status: "failed", note: `${stageLabel(request.stage)}：启动失败 — ${reason}` });
       log(`[runner] ${request.stage} could not start: ${reason}`);
-      return;
+      runFailed = true;
+      stageFailure = unclassifiedFailure();
     }
 
-    const readsBefore = request.taskId === null ? 0 : readSourceCount(request.taskId);
-    let runFailed = false;
-    let stageFailure: SafeFailure | null = null;
-    const deadline = Date.now() + stageTimeoutMs;
-    for (;;) {
-      await new Promise((resolve) => {
-        setTimeout(resolve, 400);
-      });
-      const state = runSettled(runId);
-      if (record !== undefined) {
-        // A run's live timeline disappears when it settles, so the last poll of
-        // a finished run reads nothing. What it did is the whole point of the
-        // record: keep the transcript that was read while it was still there.
-        const transcript = transcriptOf(runId);
-        if (transcript.length > 0) record = { ...record, activity: transcript };
-        service.recordRun(record);
-      }
-      if (state.settled) {
-        runFailed = state.status !== "completed";
-        // What the action resolved is a fact about this action, and it is read
-        // here — while its grant is still live — so later material can never
-        // change what an earlier action is said to have answered.
-        const outcome =
-          request.userText === undefined ? undefined : service.actionOutcomeOf(request.sessionId, request.userText);
-        // A failed stage is reported in the product's own safe vocabulary: the
-        // category comes from the model layer's record of what it saw, never
-        // from the host's masked answer, which deliberately says nothing.
-        stageFailure =
-          state.status === "completed" ? null : (failures.read(request.sessionId, startedAtMs) ?? unclassifiedFailure());
-        const note =
-          state.status === "completed"
-            ? `${stageLabel(request.stage)}：完成`
-            : stageFailure === null
-              ? `${stageLabel(request.stage)}：${state.error ?? state.status}`
-              : `${stageLabel(request.stage)}：失败 — ${stageFailure.problem}`;
-        finish({
-          status: state.status === "completed" ? "completed" : "failed",
-          note,
-          endedAt: new Date().toISOString(),
-          ...(outcome === undefined ? {} : { outcome }),
-        });
-        if (request.taskId !== null) {
-          const settled = service.getTask(request.taskId);
-          const running = settled !== undefined && settled.status !== "failed";
-          if (state.status === "completed" && running) {
-            service.recordActivity({
-              taskId: request.taskId,
-              kind: "stage_completed",
-              message: note,
-              stage: progressStageOf(request.stage),
+    if (runId !== null) {
+      try {
+        for (;;) {
+          await new Promise((resolve) => {
+            setTimeout(resolve, 400);
+          });
+          const state = runSettled(runId);
+          if (record !== undefined) {
+            // A run's live timeline disappears when it settles, so the last poll of
+            // a finished run reads nothing. What it did is the whole point of the
+            // record: keep the transcript that was read while it was still there.
+            const transcript = transcriptOf(runId);
+            if (transcript.length > 0) record = { ...record, activity: transcript };
+            service.recordRun(record);
+          }
+          if (state.settled) {
+            runFailed = state.status !== "completed";
+            // What the action resolved is a fact about this action, and it is read
+            // here — while its grant is still live — so later material can never
+            // change what an earlier action is said to have answered.
+            const outcome =
+              request.userText === undefined ? undefined : service.actionOutcomeOf(sessionId, request.userText);
+            // A failed stage is reported in the product's own safe vocabulary: the
+            // category comes from the model layer's record of what it saw, never
+            // from the host's masked answer, which deliberately says nothing.
+            stageFailure =
+              state.status === "completed" ? null : (failures.read(sessionId, startedAtMs) ?? unclassifiedFailure());
+            const note =
+              state.status === "completed"
+                ? `${stageLabel(request.stage)}：完成`
+                : stageFailure === null
+                  ? `${stageLabel(request.stage)}：${state.error ?? state.status}`
+                  : `${stageLabel(request.stage)}：失败 — ${stageFailure.problem}`;
+            finish({
+              status: state.status === "completed" ? "completed" : "failed",
+              note,
+              endedAt: new Date().toISOString(),
+              ...(outcome === undefined ? {} : { outcome }),
             });
+            if (request.taskId !== null) {
+              const settled = service.getTask(request.taskId);
+              const running = settled !== undefined && settled.status !== "failed";
+              if (state.status === "completed" && running) {
+                service.recordActivity({
+                  taskId: request.taskId,
+                  kind: "stage_completed",
+                  message: note,
+                  stage: progressStageOf(request.stage),
+                });
+              }
+            }
+            break;
+          }
+          if (Date.now() > deadline) {
+            try {
+              await client.runs.cancel({ runId });
+            } catch {
+              // The run may have settled between the check and the cancel.
+            }
+            runFailed = true;
+            finish({ status: "failed", note: `${stageLabel(request.stage)}：超时后已取消` });
+            log(`[runner] ${request.stage} timed out and was cancelled`);
+            break;
           }
         }
-        break;
-      }
-      if (Date.now() > deadline) {
+      } catch (error) {
+        // Polling can throw — a snapshot read, a record write, a cancel. A stage
+        // whose own bookkeeping failed is a stage that did not complete, and it is
+        // recorded as such instead of leaving a run record `running` forever.
+        const reason = error instanceof Error ? error.message : "结束时读取运行状态失败";
+        runFailed = true;
+        stageFailure = failures.read(sessionId, startedAtMs) ?? unclassifiedFailure();
+        finish({ status: "failed", note: `${stageLabel(request.stage)}：失败 — ${reason}` });
+        log(`[runner] ${request.stage} could not be followed to its end: ${reason}`);
         try {
           await client.runs.cancel({ runId });
         } catch {
-          // The run may have settled between the check and the cancel.
-        }
-        runFailed = true;
-        finish({ status: "failed", note: `${stageLabel(request.stage)}：超时后已取消` });
-        log(`[runner] ${request.stage} timed out and was cancelled`);
-        break;
-      }
-    }
-
-    if (runFailed) {
-      if (request.taskId === null) {
-        const key = request.intentId === undefined ? request.sessionId : `intent:${request.intentId}`;
-        const attempts = (tasklessAttempts.get(key) ?? 0) + 1;
-        tasklessAttempts.set(key, attempts);
-        if (attempts < 2) {
-          log(`[runner] retrying ${request.stage} once for session ${request.sessionId}`);
-          enqueue(request);
-          return;
-        }
-      } else {
-        const tally = stageAttempts(request.taskId, request.stage, service.getTask(request.taskId)?.attempt?.startedAt);
-        if (tally.failures === 1 && tally.attempts === 1) {
-          log(`[runner] retrying ${request.stage} once for task ${request.taskId}`);
-          enqueue(request);
-          return;
+          // Best effort: the run may already have settled.
         }
       }
     }
 
-    // The action is over, so the permission it carried is over too: a later run
-    // gets its own grant, and nothing that is still settling can keep writing.
-    if (!runFailed) service.clearGrant(request.sessionId);
-    await afterStage(request, readsBefore, runFailed, stageFailure);
+    // The run is over, so the permission it carried is over too: it is released
+    // here, on every path — completed, failed, timed out, or about to be retried
+    // — and a retry mints its own grant when it starts. Nothing that is still
+    // settling under this one can keep writing.
+    service.clearGrant(sessionId);
+    if (task !== undefined && sessionId !== task.sessionId) service.clearGrant(task.sessionId);
+
+    const retry = request.taskId === null ? tasklessRetryOf(request, runFailed, stageFailure) : retryOf(request, runFailed, stageFailure, deadline);
+    if (retry !== undefined && enqueue(retry)) {
+      log(`[runner] retrying ${request.stage} once for ${request.taskId ?? request.sessionId}`);
+      return;
+    }
+
+    await afterStage(request, readsBefore, runFailed, stageFailure, attemptId);
+  }
+
+  /**
+   * The one automatic retry a request is allowed, when the failure deserves it.
+   *
+   * Only a failure the model layer established as retryable earns one — a rate
+   * limit or a service that is temporarily unavailable — and only once per
+   * request. Everything else stops here: a payment problem, a credential
+   * problem, a cancellation and an unknown cause are all failures that a second
+   * identical request cannot fix, and spending that request is spending the
+   * reader's money to learn nothing.
+   *
+   * The wait is the provider's own when it asked for one in a number, capped:
+   * a request for more than half a minute is not a backoff this stage will sit
+   * on, and a wait that would run past the stage's own deadline is not a retry
+   * this stage has time for. Both cases stop rather than clamp, because retrying
+   * sooner than the provider asked is how a rate limit becomes a ban.
+   */
+  function retryOf(
+    request: StageRequest,
+    runFailed: boolean,
+    failure: SafeFailure | null,
+    deadline: number,
+  ): StageRequest | undefined {
+    if (!runFailed || stopping) return undefined;
+    if (failure === null || !failure.retryable) return undefined;
+    if ((request.retryAttempt ?? 0) >= 1) return undefined;
+    const waitMs = failure.retryAfterMs ?? RETRY_DELAY_MS;
+    if (waitMs > MAX_RETRY_DELAY_MS) return undefined;
+    if (deadline - Date.now() <= waitMs) return undefined;
+    return {
+      ...request,
+      retryAttempt: (request.retryAttempt ?? 0) + 1,
+      deadlineAt: deadline,
+      notBeforeMs: Date.now() + waitMs,
+    };
+  }
+
+  /**
+   * The same policy for the stages that have no task yet.
+   *
+   * A card and an intent turn cannot be counted from run records, so their one
+   * retry is counted on the request itself, exactly like the task stages'. What
+   * it replaced was a counter keyed by session, which an unrelated later failure
+   * could exhaust on a stage that had never been tried.
+   */
+  function tasklessRetryOf(
+    request: StageRequest,
+    runFailed: boolean,
+    failure: SafeFailure | null,
+  ): StageRequest | undefined {
+    return retryOf(request, runFailed, failure, Number.POSITIVE_INFINITY);
   }
 
   /**
@@ -1147,30 +1428,6 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
   }
 
   /**
-   * How many times a stage has been tried *in the current attempt*, and whether
-   * it already failed before.
-   *
-   * A real provider occasionally fails a request for reasons that have nothing
-   * to do with this product — a transient error, a momentary rate limit. The
-   * bounded answer is one retry per stage, counted from the records the runner
-   * itself wrote, so a demo that hits a hiccup recovers by itself and a stage
-   * that is failing for a real reason stops after the second attempt. The
-   * count is scoped to the attempt for the same reason the budget is: a retry
-   * is a new pass, and it deserves its own one.
-   */
-  function stageAttempts(
-    taskId: string,
-    stage: ResearchStage,
-    since?: string,
-  ): { readonly attempts: number; readonly failures: number } {
-    const records = service.runsOf(taskId).filter((record) => record.stage === stage && (since === undefined || record.startedAt >= since));
-    return {
-      attempts: records.length,
-      failures: records.filter((record) => record.status === "failed" || record.status === "interrupted").length,
-    };
-  }
-
-  /**
    * How many repair passes one report attempt may spend.
    *
    * One. A repair is aimed at a specific objection, and a second pass at the
@@ -1180,20 +1437,43 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
   const MAX_REPORT_REPAIRS = 1;
 
   /**
-   * Opens the report attempt this stage belongs to, when none is open.
+   * The report attempt this stage belongs to, opened when none is open.
    *
    * The automatic pipeline reaches report and synthesis without going through
    * the button, so nothing else would open one — and without an attempt there is
    * no place to record which objection a repair already answered, which is what
    * bounded it. An explicit request opens its own attempt first (it counts a
    * resumption and clears a previous failure); this only covers the path that
-   * has no request behind it.
+   * has no request behind it, and it answers with the attempt that is current
+   * whichever path opened it.
+   *
+   * A terminal attempt is returned, not replaced: a pass that already failed
+   * must not be reopened by a stage that was queued before the failure, and the
+   * caller's writes are then checked against that attempt and refused.
    */
-  function ensureReportAttempt(stage: "report" | "synthesis", taskId: string): void {
+  function ensureReportAttempt(stage: "report" | "synthesis", taskId: string): ReportGenerationState | undefined {
     const task = service.getTask(taskId);
-    if (task === undefined || task.currentReportId !== null) return;
-    if (task.reportGeneration !== undefined && task.reportGeneration !== null) return;
-    service.beginReportGeneration(taskId, { stage, resume: task.reportDraft !== null });
+    if (task === undefined || task.currentReportId !== null) return undefined;
+    const existing = task.reportGeneration ?? null;
+    if (existing !== null) {
+      // A report attempt that failed before this research pass began belongs to
+      // the pass before it. The user asked for the research again, and the
+      // report that comes out of the new material is a new attempt — reusing
+      // the failed record would report yesterday's reason for today's work.
+      const attemptStart = task.attempt?.startedAt ?? null;
+      const superseded = existing.status === "failed" && attemptStart !== null && attemptStart > existing.startedAt;
+      if (!superseded) {
+        // A later stage of an open attempt moves the attempt's own stage along
+        // — from draft_saved to running — without restarting it: the clock and
+        // the resumption count belong to the attempt, not to the stage in it.
+        if (existing.status === "draft_saved" && existing.stage !== stage) {
+          return service.recordReportStage(taskId, { status: "running", stage }) ?? existing;
+        }
+        return existing;
+      }
+    }
+    const opened = service.beginReportGeneration(taskId, { stage, resume: task.reportDraft !== null });
+    return "attemptId" in opened ? opened : undefined;
   }
 
   /**
@@ -1351,6 +1631,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     readsBefore: number,
     runFailed: boolean,
     failure: SafeFailure | null,
+    attemptId: string | undefined,
   ): Promise<void> {
     // The conversation stage is examined before the task guard below: it runs
     // before any task exists, which is exactly why its outcome needs looking at.
@@ -1382,17 +1663,19 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         // A task that already has a report is never re-written by research:
         // the material changes, the report is flagged, and the text stays.
         if (task.currentReportId !== null) return;
+        // A pass that ended because the model service did not answer is not a
+        // pass that should go on to write a report: the next stage would spend
+        // another request against the same wall, and the reader would be told
+        // about a report failure instead of the provider failure that caused it.
+        if (runFailed && modelDidNotAnswer(failure)) {
+          service.failTask(task.id, `${failure?.problem ?? ""} ${failure?.guidance ?? ""}`.trim());
+          return;
+        }
         const gaps = task.matrix.filter((cell) => needsAttention(cell.status));
         if (runFailed) {
           // A stage that ended in an error does not get to spend another round:
           // whatever was read is written up honestly, gaps included.
-          enqueue({
-            taskId: task.id,
-            sessionId,
-            stage: "report",
-            instruction: stageInstruction({ stage: "report", task }),
-            grant: STAGE_GRANTS.report,
-          });
+          enqueueReportStage({ taskId: task.id, sessionId, reason: "research" });
           return;
         }
         if (gaps.length > 0 && gapStagesSoFar(task.id, task.attempt?.startedAt) < task.budget.maxGapRounds) {
@@ -1405,13 +1688,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           });
           return;
         }
-        enqueue({
-          taskId: task.id,
-          sessionId,
-          stage: "report",
-          instruction: stageInstruction({ stage: "report", task, documents: taskDocumentsOf(task.id) }),
-          grant: STAGE_GRANTS.report,
-        });
+        enqueueReportStage({ taskId: task.id, sessionId, reason: "research" });
         return;
       }
       case "gap": {
@@ -1420,6 +1697,10 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         // Same rule as above:补查 on a task that has a report ends with the
         // material, not with a new version of the report.
         if (refreshed.currentReportId !== null) return;
+        if (runFailed && modelDidNotAnswer(failure)) {
+          service.failTask(refreshed.id, `${failure?.problem ?? ""} ${failure?.guidance ?? ""}`.trim());
+          return;
+        }
         const gaps = refreshed.matrix.filter((cell) => needsAttention(cell.status));
         const budgetLeft = gapStagesSoFar(refreshed.id, refreshed.attempt?.startedAt) < refreshed.budget.maxGapRounds;
         // A round that read nothing new cannot have changed the matrix, so it
@@ -1435,13 +1716,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           });
           return;
         }
-        enqueue({
-          taskId: refreshed.id,
-          sessionId,
-          stage: "report",
-          instruction: stageInstruction({ stage: "report", task: refreshed, documents: taskDocumentsOf(refreshed.id) }),
-          grant: STAGE_GRANTS.report,
-        });
+        enqueueReportStage({ taskId: refreshed.id, sessionId, reason: "gap" });
         return;
       }
       case "report": {
@@ -1453,15 +1728,30 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
         // that deserves its own instruction rather than being the last paragraph
         // of whatever section happened to be open.
         if (settled.currentReportId === null) {
-          // A report stage that ended without a saved report is either a stage
-          // that failed outright or one that wrote sections and left the
-          // obligation to synthesis. Both are recorded, because the difference
-          // is the difference between「恢复报告」and「重试一次失败」.
-          service.recordReportStage(settled.id, {
-            stage: "synthesis",
-            status: runFailed ? "failed" : "draft_saved",
-            ...(runFailed ? { endedAt: new Date().toISOString(), failure } : {}),
-          });
+          if (runFailed) {
+            // The pass failed and no report came out of it: the attempt ends
+            // here. Queuing synthesis after a failed report stage is how a
+            // permanent provider failure came to cost two calls instead of one,
+            // and the second call could not have succeeded — there was nothing
+            // to synthesise.
+            service.recordReportStage(
+              settled.id,
+              { stage: "synthesis", status: "failed", endedAt: new Date().toISOString(), failure: publicFailure(failure) },
+              attemptId,
+            );
+            service.failTask(
+              settled.id,
+              failure === null
+                ? "报告阶段结束但没有保存有效报告；已有材料与草稿都保留着，可以用「使用现有资料恢复报告」继续，不需要重新检索。"
+                : `${failure.problem} ${failure.guidance}`,
+            );
+            return;
+          }
+          // A report stage that ended without a saved report but without
+          // failing wrote sections and left the obligation to synthesis. It is
+          // recorded as the draft it is, because the difference is the
+          // difference between「恢复报告」and「重试一次失败」.
+          service.recordReportStage(settled.id, { stage: "synthesis", status: "draft_saved" }, attemptId);
           enqueue({
             taskId: settled.id,
             sessionId,
@@ -1473,10 +1763,15 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
               documents: taskDocumentsOf(settled.id),
             }),
             grant: STAGE_GRANTS.synthesis,
+            ...(attemptId === undefined ? {} : { generationAttemptId: attemptId }),
           });
           return;
         }
-        service.recordReportStage(settled.id, { status: "validated", endedAt: new Date().toISOString(), failure: null });
+        service.recordReportStage(
+          settled.id,
+          { status: "validated", endedAt: new Date().toISOString(), failure: null },
+          attemptId,
+        );
         await afterReportSaved(settled);
         return;
       }
@@ -1500,11 +1795,15 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           // bounded, so it is not spent: the pipeline stops instead of looping.
           const canRepair =
             !runFailed && previous !== null && previous.repairs < MAX_REPORT_REPAIRS && previous.repairSignature !== signature;
-          const recorded = service.recordReportStage(settled.id, {
-            ...(canRepair
-              ? { status: "running" as const, repairs: previous.repairs + 1, repairSignature: signature }
-              : { status: "failed" as const, endedAt: new Date().toISOString(), failure, repairSignature: signature }),
-          });
+          const recorded = service.recordReportStage(
+            settled.id,
+            {
+              ...(canRepair
+                ? { status: "running" as const, repairs: previous.repairs + 1, repairSignature: signature }
+                : { status: "failed" as const, endedAt: new Date().toISOString(), failure: publicFailure(failure), repairSignature: signature }),
+            },
+            attemptId,
+          );
           if (canRepair && recorded !== undefined && recorded.repairs === previous.repairs + 1) {
             log(`[runner] repairing the report draft for ${settled.id}: ${obligations.slice(0, 3).join("；")}`);
             enqueue({
@@ -1519,6 +1818,7 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
                 repair: obligations.slice(0, 6),
               }),
               grant: STAGE_GRANTS.synthesis,
+              ...(attemptId === undefined ? {} : { generationAttemptId: attemptId }),
             });
             return;
           }
@@ -1530,11 +1830,123 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
           );
           return;
         }
-        service.recordReportStage(settled.id, { status: "validated", endedAt: new Date().toISOString(), failure: null });
+        service.recordReportStage(
+          settled.id,
+          { status: "validated", endedAt: new Date().toISOString(), failure: null },
+          attemptId,
+        );
         await afterReportSaved(settled);
         return;
       }
     }
+  }
+
+  /**
+   * Queues the report stage the pipeline decided on, opening its attempt first.
+   *
+   * The attempt is opened at the moment the work is queued — not when the stage
+   * starts — so「已受理」and「正在撰写」are two different facts from the first
+   * millisecond, exactly as they are for a request that came from the button. A
+   * report the reader has already asked for keeps its own queue and its own
+   * attempt: the pipeline joins the work in flight instead of opening a second
+   * generation beside it.
+   */
+  function enqueueReportStage(input: { readonly taskId: string; readonly sessionId: string; readonly reason: "research" | "gap" }): void {
+    const task = service.getTask(input.taskId);
+    if (task === undefined) return;
+    // The confirmation gate, checked before anything is opened or queued. The
+    // report is written on a card the user agreed to, and the automatic
+    // transition is the one path into it that no request stands behind — so
+    // here is where an unconfirmed project must stop: no attempt is opened, no
+    // stage is queued, and no report grant is ever minted for it.
+    //
+    // Stopping means stopping *readably*: the pass that led here is over, so
+    // the project is told what happened instead of being left「研究中」with
+    // nothing running and no way to see why the writing never began.
+    if (task.confirmedAt === null) {
+      log(`[runner] report stage refused for ${task.id}: the brief is not confirmed`);
+      service.failTask(
+        task.id,
+        "这个项目的研究简报还没有确认，报告阶段不会开始。请先确认研究简报；确认后可以重新研究，已经读到的材料都保留着。",
+      );
+      return;
+    }
+    if (hasReportWorkFor(input.taskId)) {
+      log(`[runner] report work is already in flight for ${input.taskId}; ${input.reason} does not queue a second one`);
+      return;
+    }
+    const request: StageRequest = {
+      taskId: input.taskId,
+      sessionId: input.sessionId,
+      stage: "report",
+      instruction: stageInstruction({ stage: "report", task, documents: taskDocumentsOf(input.taskId) }),
+      grant: STAGE_GRANTS.report,
+    };
+    const attempt = ensureReportAttempt("report", input.taskId);
+    const queued = enqueue(attempt === undefined ? request : { ...request, generationAttemptId: attempt.attemptId });
+    if (queued || attempt === undefined) return;
+    // The queue refused it (the process is stopping), so the attempt that was
+    // opened for it is closed here. An attempt left `running` with nobody to run
+    // it is the state the reader could not recover from.
+    service.recordReportStage(
+      input.taskId,
+      { status: "failed", endedAt: null, failure: publicFailure(ABORTED_FAILURE) },
+      attempt.attemptId,
+    );
+  }
+
+  /**
+   * Whether the failure means the model service itself did not answer.
+   *
+   * The distinction decides whether a pipeline continues. A truncated answer, a
+   * request that was too large or a tool argument that could not be parsed are
+   * all failures *of a request the model answered* — the next stage asks a
+   * different question and may well succeed. A payment refusal, a credential
+   * refusal, a rate limit, a service that is down, a cancellation and an
+   * unknown cause are the service not talking to us, and every later model stage
+   * would spend a request to learn the same thing.
+   *
+   * `run_failed` is the unknown one, and it belongs in the list for the same
+   * reason as the rest: a research pass whose failure nobody could classify is
+   * not a pass that gets to start writing. What it read is kept, the project is
+   * marked failed with the reason that was established, and writing the report
+   * afterwards is the reader's own decision —「使用现有资料恢复报告」exists for
+   * exactly that — instead of twenty more model calls spent learning that the
+   * provider is still not answering.
+   */
+  function modelDidNotAnswer(failure: SafeFailure | null): boolean {
+    return failure !== null && MODEL_UNREACHABLE_CODES.has(failure.code);
+  }
+
+  const MODEL_UNREACHABLE_CODES: ReadonlySet<string> = new Set([
+    "model_payment_required",
+    "model_authentication_failed",
+    "model_rate_limited",
+    "model_service_unavailable",
+    "model_aborted",
+    "model_request_failed",
+    "run_failed",
+  ]);
+
+  /**
+   * A failure, projected onto what a task's own record may hold.
+   *
+   * Built field by field: the category, the fixed code, the two sentences and
+   * whether retrying could work. The provider's own wait never travels into the
+   * record — it is a fact about one request, not about the report — and neither
+   * does anything else the classifier may carry later.
+   */
+  function publicFailure(failure: SafeFailure | null): ReportGenerationFailure {
+    if (failure === null) {
+      return { category: "runtime_unknown", code: "run_failed", problem: "这次运行失败了，但没有取得可安全分类的原因。", guidance: "可以在「研究状态」里查看活动详情，或直接重试；已读材料与草稿都保留着。", retryable: false };
+    }
+    return {
+      category: failure.category,
+      code: failure.code,
+      problem: failure.problem,
+      guidance: failure.guidance,
+      retryable: failure.retryable,
+    };
   }
 
   /** What happens once a validated report exists: export the PDF, and stop. */
@@ -1638,26 +2050,37 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     },
     startReport(taskId) {
       const task = service.getTask(taskId);
-      if (task === undefined) return;
+      if (task === undefined) return undefined;
       // The attempt is opened before the stage is queued, so a request that was
       // accepted, a stage that is running and a draft that was written but not
       // validated are three different facts from the first millisecond — not
       // one「report」that only becomes true at the end.
-      service.beginReportGeneration(taskId, { stage: "report", resume: task.reportDraft !== null });
-      enqueue({
+      const opened = service.beginReportGeneration(taskId, { stage: "report", resume: task.reportDraft !== null });
+      // A refused attempt is answered as a refusal, and nothing is queued: a
+      // request that cannot start must not leave a `running` attempt behind, and
+      // it must not be answered with a 202 that says work began.
+      if (!("attemptId" in opened)) return opened;
+      const queued = enqueue({
         taskId,
         sessionId: task.sessionId,
         stage: "report",
         instruction: stageInstruction({ stage: "report", task, documents: taskDocumentsOf(taskId) }),
         grant: STAGE_GRANTS.report,
+        generationAttemptId: opened.attemptId,
       });
+      if (queued) return opened;
+      // The queue refused it — the process is stopping. The attempt this request
+      // opened is closed rather than left running with nobody to run it.
+      service.recordReportStage(taskId, { status: "failed", endedAt: null, failure: publicFailure(ABORTED_FAILURE) }, opened.attemptId);
+      return undefined;
     },
 
     hasReportWork(taskId) {
-      const isReportStage = (request: StageRequest | undefined): boolean =>
-        request?.taskId === taskId && (request.stage === "report" || request.stage === "synthesis");
-      if (isReportStage(activeRequest)) return true;
-      return queue.some((request) => isReportStage(request));
+      return hasReportWorkFor(taskId);
+    },
+
+    hasResearchWork(taskId) {
+      return hasResearchWorkFor(taskId);
     },
 
     startAssistant(taskId, input) {
@@ -1738,6 +2161,14 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     startResearchAction(taskId, input) {
       const task = service.getTask(taskId);
       if (task === undefined) return undefined;
+      // The same gate as `/report`, at the other door into the same pipeline: a
+      //用户补查 is research on the card's subjects and dimensions, and the gap
+      // stage it starts can be followed by a report stage the program decides
+      // on. Neither is something an unconfirmed card may enter.
+      if (task.confirmedAt === null) {
+        log(`[runner] research action refused for ${task.id}: the brief is not confirmed`);
+        return BRIEF_UNCONFIRMED;
+      }
       // A user's instruction is not a gap round the pipeline decided on: it
       // gets its own grant and its own budget, and it is never refused because
       // the project's automatic rounds or its deadline are used up.
@@ -1773,16 +2204,31 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     },
 
     reconcileInterrupted() {
+      // Convergence is a statement about a process that is gone, so it is only
+      // made by a runner that is not doing anything: a live stage's records
+      // belong to this process, and rewriting them would be the runner
+      // declaring its own work interrupted.
+      if (active !== undefined || queue.length > 0) {
+        log("[runner] reconciliation skipped: this runner still has work of its own");
+        return;
+      }
+      const at = new Date().toISOString();
       for (const task of service.listTasks()) {
         for (const run of service.runsOf(task.id)) {
           if (run.status !== "running") continue;
           service.recordRun({
             ...run,
             status: "interrupted",
-            endedAt: new Date().toISOString(),
+            endedAt: at,
             note: `${run.note}（应用重启后中断；材料已保留，可重新发起该阶段）`,
           });
         }
+        // The generation is converged here too, and for the same reason: a run
+        // left `running` by a process that is gone is not progress, and reading
+        // it as progress is what left a project waiting forever for work nobody
+        // was doing. The reader gets the recovery button back, and nothing calls
+        // a model to find that out.
+        convergeInterruptedGeneration(task.id);
       }
     },
 
@@ -1819,8 +2265,55 @@ export function createResearchRunner(options: ResearchRunnerOptions): ResearchRu
     },
     async shutdown() {
       stopping = true;
+      // Work that never started is dropped, and the attempts it had opened are
+      // closed rather than left running: nothing is going to run them now.
       queue.length = 0;
       if (active !== undefined) await active;
+      for (const task of service.listTasks()) closeAbandonedGeneration(task.id);
     },
   };
+
+  /**
+   * Ends a generation that a restart caught mid-flight.
+   *
+   * Everything the project already has is kept — material, draft, counts, and
+   * the budget — and only the attempt is closed, with the safe code that says
+   * what happened. The end time stays null on purpose: the moment this process
+   * looked is not the moment the work stopped, and a duration computed from it
+   * would be a made-up number (the timing projection reads a missing end as
+   * 「无法确定」 rather than as zero).
+   */
+  function convergeInterruptedGeneration(taskId: string): void {
+    const task = service.getTask(taskId);
+    if (task === undefined || task.currentReportId !== null) return;
+    const generation = task.reportGeneration ?? null;
+    if (generation === null || generation.status === "validated") return;
+    if (generation.status === "failed") return;
+    service.recordReportStage(taskId, {
+      status: "failed",
+      endedAt: generation.endedAt === null ? null : generation.endedAt,
+      failure: publicFailure(INTERRUPTED_FAILURE),
+    });
+  }
+
+  /**
+   * Closes an attempt that has nothing left to run it.
+   *
+   * Called at shutdown, once the active stage has settled and the queue is gone:
+   * whatever is still open for a task at that moment cannot be finished by this
+   * process. A draft that was saved stays saved — the attempt is what closes.
+   */
+  function closeAbandonedGeneration(taskId: string): void {
+    const task = service.getTask(taskId);
+    if (task === undefined || task.currentReportId !== null) return;
+    const generation = task.reportGeneration ?? null;
+    if (generation === null || generation.status === "validated" || generation.status === "failed") return;
+    if (activeRequest?.taskId === taskId) return;
+    if (queue.some((request) => request.taskId === taskId)) return;
+    service.recordReportStage(
+      taskId,
+      { status: "failed", endedAt: null, failure: publicFailure(ABORTED_FAILURE) },
+      generation.attemptId,
+    );
+  }
 }

@@ -493,6 +493,17 @@ export interface TaskBundle {
    * vocabulary the model layer classified — never in a provider's own words.
    */
   readonly reportGeneration: ReportGenerationView;
+  /**
+   * How long the research and the report have taken, as two independent facts.
+   *
+   * The server decides both, because only it knows which runs belong to which
+   * piece of work. A page computes nothing here: `state` is what says whether
+   * the current time may be read at all (`running`), whether there is a real
+   * pair of instants to subtract (`ended`), or whether the honest answer is that
+   * the end is unknown (`unknown`) — a project interrupted by a restart, or one
+   * whose end was never written.
+   */
+  readonly timing: TaskTiming;
   /** The reader-facing activity history, oldest first; stored, not in memory. */
   readonly activityLog: readonly ActivityEventView[];
   /**
@@ -546,11 +557,25 @@ export interface ReportGenerationView {
     readonly code: string;
     readonly problem: string;
     readonly guidance: string;
+    /** Whether the model layer established that retrying could work. */
+    readonly retryable: boolean;
   } | null;
   readonly draft: { readonly sections: number; readonly claims: number; readonly outstanding: number } | null;
   readonly canResume: boolean;
   readonly reportId: string | null;
   readonly blockedBy: "report_exists" | "brief_unconfirmed" | "busy" | null;
+}
+
+/** One piece of work's duration, as the server states it. */
+export interface TimingEntryView {
+  readonly startedAt: string | null;
+  readonly endedAt: string | null;
+  readonly state: "idle" | "running" | "ended" | "unknown";
+}
+
+export interface TaskTiming {
+  readonly research: TimingEntryView;
+  readonly report: TimingEntryView;
 }
 
 /** The research stages a reader watches, in the product's own words. */
@@ -571,6 +596,31 @@ export interface ProgressView {
 /* --------------------------------------------------------------- settings -- */
 
 /** One capability, as the server can be held to it. */
+/**
+ * What was observed about a service, and when.
+ *
+ * `not_checked` carries no time: there is no observation to date. An
+ * integration that is implemented, configured, or has answered a request is not
+ * evidence for either of the other two.
+ */
+export interface HealthView {
+  readonly status: "not_checked" | "reachable" | "unreachable";
+  readonly checkedAt: string | null;
+}
+
+/** One provider of the retrieval catalogue, as the page reads it. */
+export interface ProviderCatalogEntryView {
+  readonly id: string;
+  readonly name: string;
+  readonly implemented: boolean;
+  readonly configured: boolean;
+  /** Whether the effective order contains it. */
+  readonly enabled: boolean;
+  /** Its 0-based place in that order, or null when it is not in it. */
+  readonly orderIndex: number | null;
+  readonly health: HealthView;
+}
+
 export interface CapabilityView {
   readonly id: string;
   readonly name: string;
@@ -579,6 +629,17 @@ export interface CapabilityView {
   readonly status: "integrated" | "reachable" | "unreachable" | "not_configured" | "not_checked" | "not_implemented";
   readonly detail: string;
   readonly checkedAt?: string | null;
+  /**
+   * Whether this capability is switched on, when it is the kind that can be.
+   *
+   * `null` for everything that is not a switch: a local upload path has no
+   * enablement, and reporting `false` for it would read as "turned off".
+   */
+  readonly enabled: boolean | null;
+  /** Where it sits in the order, when it has one. */
+  readonly orderIndex: number | null;
+  /** The observation behind `status`, when there is one. */
+  readonly health: HealthView | null;
 }
 
 /** The product's own settings, with the provenance of every number in force. */
@@ -598,7 +659,15 @@ export interface SettingsBundle {
     readonly note: string;
   };
   readonly retrieval: {
-    readonly providers: readonly { readonly id: string; readonly name: string; readonly implemented: boolean; readonly configured: boolean; readonly enabled: boolean }[];
+    /**
+     * The whole catalogue, not the enabled subset.
+     *
+     * A page that is only told what is on cannot switch anything back on: the
+     * control for the provider that was turned off is the one entry a
+     * "currently enabled" list leaves out.
+     */
+    readonly providers: readonly ProviderCatalogEntryView[];
+    /** The active order: which providers are asked, and in what order. */
     readonly order: readonly string[];
     readonly source: "product-default" | "saved";
     readonly fallback: boolean;

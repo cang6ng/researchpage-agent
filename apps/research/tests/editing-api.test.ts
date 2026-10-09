@@ -554,13 +554,28 @@ function scriptedModel(): Scripted {
         if (writes.length === 0) {
           return next(call("search_sources", { query: "unrelated side quest", limit: 1 }));
         }
-        if (!results.some((result) => result.name === "save_report")) {
+        const saves = results.filter((result) => result.name === "save_report");
+        if (saves.length === 0) {
           return next(
             call("save_report", {
               title: "偷偷写的报告",
               summary: "这次回答不应该产生任何正式数据。",
               claims: [],
               sections: [],
+            }),
+          );
+        }
+        // The incremental path is the same act under another name: an Ask that
+        // starts a draft leaves the next report stage a work in progress it
+        // never authorized, so it is attempted here too, and refused just the
+        // same.
+        if (saves.length === 1) {
+          return next(
+            call("save_report", {
+              part: "start",
+              title: "偷偷写的草稿",
+              summary: "这次回答不应该产生任何草稿。",
+              frame: { question: "Q", audience: "A", scope: "S" },
             }),
           );
         }
@@ -761,6 +776,7 @@ afterAll(async () => {
 describe("the assistant's three intents, over HTTP", () => {
   it("answers an Ask without touching the project", async () => {
     const before = await bundle();
+    const savesBefore = scripted.attempts.filter((name) => name === "save_report").length;
     const started = await post(`/api/research/tasks/${taskId}/assistant`, {
       text: "这份材料里 GraphRAG 的构建步骤是什么？",
       intent: "ask",
@@ -773,12 +789,14 @@ describe("the assistant's three intents, over HTTP", () => {
       const current = await bundle();
       return current.runs.some((run) => run.stage === "ask") && !current.busy;
     }, "the ask run to settle");
+    const savesAttempted = scripted.attempts.filter((name) => name === "save_report").length - savesBefore;
 
-    // The model tried to search and to save a report; both were refused by the
-    // service, and the recorded run says so.
+    // The model tried to search, to save a report and to start a draft; all
+    // three were refused by the service, and the recorded run says so.
     expect(scripted.attempts).toContain("save_report");
     const after = await bundle();
     const askRun = app.service.runsOf(taskId).filter((run) => run.stage === "ask").slice(-1)[0]!;
+    expect(askRun.status).toBe("completed");
     // A refusal is an answer, not a crash: what the model received back is the
     // proof the boundary held, and it is also the sentence it can act on.
     const refusedWrites = scripted.refusals.filter((entry) => entry.name === "save_report" || entry.name === "search_sources");
@@ -786,6 +804,13 @@ describe("the assistant's three intents, over HTTP", () => {
     for (const refusal of refusedWrites) {
       expect(refusal.problems.join(" "), `${refusal.name} must be refused by the service`).toMatch(/没有授权|不允许/);
     }
+    // Both flavours of the report write were attempted in this run and both were
+    // refused: the one-shot save and the incremental draft. Counting attempts
+    // rather than refused answers matters here — the two refusals carry the same
+    // sentence, and a boundary that covered only one of them would be invisible
+    // in the deduplicated list.
+    expect(savesAttempted, "both flavours of the report write must have been attempted").toBe(2);
+    expect(app.service.reportDraftOf(taskId), "an Ask must not leave a draft").toBeNull();
 
     expect(after.currentReportId).toBe(before.currentReportId);
     expect(after.currentReportHash).toBe(before.currentReportHash);

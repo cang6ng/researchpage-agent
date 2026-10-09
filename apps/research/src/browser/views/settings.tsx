@@ -47,15 +47,53 @@ function Row({ k, help, children }: { readonly k: string; readonly help?: string
   );
 }
 
-/** How a capability's status is worded, and how it looks. */
+/**
+ * How a capability's status is worded, and how it looks.
+ *
+ * `integrated` says the code path exists — nothing more. It used to read
+ * 「已实现并可用」, which claimed availability for services nobody had asked:
+ * arXiv had already timed out in a real report while the page still said it was
+ * available, and a provider that was switched off read the same way. What a
+ * reader needs is three separate facts, so the chip states implementation and
+ * the line beside it states whether it is switched on and what was observed.
+ */
 const CAPABILITY: Readonly<Record<CapabilityView["status"], { readonly label: string; readonly chip: string }>> = Object.freeze({
-  integrated: { label: "已实现并可用", chip: "rp-chip--reviewed" },
-  reachable: { label: "已探测可用", chip: "rp-chip--reviewed" },
+  integrated: { label: "已接入", chip: "rp-chip--quiet" },
+  reachable: { label: "已探测可达", chip: "rp-chip--reviewed" },
   unreachable: { label: "服务不可达", chip: "rp-chip--conflict" },
   not_configured: { label: "已实现但未配置", chip: "rp-chip--limited" },
   not_checked: { label: "尚未检查", chip: "rp-chip--quiet" },
   not_implemented: { label: "暂未实现", chip: "rp-chip--quiet" },
 });
+
+/**
+ * The active order after one provider's switch changes.
+ *
+ * Switching a provider off removes it from the order; switching it on appends
+ * it, which is the only order a reader can predict without a drag handle —
+ * everything already in the list keeps its place, and the one that comes back
+ * goes last. This is the whole of what the form computes, and it is a pure
+ * function so both directions can be checked for what they do.
+ */
+export function setProviderEnabled(order: readonly string[], id: string, on: boolean): readonly string[] {
+  if (on) return order.includes(id) ? order : [...order, id];
+  return order.filter((entry) => entry !== id);
+}
+
+/** Whether a capability is switched on, in words that do not overstate it. */
+export function enablementOf(capability: CapabilityView): string {
+  if (capability.enabled === null) return "";
+  if (!capability.enabled) return "当前未启用";
+  return capability.orderIndex === null ? "已启用" : `已启用（第 ${String(capability.orderIndex + 1)} 位）`;
+}
+
+/** What has actually been observed, or that nothing has. */
+export function healthOf(capability: CapabilityView): string {
+  const health = capability.health;
+  if (health === null || health.status === "not_checked") return "健康：尚未检查";
+  const when = health.checkedAt === null ? "" : `（${health.checkedAt}）`;
+  return health.status === "reachable" ? `健康：最近一次探测服务可达${when}` : `健康：最近一次探测服务不可达${when}`;
+}
 
 /** The research defaults, as a form that saves what it shows. */
 function ResearchForm({
@@ -163,6 +201,8 @@ function RetrievalForm({
   readonly onSaved: (next: SettingsBundle) => void;
 }) {
   const { act, busy } = useApp();
+  // The active order, as this form would save it: switching one off removes it,
+  // switching one on appends it, and everything else keeps its place.
   const [enabled, setEnabled] = useState<readonly string[]>(settings.retrieval.order);
   const [dirty, setDirty] = useState(false);
   useEffect(() => {
@@ -173,14 +213,26 @@ function RetrievalForm({
     <div className="rp-set-group">
       <h2>检索来源</h2>
       <p>{settings.retrieval.note}</p>
+      {/*
+        Every provider the product has, always. The list used to be the enabled
+        subset, so switching arXiv off removed its switch from the page and left
+        the reader without the control that would turn it back on.
+      */}
       {settings.retrieval.providers.map((provider) => {
         const on = enabled.includes(provider.id);
         const last = enabled.length === 1 && on;
+        const position = enabled.indexOf(provider.id);
         return (
           <Row
             key={provider.id}
             k={provider.name}
-            help={provider.id === "arxiv" ? "优先来源；读取时优先抽取 HTML 正文，必要时退回摘要页。" : "备用来源：前一个没有结果或不可用时才使用。"}
+            help={
+              on
+                ? position === 0
+                  ? `当前是主用来源（第 1 位）：先向它检索，没有结果或不可用时才换下一个。`
+                  : `当前是备用来源（第 ${String(position + 1)} 位）：前面的来源没有结果或不可用时才使用。`
+                : "当前未启用：保存后即可重新启用，不需要重启服务。"
+            }
           >
             <span className="rp-factline">
               <Switch
@@ -189,13 +241,21 @@ function RetrievalForm({
                 aria-label={provider.name}
                 data-testid={`provider-${provider.id}`}
                 onChange={(event) => {
+                  // Read the value here, not inside the updater: React releases
+                  // the event before the updater runs, so `currentTarget` is
+                  // null by then — which is exactly how this control came to
+                  // throw on the first click.
+                  const on = event.currentTarget.checked;
                   setDirty(true);
-                  setEnabled((current) =>
-                    event.currentTarget.checked ? [...current, provider.id] : current.filter((entry) => entry !== provider.id),
-                  );
+                  setEnabled((current) => setProviderEnabled(current, provider.id, on));
                 }}
               />
-              <span className={`rp-chip ${last ? "rp-chip--limited" : "rp-chip--reviewed"}`}>{last ? "最后一个，不能关闭" : "已启用"}</span>
+              <span className={`rp-chip ${last ? "rp-chip--limited" : on ? "rp-chip--reviewed" : "rp-chip--quiet"}`} data-testid={`provider-chip-${provider.id}`}>
+                {last ? "最后一个，不能关闭" : on ? "已启用" : "未启用"}
+              </span>
+              <span style={{ fontSize: 12, color: "var(--rp-ink-3)" }} data-testid={`provider-health-${provider.id}`}>
+                {provider.health.status === "not_checked" ? "健康：尚未检查" : provider.health.status === "reachable" ? "健康：已探测可达" : "健康：服务不可达"}
+              </span>
             </span>
           </Row>
         );
@@ -411,7 +471,19 @@ export function SettingsView() {
                   <p>每一条都写明它现在的真实状态：已实现、已配置、已探测、不可达、尚未检查，或尚未实现。</p>
                   {settings.capabilities.map((capability) => (
                     <Row key={capability.id} k={capability.name} help={capability.detail}>
-                      <span className={`rp-chip ${CAPABILITY[capability.status].chip}`}>{CAPABILITY[capability.status].label}</span>
+                      <span className="rp-factline" style={{ flexWrap: "wrap", rowGap: 4 }}>
+                        <span className={`rp-chip ${CAPABILITY[capability.status].chip}`} data-testid={`capability-${capability.id}`}>
+                          {CAPABILITY[capability.status].label}
+                        </span>
+                        {enablementOf(capability).length > 0 && (
+                          <span className="rp-chip rp-chip--quiet" data-testid={`capability-state-${capability.id}`}>
+                            {enablementOf(capability)}
+                          </span>
+                        )}
+                        <span style={{ fontSize: 12, color: "var(--rp-ink-3)" }} data-testid={`capability-health-${capability.id}`}>
+                          {healthOf(capability)}
+                        </span>
+                      </span>
                     </Row>
                   ))}
                   <Row k="数据位置" help="项目数据保存在本机；报告与导出文件也在同一个数据目录下。">

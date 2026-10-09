@@ -12,8 +12,8 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { ReportTask, ResearchActivityEvent, ResearchRunRecord } from "@every-dagent/plugin-research";
-import { researchProgressOf, type ProgressInput } from "../src/server/presentation.js";
+import type { ReportGenerationState, ReportTask, ResearchActivityEvent, ResearchRunRecord } from "@every-dagent/plugin-research";
+import { researchProgressOf, timingOf, type ProgressInput } from "../src/server/presentation.js";
 
 const AT = "2026-10-08T10:00:00.000Z";
 
@@ -184,5 +184,176 @@ describe("research progress", () => {
     const view = progress({ task: task({ currentReportId: "rep_1" }), runs: [], activity: [] });
     expect(view.currentStage).toBe("completed");
     expect(view.displayName).toBe("已完成");
+  });
+});
+
+/**
+ * How long a project took, as two facts rather than one running clock.
+ *
+ * The defect this file is written against: a project that started at 10:23 and
+ * finished at 10:25 showed「已完成 / 已用时 1 小时 23 分钟」when it was reopened
+ * at 11:48 — the page had been adding the current time to a term that had ended
+ * an hour earlier. Two rules are pinned here. A term that has ended is its own
+ * two instants subtracted, so nothing about when the page is open can change
+ * the answer. And a term whose end was never recorded — a run a restart
+ * interrupted, an attempt a process died inside — says「无法确定」rather than
+ * borrowing a time from somewhere else.
+ */
+/** One report attempt, as the service persists it. */
+function generation(patch: Partial<ReportGenerationState> = {}): ReportGenerationState {
+  return {
+    attemptId: "jrn_gen",
+    status: "running",
+    stage: "report",
+    startedAt: "2026-10-09T10:02:00.000Z",
+    endedAt: null,
+    failure: null,
+    resumes: 0,
+    repairs: 0,
+    repairSignature: null,
+    ...patch,
+  };
+}
+
+describe("the two durations a project reports", () => {
+  const ten = "2026-10-09T10:00:00.000Z";
+  const tenTwo = "2026-10-09T10:02:00.000Z";
+  const tenFive = "2026-10-09T10:05:00.000Z";
+  const eleven = "2026-10-09T11:00:00.000Z";
+
+  /** A task whose research attempt began at `startedAt`. */
+  function attempted(startedAt: string, patch: Partial<ReportTask> = {}): ReportTask {
+    return task({
+      attempt: { number: 1, startedAt, searches: 1, reads: 1, gapRounds: 0, reason: "用户确认任务后开始研究" },
+      ...patch,
+    });
+  }
+
+  it("freezes research at the end of its own runs, whatever a report does afterwards", () => {
+    const runs = [
+      run({ id: "jrn_1", stage: "research", status: "completed", startedAt: ten, endedAt: tenTwo }),
+      run({ id: "jrn_2", stage: "report", status: "completed", startedAt: tenTwo, endedAt: tenFive }),
+      run({ id: "jrn_3", stage: "synthesis", status: "completed", startedAt: tenFive, endedAt: "2026-10-09T10:06:00.000Z" }),
+    ];
+    const timing = timingOf({ task: attempted(ten, { reportGeneration: generation({ startedAt: tenTwo, endedAt: tenFive }) }), runs, researchBusy: false, reportBusy: false });
+    expect(timing.research).toEqual({ startedAt: ten, endedAt: tenTwo, state: "ended" });
+  });
+
+  it("does not extend research for a report recovered an hour later", () => {
+    // 10:00–10:02 research, 10:02–10:05 report, the report recovered at 11:00:
+    // the research is still two minutes, and the recovery is its own attempt.
+    const runs = [
+      run({ id: "jrn_1", stage: "research", status: "completed", startedAt: ten, endedAt: tenTwo }),
+      run({ id: "jrn_2", stage: "report", status: "completed", startedAt: tenTwo, endedAt: tenFive }),
+      run({ id: "jrn_3", stage: "report", status: "running", startedAt: eleven, endedAt: null }),
+    ];
+    const timing = timingOf({
+      task: attempted(ten, { reportGeneration: generation({ attemptId: "jrn_recover", startedAt: eleven, endedAt: null, status: "running" }) }),
+      runs,
+      researchBusy: false,
+      reportBusy: true,
+    });
+    expect(timing.research).toEqual({ startedAt: ten, endedAt: tenTwo, state: "ended" });
+    expect(timing.report).toEqual({ startedAt: eleven, endedAt: null, state: "running" });
+  });
+
+  it("leaves a user's own补查 out of the pass it is not part of", () => {
+    const runs = [
+      run({ id: "jrn_1", stage: "research", status: "completed", startedAt: ten, endedAt: tenTwo }),
+      run({ id: "jrn_2", stage: "gap", status: "completed", startedAt: tenTwo, endedAt: tenFive, userText: "再补查一些资料" }),
+    ];
+    const timing = timingOf({ task: attempted(ten), runs, researchBusy: false, reportBusy: false });
+    expect(timing.research.endedAt).toBe(tenTwo);
+  });
+
+  it("does not let a report from before this attempt cut the research short", () => {
+    // The real retry: research 10:00–10:05, its report failed, the reader asked
+    // for research again at 11:00 — a new attempt — that pass ran 11:00–11:04 and
+    // its own report began there. The failed report's record is older than the
+    // attempt, so it is not a boundary of it: read as one, it filtered out the
+    // very research that came after it, and a pass that really ran and really
+    // ended was shown as「无法确定」.
+    const elevenThree = "2026-10-09T11:03:00.000Z";
+    const elevenFour = "2026-10-09T11:04:00.000Z";
+    const elevenSix = "2026-10-09T11:06:00.000Z";
+    const runs = [
+      run({ id: "jrn_1", stage: "research", status: "completed", startedAt: ten, endedAt: tenTwo }),
+      run({ id: "jrn_2", stage: "gap", status: "completed", startedAt: tenTwo, endedAt: tenFive }),
+      run({ id: "jrn_3", stage: "report", status: "failed", startedAt: tenFive, endedAt: "2026-10-09T10:05:30.000Z" }),
+      run({ id: "jrn_4", stage: "research", status: "completed", startedAt: eleven, endedAt: elevenThree }),
+      run({ id: "jrn_5", stage: "gap", status: "completed", startedAt: elevenThree, endedAt: elevenFour }),
+      run({ id: "jrn_6", stage: "report", status: "completed", startedAt: elevenFour, endedAt: elevenSix }),
+    ];
+    const timing = timingOf({
+      task: task({
+        attempt: {
+          number: 2,
+          startedAt: eleven,
+          searches: 1,
+          reads: 0,
+          gapRounds: 0,
+          reason: "用户请求重新研究（保留原有材料、报告与冻结版本）",
+        },
+        reportGeneration: generation({ attemptId: "jrn_new", startedAt: elevenFour, endedAt: elevenSix, status: "validated" }),
+      }),
+      runs,
+      researchBusy: false,
+      reportBusy: false,
+    });
+    expect(timing.research).toEqual({ startedAt: eleven, endedAt: elevenFour, state: "ended" });
+    expect(timing.report).toEqual({ startedAt: elevenFour, endedAt: elevenSix, state: "ended" });
+  });
+
+  it("says unknown when a restart interrupted the pass", () => {
+    // The end a restart records is when the interruption was *detected*, not
+    // when the work stopped, so it is not an end this product may report.
+    const runs = [run({ id: "jrn_1", stage: "research", status: "interrupted", startedAt: ten, endedAt: eleven })];
+    const timing = timingOf({ task: attempted(ten), runs, researchBusy: false, reportBusy: false });
+    expect(timing.research).toEqual({ startedAt: ten, endedAt: null, state: "unknown" });
+  });
+
+  it("says unknown for a pass that has no records at all", () => {
+    const timing = timingOf({ task: attempted(ten), runs: [], researchBusy: false, reportBusy: false });
+    expect(timing.research.state).toBe("unknown");
+    expect(timing.research.startedAt).toBe(ten);
+  });
+
+  it("says idle when there is no attempt and no generation", () => {
+    const timing = timingOf({ task: task(), runs: [], researchBusy: false, reportBusy: false });
+    expect(timing.research.state).toBe("idle");
+    expect(timing.report.state).toBe("idle");
+  });
+
+  it("runs only while work is really in flight", () => {
+    const runs = [run({ id: "jrn_1", stage: "research", status: "running", startedAt: ten, endedAt: null })];
+    const timing = timingOf({ task: attempted(ten), runs, researchBusy: true, reportBusy: false });
+    expect(timing.research).toEqual({ startedAt: ten, endedAt: null, state: "running" });
+    // A generation persisted as `running` by a process that is gone is not
+    // running: nothing is producing an end for it.
+    const stale = timingOf({
+      task: attempted(ten, { reportGeneration: generation({ startedAt: ten, endedAt: null, status: "running" }) }),
+      runs: [],
+      researchBusy: false,
+      reportBusy: false,
+    });
+    expect(stale.report).toEqual({ startedAt: ten, endedAt: null, state: "unknown" });
+  });
+
+  it("freezes a failed generation at the end it recorded, and says unknown when it recorded none", () => {
+    const withEnd = timingOf({
+      task: attempted(ten, { reportGeneration: generation({ startedAt: ten, endedAt: tenFive, status: "failed" }) }),
+      runs: [],
+      researchBusy: false,
+      reportBusy: false,
+    });
+    expect(withEnd.report).toEqual({ startedAt: ten, endedAt: tenFive, state: "ended" });
+    // A failure a restart detected has no end: the boot moment is not one.
+    const interrupted = timingOf({
+      task: attempted(ten, { reportGeneration: generation({ startedAt: ten, endedAt: null, status: "failed" }) }),
+      runs: [],
+      researchBusy: false,
+      reportBusy: false,
+    });
+    expect(interrupted.report).toEqual({ startedAt: ten, endedAt: null, state: "unknown" });
   });
 });

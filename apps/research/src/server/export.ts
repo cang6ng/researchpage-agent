@@ -14,7 +14,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ExportArtifact, FrozenRevision, ResearchService } from "@every-dagent/plugin-research";
-import { exportHtmlToPdf, ID_PREFIX, newId, renderReportHtml, renderRevisionHtml } from "@every-dagent/plugin-research";
+import { RENDERER, exportHtmlToPdf, ID_PREFIX, newId, renderReportHtml, renderRevisionHtml } from "@every-dagent/plugin-research";
 
 export interface PdfExportOutcome {
   readonly ok: boolean;
@@ -93,7 +93,10 @@ export async function exportRevisionPdf(input: {
     reportId: revision.reportId,
     revisionId: revision.id,
     themeId: revision.themeId,
-    rendererVersion: `${revision.renderer.name}@${revision.renderer.version}`,
+    // The renderer that actually produced this file, not the one the revision
+    // was frozen by: a re-export of an old revision is drawn by today's
+    // renderer, and the artifact is a record of the drawing.
+    rendererVersion: `${RENDERER.name}@${RENDERER.version}`,
     kind: "pdf",
     status: result.ok ? "exported" : "failed",
     path: result.ok ? result.path : null,

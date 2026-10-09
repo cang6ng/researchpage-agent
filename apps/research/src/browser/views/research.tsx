@@ -463,6 +463,7 @@ export function ResearchView() {
             <ResearchProgress
               progress={bundle.progress}
               attempt={bundle.attempt}
+              timing={bundle.timing}
               discovery={bundle.discovery}
               activityLog={bundle.activityLog}
               sources={bundle.sources}

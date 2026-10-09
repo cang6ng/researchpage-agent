@@ -341,6 +341,12 @@ function bundleFixture(): TaskBundle {
       reportId: null,
       blockedBy: null,
     },
+    // The two durations the server states, as a finished research pass and no
+    // report attempt yet.
+    timing: {
+      research: { startedAt: "2026-10-06T08:05:00.000Z", endedAt: "2026-10-06T08:20:00.000Z", state: "ended" as const },
+      report: { startedAt: null, endedAt: null, state: "idle" as const },
+    },
     busy: false,
   };
 }

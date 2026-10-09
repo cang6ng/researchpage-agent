@@ -14,5 +14,5 @@
     "types": ["node"]
   },
   "include": ["packages", "apps", "tests"],
-  "exclude": ["apps/web/src/browser", "apps/web/tests/shell-rendering.test.tsx", "apps/web/dist", "apps/research/src/browser", "apps/research/dist", "apps/research/tests/markdown.test.ts", "apps/research/tests/artifact-view.test.ts", "apps/research/tests/guide-conversation.test.ts", "apps/research/tests/trust-ux.test.ts", "apps/research/tests/intent-view.test.ts", "apps/research/tests/document-library-view.test.ts", "apps/research/tests/research-progress-view.test.ts", "apps/research/tests/report-recovery-view.test.ts"]
+  "exclude": ["apps/web/src/browser", "apps/web/tests/shell-rendering.test.tsx", "apps/web/dist", "apps/research/src/browser", "apps/research/dist", "apps/research/tests/markdown.test.ts", "apps/research/tests/artifact-view.test.ts", "apps/research/tests/guide-conversation.test.ts", "apps/research/tests/trust-ux.test.ts", "apps/research/tests/intent-view.test.ts", "apps/research/tests/document-library-view.test.ts", "apps/research/tests/research-progress-view.test.ts", "apps/research/tests/report-recovery-view.test.ts", "apps/research/tests/settings-view.test.ts"]
 }

@@ -26,6 +26,7 @@ import type {
   ReportClaim,
   ReportFrame,
   ReportSection,
+  ResearchRunRecord,
   ResearchService,
   SupportAssessment,
 } from "@every-dagent/plugin-research";
@@ -46,7 +47,7 @@ import {
 import { publicProblem, type ConversionManager, type ConversionProblem } from "./conversions.js";
 import { exportRevisionPdf, exportTaskReportPdf, renderHtmlOf, revisionHtmlOf } from "./export.js";
 import { MINERU_FLASH_MAX_BYTES, MINERU_FLASH_MAX_PAGES, MINERU_PACKAGE } from "./mineru.js";
-import { presentationOf, reportGenerationOf, researchProgressOf } from "./presentation.js";
+import { presentationOf, reportGenerationOf, researchProgressOf, timingOf } from "./presentation.js";
 import type { ResearchRunner } from "./runner.js";
 
 const MAX_BODY_BYTES = 32 * 1024;
@@ -366,7 +367,14 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 /** The whole workspace state for one task: what the UI polls. */
-function taskBundle(service: ResearchService, taskId: string, busy: boolean, reportBusy = false): unknown {
+function taskBundle(
+  service: ResearchService,
+  taskId: string,
+  busy: boolean,
+  reportBusy = false,
+  researchBusy = false,
+  runs: readonly ResearchRunRecord[] = service.runsOf(taskId),
+): unknown {
   const task = service.getTask(taskId);
   if (task === undefined) return undefined;
   const cells = service.cellsOf(taskId);
@@ -637,7 +645,7 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean, rep
       sources: service.sourcesOf(taskId),
       hasReport: current !== undefined,
       pendingProposal: proposals.some((proposal) => proposal.status === "pending"),
-      runningStage: service.runsOf(taskId).find((record) => record.status === "running")?.stage ?? null,
+      runningStage: runs.find((record) => record.status === "running")?.stage ?? null,
       validation: current?.validation ?? null,
     }),
     /**
@@ -645,13 +653,26 @@ function taskBundle(service: ResearchService, taskId: string, busy: boolean, rep
      * as one. `validated` is the only one that means a report exists; the rest
      * each say what would move it forward, and a failure says it in the safe
      * vocabulary the model layer classified rather than in a provider's words.
+     *
+     * Only a report or synthesis run counts as「正在生成报告」: a research, gap,
+     * ask or edit run is a different piece of work on the same project.
      */
     reportGeneration: reportGenerationOf({
       task,
-      runningStage: service.runsOf(taskId).find((record) => record.status === "running")?.stage ?? null,
+      runningStage:
+        runs.find((record) => record.status === "running" && (record.stage === "report" || record.stage === "synthesis"))?.stage ??
+        null,
       draft: draftSummary,
       busy: reportBusy,
     }),
+    /**
+     * How long research and the report have taken, as two independent answers.
+     *
+     * They are separate because they are: the research pass ends when its own
+     * runs end, whether or not a report is being written afterwards, and a
+     * report recovered an hour later has its own duration rather than the hour's.
+     */
+    timing: timingOf({ task, runs, researchBusy, reportBusy }),
     busy,
   };
 }
@@ -672,6 +693,62 @@ let options: ResearchRoutesOptions;
  * and false about this one, and a claim about capability is only worth reading
  * if it is derived from the thing itself.
  */
+/**
+ * What was observed about a service, and when.
+ *
+ * `not_checked` is a status in its own right and carries no time, because there
+ * is no observation to date. The other two can only be produced by something
+ * that really asked — a probe, or a request that answered — and the time is the
+ * moment that happened. An integration that is implemented, configured, or has
+ * worked before is *not* evidence for either of them.
+ */
+interface Health {
+  readonly status: "not_checked" | "reachable" | "unreachable";
+  readonly checkedAt: string | null;
+}
+
+/** One provider of the retrieval catalogue, as the page reads it. */
+interface ProviderCatalogEntry {
+  readonly id: string;
+  readonly name: string;
+  readonly implemented: boolean;
+  readonly configured: boolean;
+  /** Whether the effective order contains it. */
+  readonly enabled: boolean;
+  /** Its 0-based place in that order, or null when it is not in it. */
+  readonly orderIndex: number | null;
+  readonly health: Health;
+}
+
+function providerNameOf(provider: string): string {
+  return provider === "arxiv" ? "arXiv" : provider === "openalex" ? "OpenAlex" : provider;
+}
+
+/**
+ * The whole catalogue, with enablement derived from the order that is in force.
+ *
+ * The page needs every provider it can switch, not only the ones currently on:
+ * a document that lists the enabled subset cannot describe the state it is in,
+ * and the control that would undo the last save has been left out of it. Each
+ * entry's health is `not_checked`, because nothing in this build ever probes a
+ * search provider — being implemented, or having answered a search, is not a
+ * health check, and saying so would be the same over-claim in a new field.
+ */
+function providerCatalogOf(settings: { readonly providerChoices: readonly string[]; readonly providers: readonly string[] }): readonly ProviderCatalogEntry[] {
+  return settings.providerChoices.map((provider) => {
+    const orderIndex = settings.providers.indexOf(provider);
+    return {
+      id: provider,
+      name: providerNameOf(provider),
+      implemented: true,
+      configured: true,
+      enabled: orderIndex >= 0,
+      orderIndex: orderIndex >= 0 ? orderIndex : null,
+      health: { status: "not_checked", checkedAt: null },
+    };
+  });
+}
+
 function settingsBundleOf(current: ResearchRoutesOptions): Record<string, unknown> {
   const settings = current.service.settingsOf();
   // Deliberately not probed here. A readiness check starts a real MCP
@@ -684,14 +761,20 @@ function settingsBundleOf(current: ResearchRoutesOptions): Record<string, unknow
   // composition that read it — not re-derived here from an environment variable
   // that a caller may have replaced.
   const mode = current.mineruMode ?? "flash";
+  // What the converter was last *observed* to be. null means nothing has been
+  // observed: the settings document is a read, and a read must not start an MCP
+  // subprocess to have something to say.
+  const observed = current.conversions?.observedReadiness() ?? null;
+  const mineruHealth: Health = observed === null
+    ? { status: "not_checked", checkedAt: null }
+    : { status: observed.ok ? "reachable" : "unreachable", checkedAt: new Date(observed.at).toISOString() };
 
-  const providers = settings.providers.map((provider) => ({
-    id: provider,
-    name: provider === "arxiv" ? "arXiv" : "OpenAlex",
-    implemented: true,
-    configured: true,
-    enabled: true,
-  }));
+  // The whole catalogue, not the enabled subset. The previous version sent only
+  // the providers in force, so a page could switch one off and never see it
+  // again — the switch it needed to turn the provider back on had been left out
+  // of the document. Enablement is *derived* from the effective order, and the
+  // order index is where the provider sits in it.
+  const providers = providerCatalogOf(settings);
 
   return {
     revision: settings.revision,
@@ -706,26 +789,67 @@ function settingsBundleOf(current: ResearchRoutesOptions): Record<string, unknow
     },
     retrieval: {
       providers,
+      // The active order: non-empty, deduplicated, and the only thing a save
+      // ever writes. A provider that is not in it is configured off, which is a
+      // state the catalogue can now describe instead of hide.
       order: settings.providers,
       source: settings.providersSource,
       fallback: settings.providers.length > 1,
       note:
         settings.providers.length > 1
-          ? `按 ${settings.providers.join(" → ")} 顺序尝试：前一个没有结果或不可用时才换下一个。`
-          : `只使用 ${settings.providers.join("、")}；它不可用时没有备用来源。`,
+          ? `按 ${settings.providers.map(providerNameOf).join(" → ")} 顺序尝试：前一个没有结果或不可用时才换下一个。`
+          : `只使用 ${settings.providers.map(providerNameOf).join("、")}；它不可用时没有备用来源。`,
     },
+    /**
+     * What the instance can do, and what it is doing *now*.
+     *
+     * `integrated` says the code path exists — it is the same claim as
+     * `implemented`, worded for a reader, and it deliberately does not say
+     * "available": a provider that is switched off is still integrated, and a
+     * service nobody has asked is not known to be reachable. Enablement, order
+     * and health are three more fields, and each of them is a fact the server
+     * holds rather than a sentence the page repeats.
+     */
     capabilities: [
-      { id: "arxiv", name: "arXiv 检索", implemented: true, configured: true, status: "integrated", detail: "已实现并默认启用" },
-      { id: "openalex", name: "OpenAlex 检索", implemented: true, configured: true, status: "integrated", detail: "已实现；作为备用来源" },
+      ...providers.map((provider) => ({
+        id: provider.id,
+        name: `${provider.name} 检索`,
+        implemented: provider.implemented,
+        configured: provider.configured,
+        status: "integrated" as const,
+        detail: provider.enabled
+          ? `已接入；当前在检索顺序中的第 ${String((provider.orderIndex ?? 0) + 1)} 位。`
+          : "已接入；当前没有启用（保存后即可重新启用，无需重启服务）。",
+        enabled: provider.enabled,
+        orderIndex: provider.orderIndex,
+        health: provider.health,
+        checkedAt: provider.health.checkedAt,
+      })),
       {
         id: "read-html",
         name: "网页 / arXiv HTML 正文读取",
         implemented: true,
         configured: true,
         status: "integrated",
-        detail: "优先抽取 HTML 正文，失败时退回摘要页；读取范围会如实记录为 full_text / abstract / metadata",
+        detail: "已接入：优先抽取 HTML 正文，失败时退回摘要页；读取范围会如实记录为 full_text / abstract / metadata",
+        // Reading a page needs the network, but nothing has *observed* whether
+        // it works from here, so this is not a health claim either way.
+        enabled: null,
+        orderIndex: null,
+        health: null,
       },
-      { id: "upload-markdown", name: "Markdown 本地上传", implemented: true, configured: true, status: "integrated", detail: "已实现并持久化" },
+      {
+        id: "upload-markdown",
+        name: "Markdown 本地上传",
+        implemented: true,
+        configured: true,
+        status: "integrated",
+        detail: "已接入并持久化",
+        // Purely local: there is no service whose health could be observed.
+        enabled: null,
+        orderIndex: null,
+        health: null,
+      },
       {
         id: "convert-document",
         name: "PDF / DOCX 上传与转换",
@@ -734,16 +858,32 @@ function settingsBundleOf(current: ResearchRoutesOptions): Record<string, unknow
         // so "implemented" and "configured" are both yes; whether it is
         // reachable is what the check answers, and that is not this document.
         configured: true,
-        status: "not_checked",
-        checkedAt: null,
-        detail: "已实现：用官方 MinerU MCP 解析 PDF / DOCX。是否可用请用「检查」探测；探测会真的启动一次服务。",
+        status: mineruHealth.status === "not_checked" ? ("not_checked" as const) : mineruHealth.status === "reachable" ? ("reachable" as const) : ("unreachable" as const),
+        checkedAt: mineruHealth.checkedAt,
+        detail:
+          mineruHealth.checkedAt === null
+            ? "已接入：用官方 MinerU MCP 解析 PDF / DOCX。是否可用请用「检查」探测；探测会真的启动一次服务。"
+            : `已接入：用官方 MinerU MCP 解析 PDF / DOCX。最近一次探测在 ${mineruHealth.checkedAt}。`,
+        enabled: null,
+        orderIndex: null,
+        health: mineruHealth,
       },
-      { id: "document-source", name: "用户附件转为研究来源", implemented: true, configured: true, status: "integrated", detail: "需要用户显式标记为研究材料，之后仍须真实读取" },
+      {
+        id: "document-source",
+        name: "用户附件转为研究来源",
+        implemented: true,
+        configured: true,
+        status: "integrated",
+        detail: "已接入：需要用户显式标记为研究材料，之后仍须真实读取",
+        enabled: null,
+        orderIndex: null,
+        health: null,
+      },
       // Not built. Saying so is the point: a settings page that is silent about
       // a capability reads as though the capability exists.
-      { id: "remote-pdf", name: "远程 PDF 链接自动解析", implemented: false, configured: false, status: "not_implemented", detail: "暂未实现：读取不会把远程 PDF 自动送入转换" },
-      { id: "other-search", name: "其它搜索引擎", implemented: false, configured: false, status: "not_implemented", detail: "暂未实现" },
-      { id: "mcp-marketplace", name: "通用 MCP 平台", implemented: false, configured: false, status: "not_implemented", detail: "暂未实现" },
+      { id: "remote-pdf", name: "远程 PDF 链接自动解析", implemented: false, configured: false, status: "not_implemented", detail: "暂未实现：读取不会把远程 PDF 自动送入转换", enabled: null, orderIndex: null, health: null },
+      { id: "other-search", name: "其它搜索引擎", implemented: false, configured: false, status: "not_implemented", detail: "暂未实现", enabled: null, orderIndex: null, health: null },
+      { id: "mcp-marketplace", name: "通用 MCP 平台", implemented: false, configured: false, status: "not_implemented", detail: "暂未实现", enabled: null, orderIndex: null, health: null },
     ],
     mineru: {
       implemented: true,
@@ -764,7 +904,7 @@ function settingsBundleOf(current: ResearchRoutesOptions): Record<string, unknow
       note:
         "上传上限是所有模式共用的产品限制，配置 Token 不会提高它。" +
         "tools/list 成功只说明 MCP 服务器可用，不代表账户 Token 或解析额度已验证。",
-      readinessCheckedAt: null,
+      readinessCheckedAt: mineruHealth.checkedAt,
       thirdParty: "转换会把文件上传到 MinerU 的在线服务，需要用户明确同意后才会执行。",
     },
     model: {
@@ -1601,14 +1741,14 @@ export function createResearchRouter(
         sendJson(response, 200, { pending: pendingTopics.has(sessionId), task: null, busy: busyState() });
         return;
       }
-      sendJson(response, 200, { pending: false, task: taskBundle(service, task.id, busyState(), runner.hasReportWork(task.id)) });
+      sendJson(response, 200, { pending: false, task: taskBundle(service, task.id, busyState(), runner.hasReportWork(task.id), runner.hasResearchWork(task.id)) });
       return;
     }
 
     // GET /api/research/tasks/:id — the whole workspace bundle.
     const getTaskId = taskIdOf(path);
     if (getTaskId !== undefined && method === "GET") {
-      const bundle = taskBundle(service, getTaskId, busyState(), runner.hasReportWork(getTaskId));
+      const bundle = taskBundle(service, getTaskId, busyState(), runner.hasReportWork(getTaskId), runner.hasResearchWork(getTaskId));
       if (bundle === undefined) {
         sendJson(response, 404, { error: "任务不存在" });
         return;
@@ -1865,7 +2005,23 @@ export function createResearchRouter(
         });
         return;
       }
-      runner.startReport(reportId2);
+      const started = runner.startReport(reportId2);
+      // A request that could not open an attempt is answered as the refusal it
+      // is: no stage was queued, and a 202 here would be the page being told
+      // that work began when nothing did.
+      if (started === undefined || "ok" in started) {
+        const refusal = started !== undefined && "ok" in started ? started : undefined;
+        sendJson(response, refusal?.conflict === true ? 409 : 503, {
+          ok: false,
+          reason: refusal === undefined ? "shutting_down" : "attempt_refused",
+          error: refusal === undefined ? "服务正在关闭，没有接受这次报告请求。" : refusal.problems.join("；"),
+          guidance:
+            refusal === undefined
+              ? "请等待服务重启后再发起报告生成；已读材料与草稿都保留着。"
+              : refusal.guidance,
+        });
+        return;
+      }
       const draft = service.reportDraftOf(reportId2);
       sendJson(response, 202, {
         ok: true,
@@ -1875,7 +2031,7 @@ export function createResearchRouter(
         reportId: null,
         resumed: draft !== null,
         draft: draft === null ? null : { sections: draft.sections.map((section) => section.id), claims: draft.claims.length },
-        generation: service.reportGenerationOf(reportId2),
+        generation: started,
       });
       return;
     }
@@ -1931,6 +2087,18 @@ export function createResearchRouter(
         });
         if (view === undefined) {
           sendJson(response, 404, { error: "任务不存在" });
+          return;
+        }
+        // The runner's own gate, answered with the word the workspace already
+        // knows: an unconfirmed brief is the same missing decision `/report`
+        // refuses with, and nothing was queued, opened or granted here.
+        if ("ok" in view) {
+          sendJson(response, 409, {
+            ok: false,
+            reason: view.reason,
+            error: view.problems.join("；"),
+            guidance: view.guidance,
+          });
           return;
         }
         sendJson(response, 202, { ok: true, started: "research", ...view, reading: reading.reason });

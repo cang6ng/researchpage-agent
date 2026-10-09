@@ -24,7 +24,7 @@ import { Alert, Badge, Button, Loader } from "@mantine/core";
 import { AlertTriangle, CheckCircle2, Clock, History, Radio, RotateCcw } from "lucide-react";
 import { useState } from "react";
 
-import type { ActivityEventView, ProgressView, SourceView, TaskBundle } from "../api.js";
+import type { ActivityEventView, ProgressView, SourceView, TaskBundle, TimingEntryView } from "../api.js";
 
 const LEVEL_LABELS: Readonly<Record<string, string>> = Object.freeze({
   info: "信息",
@@ -75,6 +75,30 @@ function elapsed(from: string | null, until: string | null = null): string {
   if (minutes < 1) return "不到 1 分钟";
   if (minutes < 60) return `${String(minutes)} 分钟`;
   return `${String(Math.floor(minutes / 60))} 小时 ${String(minutes % 60)} 分钟`;
+}
+
+/**
+ * A duration, read the way its own state allows it to be read.
+ *
+ * The current time is read for exactly one state — `running` — because that is
+ * the only one where the work is still going on and the answer is still
+ * changing. A finished piece of work is its two instants subtracted, so
+ * reloading the page, polling, or leaving the tab open overnight does not make
+ * it longer. `unknown` says so in words: work a restart interrupted, or an end
+ * that was never recorded, has no honest duration, and a number invented for it
+ * would be read as if it did.
+ */
+export function durationOf(entry: TimingEntryView): string {
+  if (entry.state === "idle" || entry.startedAt === null) return "—";
+  if (entry.state === "running") return elapsed(entry.startedAt, null);
+  if (entry.state === "ended") {
+    if (entry.endedAt === null) return "无法确定";
+    const start = Date.parse(entry.startedAt);
+    const end = Date.parse(entry.endedAt);
+    if (Number.isNaN(start) || Number.isNaN(end) || end < start) return "无法确定";
+    return elapsed(entry.startedAt, entry.endedAt);
+  }
+  return "无法确定";
 }
 
 function Fact({ label, value, tone, testId }: { readonly label: string; readonly value: string; readonly tone?: string; readonly testId?: string }): React.ReactElement {
@@ -188,6 +212,15 @@ export function ResearchDetailFacts({
 export interface ResearchProgressProps {
   readonly progress: ProgressView;
   readonly attempt: TaskBundle["attempt"];
+  /**
+   * How long research and the report have taken, as the server states them.
+   *
+   * Both come from the record rather than from when this page happens to be
+   * open: `research` is the automatic pass of the current attempt, `report` is
+   * the current generation alone, and a term that has ended stays ended however
+   * long the page keeps polling.
+   */
+  readonly timing: TaskBundle["timing"];
   readonly discovery: TaskBundle["discovery"];
   readonly activityLog: readonly ActivityEventView[];
   readonly sources: readonly SourceView[];
@@ -264,7 +297,10 @@ export function ResearchProgress(props: ResearchProgressProps): React.ReactEleme
           testId="summary-unresolved"
         />
         <Fact label="研究轮次" value={attempt === null ? "尚未开始" : `第 ${String(attempt.number)} 轮`} testId="summary-round" />
-        <Fact label="已用时" value={attempt === null ? "—" : elapsed(attempt.startedAt, props.status === "failed" || props.status === "ready" ? null : null)} testId="summary-elapsed" />
+        <Fact label="已用时" value={durationOf(props.timing.research)} testId="summary-elapsed" />
+        {props.timing.report.state !== "idle" && (
+          <Fact label="报告耗时" value={durationOf(props.timing.report)} testId="summary-report-elapsed" />
+        )}
         <Fact label="最近活动" value={when(progress.lastActivityAt)} testId="summary-last-activity" />
       </div>
 

@@ -363,6 +363,15 @@ export interface ConversionManagerOptions {
 export interface ConversionManager {
   /** Whether MinerU is usable right now, as the server itself answers it. */
   readiness(): Promise<MineruStatus>;
+  /**
+   * The last readiness MinerU was actually *observed* to have, and when.
+   *
+   * It is a read, not a probe: a settings page load must not start a real MCP
+   * subprocess, and a status nobody observed is not a status. `null` means
+   * exactly that — nothing has been observed — which is a different claim from
+   * "unreachable".
+   */
+  observedReadiness(): { readonly ok: boolean; readonly at: number } | null;
   submit(input: ConversionSubmitInput): { readonly ok: true; readonly job: ConversionJobView } | ConversionProblem | Refusal;
   view(jobId: string, ref: DocumentAccessRef): { readonly ok: true; readonly job: ConversionJobView } | ConversionProblem | Refusal;
   retry(jobId: string, ref: DocumentAccessRef): { readonly ok: true; readonly job: ConversionJobView } | ConversionProblem | Refusal;
@@ -686,6 +695,10 @@ export function createConversionManager(options: ConversionManagerOptions): Conv
   }
 
   return {
+    observedReadiness(): { readonly ok: boolean; readonly at: number } | null {
+      return probe === null ? null : { ok: probe.status.ok, at: probe.at };
+    },
+
     async readiness(): Promise<MineruStatus> {
       if (probe !== null && Date.now() - probe.at < PROBE_TTL_MS) return probe.status;
       if (probing !== null) return probing;

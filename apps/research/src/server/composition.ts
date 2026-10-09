@@ -17,6 +17,7 @@ import { join } from "node:path";
 
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import type { ModelClient } from "@every-dagent/agent-core";
+import { NonRetryableModelError } from "@every-dagent/agent-core";
 import { createClient, type Client } from "@every-dagent/client";
 import { createHost, type Host, type TrustedComposition } from "@every-dagent/host";
 import { createPiAiComposition, explicitCredentials } from "@every-dagent/model-pi-ai";
@@ -36,7 +37,7 @@ import { createResearchContextBuilder } from "./context-builder.js";
 import { createConversionManager, type ConversionManager } from "./conversions.js";
 import { exportTaskReportPdf } from "./export.js";
 import { mineruSettingsFrom } from "./mineru.js";
-import { classifyModelFailure, createFailureLedger } from "./model-failures.js";
+import { ABORTED_FAILURE, classifyModelFailure, createFailureLedger } from "./model-failures.js";
 import { createResearchRouter } from "./routes.js";
 import { createResearchRunner, type ResearchRunner } from "./runner.js";
 
@@ -138,6 +139,14 @@ export async function startResearchApp(options: ResearchAppOptions): Promise<Res
    * classified here into a safe category and recorded for the runner that
    * started the stage. The wrapper is also the operator's log line, and it logs
    * the *classified* sentence, never the raw one.
+   *
+   * Two things are established here rather than guessed at later. A cancelled
+   * signal is normalised to the cancellation it is, before anything else reads
+   * the error: a stage that was cancelled while the provider was mid-response
+   * must not be reported as a provider fault. And what is rethrown is always a
+   * safe, non-retryable failure — an error this wrapper does not recognise is
+   * wrapped rather than passed through, because a raw error reaching the Core
+   * would let the Core's own retry logic act on a failure nobody classified.
    */
   const withFailureLog = (client: ModelClient): ModelClient => ({
     limits: client.limits,
@@ -150,10 +159,11 @@ export async function startResearchApp(options: ResearchAppOptions): Promise<Res
           // classification either way.
           yield* client.stream(request, context);
         } catch (error) {
-          const failure = classifyModelFailure(error);
-          failures.record(context.sessionId, error);
+          const failure = context.signal.aborted ? ABORTED_FAILURE : classifyModelFailure(error);
+          failures.record(context.sessionId, failure);
           log(`[app] model step failed: ${failure.code} (${failure.category})`);
-          throw error;
+          if (error instanceof NonRetryableModelError) throw error;
+          throw new NonRetryableModelError(`${failure.problem}${failure.guidance.length === 0 ? "" : ` ${failure.guidance}`}`);
         }
       })();
     },
@@ -240,6 +250,12 @@ export async function startResearchApp(options: ResearchAppOptions): Promise<Res
     client,
     service,
     failures,
+    // A stage whose own session was blocked by an interrupted run finishes its
+    // work in a session of its own: the project is the object, not the session.
+    createSession: async () => {
+      const created = await client.sessions.create();
+      return created.session.sessionId;
+    },
     exportPdf: async (taskId) => {
       const outcome = await exportTaskReportPdf({
         service,

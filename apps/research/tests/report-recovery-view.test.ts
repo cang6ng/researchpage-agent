@@ -53,9 +53,10 @@ describe("the report button", () => {
           canResume: true,
           failure: {
             category: "model_request",
-            code: "model_credential_or_quota",
-            problem: "模型服务拒绝了这次请求（常见原因：凭据无效、账户余额或配额用尽、模型名不可用）。",
-            guidance: "请在设置里检查模型凭据与账户余额。",
+            code: "model_payment_required",
+            problem: "模型服务以「需要付费」拒绝了这次请求（HTTP 402）。",
+            guidance: "请检查模型服务的支付方式、账户余额或配额。",
+            retryable: false,
           },
         }),
       ),

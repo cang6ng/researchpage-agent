@@ -380,9 +380,16 @@ const REPORT_STATUS_WORDS: Readonly<Record<ReportGenerationStatus, string>> = Ob
 
 export interface ReportGenerationInput {
   readonly task: ReportTask;
-  /** The stage of the run actually executing, if one is. */
+  /**
+   * The report stage actually executing right now, or `null`.
+   *
+   * Only `report` and `synthesis` reach this: a research, gap, ask or edit run
+   * is a different piece of work, and reading one of those as "the report is
+   * being written" is how a page came to show「正在生成报告」while nothing was.
+   */
   readonly runningStage: string | null;
   readonly draft: { readonly sections: number; readonly claims: number; readonly outstanding: number } | null;
+  /** Whether this task really has report work in flight — active or queued. */
   readonly busy: boolean;
 }
 
@@ -395,7 +402,7 @@ export function reportGenerationOf(input: ReportGenerationInput): ReportGenerati
     endedAt: generation?.endedAt ?? null,
     resumes: generation?.resumes ?? 0,
     repairs: generation?.repairs ?? 0,
-    failure: generation?.failure ?? null,
+    failure: publicFailureOf(generation?.failure ?? null),
     draft: input.draft,
     reportId,
   };
@@ -424,7 +431,12 @@ export function reportGenerationOf(input: ReportGenerationInput): ReportGenerati
     };
   }
 
-  if (input.busy || (generation !== null && generation.status === "running")) {
+  // Work in flight is the *only* thing that makes this either「running」or
+  // 「accepted」. A persisted `running` with nothing behind it — a process that
+  // died mid-report, an attempt whose run never came back — is not progress, and
+  // reading it as progress is what left the recovery button disabled with no way
+  // to use it.
+  if (input.busy) {
     const accepted = input.runningStage === null;
     return {
       ...base,
@@ -461,7 +473,10 @@ export function reportGenerationOf(input: ReportGenerationInput): ReportGenerati
     };
   }
 
-  if (generation !== null && generation.status === "failed") {
+  // A failed attempt, and an attempt that was left `running` by a process that
+  // is gone, are the same answer to the reader: nothing is being written, and
+  // recovery is what moves this forward.
+  if (generation !== null && (generation.status === "failed" || generation.status === "running")) {
     const failure = generation.failure;
     return {
       ...base,
@@ -469,7 +484,7 @@ export function reportGenerationOf(input: ReportGenerationInput): ReportGenerati
       displayName: REPORT_STATUS_WORDS.failed,
       userMessage:
         failure === null
-          ? "报告生成失败，而且还没有写出可用的草稿；已读材料都保留着，可以用现有资料重试报告，不需要重新检索。"
+          ? "报告生成没有完成，而且还没有写出可用的草稿；已读材料都保留着，可以用现有资料重试报告，不需要重新检索。"
           : `${failure.problem} ${failure.guidance}`,
       canResume: true,
       blockedBy: null,
@@ -483,6 +498,32 @@ export function reportGenerationOf(input: ReportGenerationInput): ReportGenerati
     userMessage: "还没有开始撰写报告；材料已经就绪，可以直接生成。",
     canResume: false,
     blockedBy: null,
+  };
+}
+
+/**
+ * A stored failure, projected onto what a client is allowed to see.
+ *
+ * Built field by field rather than spread, so a field added to the internal
+ * record later cannot leak by accident: a category, a fixed code, two sentences
+ * and whether retrying could work. `retryable` defaults to false — a record
+ * written before it existed claims nothing, and claiming nothing is not
+ * permission to retry.
+ */
+export function publicFailureOf(failure: ReportGenerationFailure | null): {
+  readonly category: string;
+  readonly code: string;
+  readonly problem: string;
+  readonly guidance: string;
+  readonly retryable: boolean;
+} | null {
+  if (failure === null) return null;
+  return {
+    category: failure.category,
+    code: failure.code,
+    problem: failure.problem,
+    guidance: failure.guidance,
+    retryable: failure.retryable === true,
   };
 }
 
@@ -586,6 +627,137 @@ function stageFromActivity(event: ResearchActivityEvent, fallback: ResearchProgr
 
 /** The stages a research pass moves through inside itself. */
 const RESEARCH_INNER_STAGES: ReadonlySet<ResearchProgressStage> = new Set(["searching", "reading", "assessing", "waiting_retry"]);
+
+/**
+ * How long a piece of work took, as a fact rather than as a clock that runs on.
+ *
+ * `startedAt` and `endedAt` are the two real instants the product recorded, and
+ * `state` says what kind of pair this is: `idle` (nothing started), `running`
+ * (started, no end yet — and only then does a client have a reason to read the
+ * current time), `ended` (both known), or `unknown`. `unknown` is not a
+ * placeholder for zero: it is what an interrupted run, an attempt with no end
+ * record, or a pair of instants that do not make sense get, because a page that
+ * shows「已用时 1 小时 23 分钟」for work that stopped at ten minutes is worse
+ * than one that says it cannot tell.
+ */
+export interface TimingEntry {
+  readonly startedAt: string | null;
+  readonly endedAt: string | null;
+  readonly state: "idle" | "running" | "ended" | "unknown";
+}
+
+export interface TaskTiming {
+  readonly research: TimingEntry;
+  readonly report: TimingEntry;
+}
+
+export interface TimingInput {
+  readonly task: ReportTask;
+  readonly runs: readonly ResearchRunRecord[];
+  /** Whether this task really has automatic research work in flight. */
+  readonly researchBusy: boolean;
+  /** Whether this task really has report work in flight. */
+  readonly reportBusy: boolean;
+}
+
+/** The stages that are part of the research pass: the pass itself and its gap rounds. */
+const TIMED_RESEARCH_STAGES: ReadonlySet<string> = new Set(["research", "gap"]);
+
+function laterOf(left: string | null, right: string | null): string | null {
+  if (left === null) return right;
+  if (right === null) return left;
+  return right > left ? right : left;
+}
+
+/**
+ * When the research stopped being the thing that was happening.
+ *
+ * The report's own work is not research time: a reader watching「研究」is
+ * watching the pass that searches, reads and assesses, and a report written
+ * afterwards — or a report recovered an hour later — does not extend it. So the
+ * boundary is the first moment a report or synthesis pass began.
+ *
+ * Only the current attempt's own report is a boundary. A project that failed a
+ * report, was retried the next morning and researched again carries report
+ * records older than the new attempt in its history; read as boundaries they
+ * would filter out the very research they came before, and a pass that really
+ * ran and really ended would be shown as a duration nobody can determine.
+ */
+function firstReportMoment(task: ReportTask, runs: readonly ResearchRunRecord[], attemptStart: string): string | null {
+  const moments = [
+    ...runs
+      .filter((record) => (record.stage === "report" || record.stage === "synthesis") && record.startedAt >= attemptStart)
+      .map((record) => record.startedAt),
+    ...(task.reportGeneration == null || task.reportGeneration.startedAt < attemptStart
+      ? []
+      : [task.reportGeneration.startedAt]),
+  ];
+  if (moments.length === 0) return null;
+  return [...moments].sort()[0] ?? null;
+}
+
+/**
+ * The two durations this project can state, and the ones it cannot.
+ *
+ * Research is timed over the current attempt's own automatic runs: the pass and
+ * its gap rounds, from the moment the attempt started, and not the user's own
+ * 「再补查一些资料」actions (those are instructions, not the pass) nor anything
+ * that begins after the report did. Its end is the latest real end of those runs
+ * — once they are all finished, the research is over even while a report is
+ * being written.
+ *
+ * The report is timed over the current generation attempt alone, so recovering a
+ * report an hour later reports the recovery's duration rather than the hour.
+ * Both are read from records; nothing here invents a start, and nothing reads
+ * the current time except a caller that has been told the state is `running`.
+ */
+export function timingOf(input: TimingInput): TaskTiming {
+  const { task, runs } = input;
+  const attemptStart = task.attempt?.startedAt ?? null;
+
+  const research = ((): TimingEntry => {
+    // The pass only exists once the attempt does; the attempt is also what a
+    // retry resets, which is why research time is measured from it and not from
+    // the project's own creation.
+    if (attemptStart === null) return { startedAt: null, endedAt: null, state: "idle" };
+    const reportStart = firstReportMoment(task, runs, attemptStart);
+    const relevant = runs.filter(
+      (record) =>
+        TIMED_RESEARCH_STAGES.has(record.stage) &&
+        record.userText === undefined &&
+        record.startedAt >= attemptStart &&
+        (reportStart === null || record.startedAt < reportStart),
+    );
+    if (relevant.some((record) => record.status === "running") || input.researchBusy) {
+      return { startedAt: attemptStart, endedAt: null, state: "running" };
+    }
+    if (relevant.length === 0) return { startedAt: attemptStart, endedAt: null, state: "unknown" };
+    if (relevant.some((record) => record.status === "interrupted")) {
+      // The end a restart records is when the interruption was *detected*, not
+      // when the work stopped, so it is not an end this projection may use.
+      return { startedAt: attemptStart, endedAt: null, state: "unknown" };
+    }
+    const ends = relevant.map((record) => record.endedAt);
+    if (ends.some((end) => end === null)) return { startedAt: attemptStart, endedAt: null, state: "unknown" };
+    return { startedAt: attemptStart, endedAt: ends.reduce(laterOf, null), state: "ended" };
+  })();
+
+  const report = ((): TimingEntry => {
+    const generation = task.reportGeneration ?? null;
+    if (generation == null) return { startedAt: null, endedAt: null, state: "idle" };
+    if (input.reportBusy && generation.endedAt === null) {
+      return { startedAt: generation.startedAt, endedAt: null, state: "running" };
+    }
+    if (generation.endedAt !== null && generation.status !== "running") {
+      return { startedAt: generation.startedAt, endedAt: generation.endedAt, state: "ended" };
+    }
+    // No end, and nothing producing one: an attempt a restart interrupted, or
+    // one whose end was never recorded. The start is still a fact.
+    return { startedAt: generation.startedAt, endedAt: null, state: "unknown" };
+  })();
+
+  return { research, report };
+}
 
 export interface ProgressInput {
   readonly task: ReportTask;
