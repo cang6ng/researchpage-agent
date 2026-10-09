@@ -189,12 +189,16 @@ P0 优先于 P1 的顺序被遵守：报告生成能力在动设置与 UI 之前
 - `pnpm typecheck`（三个 project：根 / web browser / research browser）：**PASS，0 错误**。
 - `pnpm build:research`：**PASS**。
 - 离线全量 `npx vitest run`：**2240 passed / 24 skipped / 0 failed**（195 个文件，6 skipped）。
+  串行复核 `npx vitest run --no-file-parallelism`：**2240 passed / 24 skipped / 0 failed**，两次结果一致。
 - 本轮新增测试文件：`report-table-contract`(10)、`report-ranking-lexicon`(9)、`prompt-budget`(3)、`report-recovery-api`(5)、`report-recovery-view`(5)、`product-settings`(11)、`settings-api`(8)；并更新 `edit-preflight`、`artifact-view`、`trust-ux`、`research-progress-view`、`intent-view` 到新契约。
 - **SKIP（如实记录）**：
   - 真实 MinerU OCR：本轮**没有**重新执行（历史验收保留；未改动转换链路）。
   - 真实 arXiv 直连：观测到超时（20s 无响应），由 OpenAlex 回退成功；这不是产品缺陷，但也没有做到「arXiv 直连可用」。
   - 模型网页配置、MinerU Token 网页写入：未实现，未测试。
-- **已知 flaky（与本次改动无关，单独重跑即过）**：`apps/web/tests/shell-m5-approval.browser.test.ts` 在整仓并行跑时偶发 CDP 超时；本轮单独重跑 8/8 通过。
+- **已知 flaky（与本次改动无关，有实测特征）**：`apps/web/tests/shell-*.browser.test.ts` 在**整仓并行**跑时偶发失败——
+  本轮三次并行运行各失败 1 例，且三例分属三个不同文件（`shell-m5-approval` 的拒绝分支、`shell-m5-sessions` 的 stale rename、`shell-browser` 的刷新后恢复选择），
+  失败点都在真实 Chrome（CDP）的等待上。旁证：四个 `apps/web` 浏览器测试文件**一起单独跑 44/44 通过**；串行跑整仓 2240/2240 通过；`fake` 模型不受影响。
+  这台机器上同时在跑的还有用户自己的 8791 / 4310 两个服务。没有证据指向本轮改动：本轮没有修改 `apps/web`、Agent Core、Host、Protocol 或 Client。
 - **改动过的既有断言（不是删测试换 PASS）**：
   - `edit-preflight.test.ts` 两例：空白表格现在在**读取阶段**就被按字段路径拒绝（更早、更精确），因此不再出现中间态 `proposal_invalid`；「一份会到读者手里带空白格的表格永远不会成为待确认提案」这一承诺仍在断言中，同一套「一次修复后停止」的状态机由旁边的 obligation-losing 用例继续覆盖。
   - `research-progress-view.test.ts`：断言从「默认显示最近十条」改为「默认折叠 + 可展开 + 可按类型分组 + 摘要计数准确」，与 Sol 的要求一致。
