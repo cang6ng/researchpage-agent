@@ -72,6 +72,16 @@ export interface PiAiModelClientOptions {
    * timeout arrives as an error terminal, which this adapter turns into a throw.
    */
   readonly timeoutMs?: number;
+  /**
+   * The HTTP implementation requests are sent with, when a caller supplies one.
+   *
+   * It is pi-ai's own per-request `fetch` seam, used here for two things: a test
+   * can drive real HTTP against a loopback server without a provider, and the
+   * adapter can read the status of the response the SDK is about to reject.
+   * Production leaves it out — `globalThis.fetch` is never replaced, and the
+   * wrapper below is per request, not global.
+   */
+  readonly fetch?: typeof globalThis.fetch;
 }
 
 /**
@@ -84,6 +94,64 @@ export interface PiAiModelClientOptions {
  * serializer evidence for is one where it cannot say that.
  */
 export class UnsupportedPiAiProfileError extends NonRetryableModelError {}
+
+/**
+ * The request-level reasons this adapter is willing to name, and no others.
+ *
+ * It is a closed set on purpose. The adapter is the one component that sees a
+ * provider's own report, and what a reader needs from it is not the report: it
+ * is which of a handful of situations they are in, because each one asks for a
+ * different action. Anything the adapter cannot establish — a failure with no
+ * observable status, a response body that only *claims* a code, a stream that
+ * broke after a 200 — is `unknown`, which is a real answer rather than a guess
+ * dressed as a diagnosis.
+ */
+export type PiAiRequestFailureKind =
+  | "payment_required"
+  | "authentication_failed"
+  | "rate_limited"
+  | "service_unavailable"
+  | "aborted"
+  | "unknown";
+
+/**
+ * The fixed sentence each kind travels as.
+ *
+ * These strings, and nothing else, are what leaves the provider boundary. No
+ * status line, body, header, URL, credential, cause or stack is carried — not
+ * even in a `cause` — because a message that is safe only until someone prints
+ * it is not safe.
+ */
+const REQUEST_FAILURE_WORDS: Readonly<Record<PiAiRequestFailureKind, string>> = Object.freeze({
+  payment_required: "the provider refused the request: payment required",
+  authentication_failed: "the provider refused the request: authentication failed",
+  rate_limited: "the provider refused the request: rate limited",
+  service_unavailable: "the provider refused the request: service unavailable",
+  aborted: "the provider request was aborted",
+  unknown: "the provider request failed",
+});
+
+/**
+ * A provider failure with a trusted, non-secret classification.
+ *
+ * It carries a kind from the closed set and, when the provider said so in a
+ * header this adapter parsed to a number, how long it asked the caller to wait.
+ * It stays a `NonRetryableModelError` so the Core never retries a request on
+ * its own: whether a request may be tried again is the caller's decision, taken
+ * from facts this type carries rather than re-derived from prose.
+ */
+export class PiAiRequestFailure extends NonRetryableModelError {
+  readonly kind: PiAiRequestFailureKind;
+  /** The provider's own wait, when it was a number this adapter could trust. */
+  readonly retryAfterMs: number | null;
+
+  constructor(kind: PiAiRequestFailureKind, retryAfterMs: number | null = null) {
+    super(REQUEST_FAILURE_WORDS[kind]);
+    this.kind = kind;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
 
 /**
  * The provider APIs this adapter has serializer evidence for.
@@ -210,7 +278,7 @@ export function createPiAiModelClient(options: PiAiModelClientOptions): ModelCli
 }
 
 async function* stream(
-  { models, model, apiKey, timeoutMs }: PiAiModelClientOptions,
+  { models, model, apiKey, timeoutMs, fetch: injectedFetch }: PiAiModelClientOptions,
   limits: ModelLimits,
   profile: BoundedProfile["cap"],
   request: ModelRequest,
@@ -242,6 +310,21 @@ async function* stream(
     return undefined;
   };
 
+  // What the provider answered, read from the response itself.
+  //
+  // `onResponse` only fires for a response the SDK accepted, so it cannot
+  // classify the 4xx/5xx the SDK rejects before that — which is exactly the
+  // case a reader needs named. The status is therefore read here, at the one
+  // point every response passes through, before the SDK looks at it.
+  const observed: { status: number | null; retryAfterMs: number | null } = { status: null, retryAfterMs: null };
+  const readResponse = async (input: Parameters<typeof globalThis.fetch>[0], init?: Parameters<typeof globalThis.fetch>[1]): Promise<Response> => {
+    const send = injectedFetch ?? globalThis.fetch;
+    const response = await send(input, init);
+    observed.status = response.status;
+    observed.retryAfterMs = retryAfterMsOf(response.headers);
+    return response;
+  };
+
   let events: AsyncIterable<AssistantMessageEvent>;
   try {
     events = models.stream(
@@ -259,6 +342,7 @@ async function* stream(
         maxTokens: cap,
         timeoutMs,
         onPayload,
+        fetch: readResponse,
         // The request layer must not retry: the AgentLoop retries whole steps, and two
         // layers retrying the same failure would multiply the attempts while hiding
         // the decision from the turn's own record. pi-ai's own default is already zero
@@ -267,7 +351,7 @@ async function* stream(
       },
     );
   } catch (error) {
-    throw refusal ?? localFailure(error);
+    throw refusal ?? localFailure(error, observed, context);
   }
 
   const reported = new Set<string>();
@@ -294,7 +378,7 @@ async function* stream(
         return;
 
       case "error":
-        throw refusal ?? providerFailure(event.reason);
+        throw refusal ?? providerFailure(event.reason, observed, context);
 
       case "start":
       case "text_start":
@@ -322,6 +406,74 @@ async function* stream(
   // without one is broken — and the Core reads a silent end as a completed step,
   // which makes this the one failure it must never be handed.
   throw refusal ?? new NonRetryableModelError("the provider stream ended without a done or error event");
+}
+
+/**
+ * How long the provider asked the caller to wait, when it said so in a number.
+ *
+ * `Retry-After` is either a whole number of seconds or an HTTP date; only the
+ * first is a fact this adapter can hand on as a duration. Anything else — a date,
+ * a fractional or negative value, an unparsable string — is no answer at all, and
+ * no answer is what the caller receives.
+ */
+function retryAfterMsOf(headers: Headers): number | null {
+  let raw: string | null;
+  try {
+    raw = headers.get("retry-after");
+  } catch {
+    return null;
+  }
+  if (raw === null) return null;
+  const seconds = Number(raw.trim());
+  if (!Number.isFinite(seconds) || !Number.isInteger(seconds) || seconds < 0) return null;
+  return seconds * 1000;
+}
+
+/**
+ * The kind a status of a response this adapter actually saw stands for.
+ *
+ * Only the statuses whose meaning the product acts differently on are named:
+ * money, credentials, rate, service. Every other status — including the 5xx this
+ * product has no specific stance on — is `unknown`, because "the provider said
+ * 500" is not the same information as "the provider is temporarily unavailable".
+ */
+function kindOfStatus(status: number): PiAiRequestFailureKind {
+  switch (status) {
+    case 402:
+      return "payment_required";
+    case 401:
+    case 403:
+      return "authentication_failed";
+    case 429:
+      return "rate_limited";
+    case 503:
+      return "service_unavailable";
+    default:
+      return "unknown";
+  }
+}
+
+/**
+ * The classification of a failure, from the facts this adapter established.
+ *
+ * The order is the order of trust. A cancelled signal outranks everything: the
+ * caller asked for this. A numeric status the response carried is next. Nothing
+ * else is read — not the SDK's message, not a status a provider wrote into a
+ * body, and not a stream that failed after a 200 — because those are exactly
+ * the cases where naming a cause would be a guess about someone else's text.
+ */
+function classifiedFailure(
+  observed: { readonly status: number | null; readonly retryAfterMs: number | null },
+  context: RuntimeContext,
+  reason?: "aborted" | "error",
+): PiAiRequestFailure {
+  if (reason === "aborted" || context.signal.aborted) return new PiAiRequestFailure("aborted");
+  if (observed.status === null) return new PiAiRequestFailure("unknown");
+  const kind = kindOfStatus(observed.status);
+  return new PiAiRequestFailure(
+    kind,
+    kind === "rate_limited" || kind === "service_unavailable" ? observed.retryAfterMs : null,
+  );
 }
 
 /**
@@ -382,25 +534,36 @@ const UNREADABLE: unique symbol = Symbol("every-dagent.capability-unreadable");
  * requires is a request this adapter cannot send — deterministically, whatever the
  * provider would have said. It is reported as such instead of being retried, and
  * the provider's rejection is never what a caller sees.
+ *
+ * A failure that got as far as a response is not local, however it surfaced: the
+ * status the response carried is the one fact worth keeping, and a request whose
+ * body could not be built never had one.
  */
-function localFailure(error: unknown): NonRetryableModelError {
+function localFailure(
+  error: unknown,
+  observed: { readonly status: number | null; readonly retryAfterMs: number | null },
+  context: RuntimeContext,
+): NonRetryableModelError {
   if (error instanceof NonRetryableModelError) return error;
+  if (observed.status !== null || context.signal.aborted) return classifiedFailure(observed, context);
   return new NonRetryableModelError("the request could not be sent to the provider");
 }
 
 /**
- * A provider failure, in fixed words.
+ * A provider failure, in fixed words and from facts this adapter established.
  *
  * Nothing of the provider's own report travels: no body, header, cause,
  * credential, URL or stack. The reason is classified by the terminal pi-ai
- * reported — an abort is an abort — and everything else is one safe failure.
- * Whether a failure may be retried is not decided here: this adapter has no
- * trusted transient signal to offer, so it offers the Core the safe default.
+ * reported — an abort is an abort — and by the status of the response, when
+ * there was one. Whether the caller should try again is not decided here; what
+ * travels is the kind, and the wait the provider itself asked for.
  */
-function providerFailure(reason: "aborted" | "error"): NonRetryableModelError {
-  return new NonRetryableModelError(
-    reason === "aborted" ? "the provider request was aborted" : "the provider request failed",
-  );
+function providerFailure(
+  reason: "aborted" | "error",
+  observed: { readonly status: number | null; readonly retryAfterMs: number | null },
+  context: RuntimeContext,
+): NonRetryableModelError {
+  return classifiedFailure(observed, context, reason);
 }
 
 /** A short, provider-free description of an event shape this adapter does not know. */

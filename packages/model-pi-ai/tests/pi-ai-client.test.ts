@@ -1,11 +1,14 @@
 import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
+import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import type { AssistantMessageEvent, JsonObject } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { DEFAULT_MODEL_FRAMING, defineModelBudget } from "@every-dagent/agent-core";
 import type { ModelClient, ModelEvent, ModelRequest, RuntimeContext } from "@every-dagent/agent-core";
 
-import { UnsupportedPiAiProfileError, createPiAiModelClient } from "../src/pi-ai-client.js";
+import { PiAiRequestFailure, UnsupportedPiAiProfileError, createPiAiModelClient } from "../src/pi-ai-client.js";
 import type { PiAiStreamSource } from "../src/pi-ai-client.js";
 import {
   abortedScript,
@@ -513,5 +516,243 @@ describe("PiAiModelClient requests", () => {
     await collect(client, request());
 
     expect(source.options[0]?.apiKey).toBeUndefined();
+  });
+});
+
+/**
+ * Request-level failures, classified from what was actually observed.
+ *
+ * The defect these cases pin down: the adapter had one sentence for every
+ * provider failure, so a rate limit, a cancellation and an exhausted balance
+ * were indistinguishable — and the application, reading the one sentence it
+ * was given, told every reader to check a balance. What is tested here is that
+ * a status the response really carried becomes a kind, and that everything
+ * else stays `unknown` rather than becoming a guess.
+ *
+ * Two levels are covered on purpose. The first drives the adapter's own
+ * `fetch` seam with a source that performs the request, so the status really
+ * passes through the wrapper the adapter installs. The second does the same
+ * thing through pi-ai's *real* SDK against a real local HTTP server, which is
+ * also where "the SDK does not retry behind our back" is established: the
+ * request count is the evidence.
+ */
+function fakeResponse(status: number, headers: Record<string, string> = {}): Response {
+  return new Response("{}", { status, headers });
+}
+
+/** A source that sends the request through the caller's own fetch, like a real adapter does. */
+function fetchingSource(input: {
+  readonly status: number;
+  readonly headers?: Record<string, string>;
+}): PiAiStreamSource & { readonly calls: number[] } {
+  const calls: number[] = [];
+  return {
+    calls,
+    async *stream(_model, _context, options): AsyncGenerator<AssistantMessageEvent> {
+      const response = await options?.fetch?.("https://provider.test/v1/chat/completions", { method: "POST" });
+      calls.push(response?.status ?? 0);
+      // What a provider terminal looks like after the client rejected the
+      // response: the status is gone from the error, which is exactly why the
+      // adapter has to have read it at the response.
+      yield {
+        type: "error",
+        reason: "error",
+        error: fauxAssistantMessage("", { stopReason: "error", errorMessage: `provider returned ${String(response?.status ?? 0)}` }),
+      };
+    },
+  };
+}
+
+function statusClient(status: number, headers: Record<string, string> = {}): {
+  readonly client: ModelClient;
+  readonly source: PiAiStreamSource & { readonly calls: number[] };
+} {
+  const source = fetchingSource({ status, headers });
+  return {
+    source,
+    client: createPiAiModelClient({
+      models: source,
+      model: MODEL,
+      fetch: () => Promise.resolve(fakeResponse(status, headers)),
+    }),
+  };
+}
+
+describe("request-level failures named from the response", () => {
+  it("names the statuses whose meaning the product acts on", async () => {
+    const cases: readonly (readonly [number, string])[] = [
+      [402, "payment_required"],
+      [401, "authentication_failed"],
+      [403, "authentication_failed"],
+      [429, "rate_limited"],
+      [503, "service_unavailable"],
+    ];
+    for (const [status, kind] of cases) {
+      const { client, source } = statusClient(status);
+      const failure = await collect(client, request()).catch((error: unknown) => error);
+      expect(failure, String(status)).toBeInstanceOf(PiAiRequestFailure);
+      expect((failure as PiAiRequestFailure).kind, String(status)).toBe(kind);
+      // One request, one failure: the adapter itself never retries.
+      expect(source.calls).toEqual([status]);
+    }
+  });
+
+  it("keeps the wait the provider asked for, and only when it is a number", async () => {
+    const withSeconds = statusClient(429, { "retry-after": "2" });
+    const limited = (await collect(withSeconds.client, request()).catch((error: unknown) => error)) as PiAiRequestFailure;
+    expect(limited.retryAfterMs).toBe(2_000);
+
+    const withDate = statusClient(429, { "retry-after": "Wed, 21 Oct 2026 07:28:00 GMT" });
+    const dated = (await collect(withDate.client, request()).catch((error: unknown) => error)) as PiAiRequestFailure;
+    expect(dated.retryAfterMs).toBeNull();
+
+    const withoutHeader = statusClient(503);
+    const plain = (await collect(withoutHeader.client, request()).catch((error: unknown) => error)) as PiAiRequestFailure;
+    expect(plain.kind).toBe("service_unavailable");
+    expect(plain.retryAfterMs).toBeNull();
+  });
+
+  it("says unknown for a status it has no stance on", async () => {
+    for (const status of [400, 404, 422, 500, 502, 504]) {
+      const { client } = statusClient(status);
+      const failure = (await collect(client, request()).catch((error: unknown) => error)) as PiAiRequestFailure;
+      expect(failure.kind, String(status)).toBe("unknown");
+    }
+  });
+
+  it("says unknown when a provider only writes a status into its own message", async () => {
+    // Nothing here observed a 402: the number is inside text this adapter did
+    // not write, so it is not a fact about the response.
+    const { client } = clientFor([errorScript("HTTP 402 Insufficient Balance sk-secret")]);
+    const failure = (await collect(client, request()).catch((error: unknown) => error)) as PiAiRequestFailure;
+    expect(failure.kind).toBe("unknown");
+    expect(String(failure)).not.toContain("402");
+    expect(String(failure)).not.toContain("sk-secret");
+  });
+
+  it("says unknown when a stream broke after the response was accepted", async () => {
+    const { client } = statusClient(200, { "content-type": "application/json" });
+    const failure = (await collect(client, request()).catch((error: unknown) => error)) as PiAiRequestFailure;
+    expect(failure.kind).toBe("unknown");
+  });
+
+  it("lets an aborted signal outrank whatever the provider answered", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { client } = statusClient(429);
+    const failure = (await collect(client, request()).catch((error: unknown) => error)) as PiAiRequestFailure;
+    void failure;
+    const aborted = await (async (): Promise<unknown> => {
+      try {
+        for await (const event of client.stream(request(), { sessionId: "s-1", signal: controller.signal })) {
+          void event;
+        }
+        return undefined;
+      } catch (error) {
+        return error;
+      }
+    })();
+    expect(aborted).toBeInstanceOf(PiAiRequestFailure);
+    expect((aborted as PiAiRequestFailure).kind).toBe("aborted");
+  });
+
+  it("carries nothing but the kind and the wait", async () => {
+    const source: PiAiStreamSource = {
+      async *stream(_model, _context, options): AsyncGenerator<AssistantMessageEvent> {
+        await options?.fetch?.("https://provider.test/v1/chat/completions", { method: "POST" });
+        yield {
+          type: "error",
+          reason: "error",
+          error: fauxAssistantMessage("", { stopReason: "error", errorMessage: "sk-live-SECRET https://provider.test/v1 402" }),
+        };
+      },
+    };
+    const client = createPiAiModelClient({
+      models: source,
+      model: MODEL,
+      apiKey: "sk-live-SECRET",
+      fetch: () => Promise.resolve(fakeResponse(402, { "x-request-id": "req-secret" })),
+    });
+    const failure = await collect(client, request()).catch((error: unknown) => error);
+    // The message is the adapter's own words, and the object carries two
+    // facts: a kind from a closed set and a wait.
+    expect(Object.keys(failure as object).sort()).toEqual(["kind", "name", "retryAfterMs"]);
+    const printed = `${String(failure)}${JSON.stringify(failure)}`;
+    expect(printed).not.toContain("SECRET");
+    expect(printed).not.toContain("req-secret");
+    expect(printed).not.toContain("provider.test");
+  });
+});
+
+/**
+ * The same classification through pi-ai's own clients.
+ *
+ * The adapter hands the SDK a per-request `fetch`, and this is the test that
+ * proves it: the SDK's real HTTP client sends the request, the local server
+ * answers with a status, and the adapter reads it. The request count is what
+ * the Core's contract depends on — one failed request must be one request.
+ */
+describe("request-level failures through the real SDK", () => {
+  let server: Server;
+  let origin = "";
+  let seen: number[] = [];
+  let answer: { readonly status: number; readonly headers: Record<string, string>; readonly body: string } = {
+    status: 429,
+    headers: {},
+    body: "{}",
+  };
+
+  beforeAll(async () => {
+    server = createServer((_request, response) => {
+      seen.push(answer.status);
+      response.writeHead(answer.status, { "content-type": "application/json", ...answer.headers });
+      response.end(answer.body);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    origin = `http://127.0.0.1:${String(address.port)}/v1`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  /** The client the product composes, pointed at the local server. */
+  function clientAgainst(): ModelClient {
+    const models = builtinModels();
+    const catalogue = models.getModel("deepseek", "deepseek-flash");
+    if (catalogue === undefined) throw new Error("the catalogue model the product composes is missing");
+    return createPiAiModelClient({ models, model: { ...catalogue, baseUrl: origin }, apiKey: "test-key" });
+  }
+
+  it("names a refusal the SDK rejected, and sends exactly one request", async () => {
+    seen = [];
+    answer = { status: 429, headers: { "retry-after": "3" }, body: "{\"error\":{\"message\":\"slow down sk-secret\"}}" };
+    const client = clientAgainst();
+    const failure = await collect(client, request()).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PiAiRequestFailure);
+    expect((failure as PiAiRequestFailure).kind).toBe("rate_limited");
+    expect((failure as PiAiRequestFailure).retryAfterMs).toBe(3_000);
+    // The SDK was told `maxRetries: 0`, and this is the proof: one request.
+    expect(seen).toEqual([429]);
+    expect(JSON.stringify(failure)).not.toContain("sk-secret");
+  });
+
+  it("names a payment refusal from the same path", async () => {
+    seen = [];
+    answer = { status: 402, headers: {}, body: "{\"error\":{\"message\":\"insufficient balance\"}}" };
+    const client = clientAgainst();
+    const failure = await collect(client, request()).catch((error: unknown) => error);
+    expect((failure as PiAiRequestFailure).kind).toBe("payment_required");
+    expect(seen).toEqual([402]);
+  });
+
+  it("keeps an unrecognized status unknown", async () => {
+    seen = [];
+    answer = { status: 500, headers: {}, body: "{\"error\":{\"message\":\"internal\"}}" };
+    const client = clientAgainst();
+    const failure = await collect(client, request()).catch((error: unknown) => error);
+    expect((failure as PiAiRequestFailure).kind).toBe("unknown");
+    expect(seen).toEqual([500]);
   });
 });

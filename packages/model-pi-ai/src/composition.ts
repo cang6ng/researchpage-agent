@@ -105,6 +105,15 @@ export interface PiAiCompositionOptions {
   readonly allowHttp?: readonly string[];
   /** The largest timeout a settings value may ask for, in milliseconds. */
   readonly maxTimeoutMs?: number;
+  /**
+   * The HTTP implementation the adapter sends with, when a caller supplies one.
+   *
+   * It is forwarded to the client exactly as given — this composition neither
+   * replaces `globalThis.fetch` nor inspects the value — and it is what lets a
+   * test drive the adapter against a real local HTTP server, with the real SDK,
+   * without a provider.
+   */
+  readonly fetch?: typeof globalThis.fetch;
 }
 
 /** The `Model<Api>` shape this module reads, checked field by field. */
@@ -369,6 +378,7 @@ export function createPiAiComposition(options: PiAiCompositionOptions): PiAiComp
         apiKey: credential,
         ...(declaredCeiling === undefined ? {} : { maxTokens: declaredCeiling }),
         ...(settings.timeoutMs === undefined ? {} : { timeoutMs: settings.timeoutMs }),
+        ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
       });
 
       // Nothing to release: the adapter owns no client of its own, and the

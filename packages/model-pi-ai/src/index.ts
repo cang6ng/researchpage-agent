@@ -1,5 +1,10 @@
-export { UnsupportedPiAiProfileError, createPiAiModelClient, isAuditedApi } from "./pi-ai-client.js";
-export type { PiAiModelClientOptions, PiAiStreamSource } from "./pi-ai-client.js";
+export {
+  PiAiRequestFailure,
+  UnsupportedPiAiProfileError,
+  createPiAiModelClient,
+  isAuditedApi,
+} from "./pi-ai-client.js";
+export type { PiAiModelClientOptions, PiAiRequestFailureKind, PiAiStreamSource } from "./pi-ai-client.js";
 export {
   DEFAULT_MAX_TIMEOUT_MS,
   PiAiCompositionError,
