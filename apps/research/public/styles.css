@@ -3583,3 +3583,130 @@ body {
   letter-spacing: 0.03em;
   color: var(--rp-ink-3);
 }
+
+/* ------------------------------------------------------- intent discovery -- */
+
+/* The conversation and the decision, side by side when there is room.
+   On a narrow screen they stack, and the decision card folds away so the
+   conversation keeps the height it needs; on a wide one the card is pinned
+   beside the conversation and the toggle disappears, because a control that
+   would do nothing is worse than no control. */
+.rp-intent {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.rp-intent__main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* The column is narrow enough to read as a conversation and wide enough for a
+   sentence of Chinese not to wrap every eight characters. */
+.rp-intent__main .rp-chat {
+  max-width: 740px;
+  gap: 20px;
+}
+
+.rp-intent__composer {
+  position: sticky;
+  bottom: 14px;
+  z-index: 2;
+  margin-top: 20px;
+  padding-top: 10px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, var(--rp-paper) 26%);
+}
+
+.rp-intent__aside {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.rp-intent__aside-toggle {
+  align-self: flex-start;
+  border: 1px solid var(--rp-hairline);
+  background: var(--rp-surface);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--rp-ink-2);
+  cursor: pointer;
+}
+
+.rp-intent__aside-toggle:hover {
+  border-color: rgba(36, 75, 96, 0.3);
+}
+
+.rp-intent__aside-body[hidden] {
+  display: none;
+}
+
+@media (min-width: 1280px) {
+  .rp-intent {
+    grid-template-columns: minmax(0, 1fr) minmax(320px, 360px);
+    gap: 32px;
+  }
+
+  .rp-intent__aside {
+    position: sticky;
+    top: 18px;
+    max-height: calc(100vh - 36px);
+    overflow-y: auto;
+  }
+
+  /* Always visible where there is a column for it. */
+  .rp-intent__aside-toggle {
+    display: none;
+  }
+
+  .rp-intent__aside-body[hidden] {
+    display: block;
+  }
+}
+
+/* The sentence about the research budget is body copy, not a scoreboard cell:
+   it belongs under the summary at the width of the reading column, and it must
+   not be mistaken for an arrival time. */
+.rp-research__budget {
+  margin: 12px 0 0;
+  max-width: 760px;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--rp-ink-3);
+}
+
+/* The reasoning behind a question, as a disclosure: the question is what a
+   reader answers, and the reasoning is what they reach for if they want it. */
+.rp-chat__why {
+  margin-top: 8px;
+}
+
+.rp-chat__why > summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  letter-spacing: 0.03em;
+  color: var(--rp-ink-3);
+  list-style: none;
+}
+
+.rp-chat__why > summary::-webkit-details-marker {
+  display: none;
+}
+
+.rp-chat__why > summary::before {
+  content: "▸ ";
+}
+
+.rp-chat__why[open] > summary::before {
+  content: "▾ ";
+}
+
+.rp-chat__why > .rp-chat__note {
+  margin-top: 6px;
+}

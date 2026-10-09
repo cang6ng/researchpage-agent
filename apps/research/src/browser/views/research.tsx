@@ -467,6 +467,8 @@ export function ResearchView() {
               activityLog={bundle.activityLog}
               sources={bundle.sources}
               usage={bundle.usage}
+              budget={bundle.budget}
+              unresolved={bundle.presentation.unresolvedResearch.unresolved}
               status={bundle.task.status}
               confirmed={bundle.task.confirmed}
               error={bundle.task.error}

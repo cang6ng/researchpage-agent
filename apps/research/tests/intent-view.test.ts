@@ -125,7 +125,30 @@ describe("the exploration panel while it is still deciding", () => {
     expect(markup).toContain("Agent 记忆系统的实现路径比较");
     expect(markup).toContain("了解中");
     expect(markup).toContain("你这次最想弄清楚的核心问题是什么？");
+  });
+
+  it("keeps the reasoning behind a question folded away", () => {
+    const markup = render();
+    // The question is what the reader answers; the reasoning is a disclosure,
+    // and it is the question that gets the size and the weight.
+    expect(markup).toContain('data-testid="intent-why-trn_1"');
+    expect(markup).toContain("为什么这样问");
+    expect(markup).toContain("<details");
+    expect(markup).not.toMatch(/<details[^>]*\sopen/);
     expect(markup).toContain("这决定了报告以机制解释为主");
+  });
+
+  it("separates the conversation column from the direction decision", () => {
+    const markup = render();
+    expect(markup).toContain('class="rp-intent"');
+    expect(markup).toContain('class="rp-intent__main"');
+    expect(markup).toContain('class="rp-intent__aside"');
+    // The composer lives in the conversation column, not after the decision.
+    const composer = markup.indexOf("rp-intent__composer");
+    const aside = markup.indexOf("rp-intent__aside");
+    expect(composer).toBeGreaterThan(-1);
+    expect(aside).toBeGreaterThan(-1);
+    expect(composer).toBeLessThan(aside);
   });
 
   it("says what confirmation means before there is anything to confirm", () => {

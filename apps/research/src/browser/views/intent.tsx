@@ -89,8 +89,19 @@ function Turn({ turn }: { readonly turn: IntentTurnView }): React.ReactElement {
       <span className="rp-chat__who">助手</span>
       <div className="rp-chat__body">
         {turn.proposesDirection === true && <p className="rp-chat__note">下面这条是研究方向建议，需要你确认。</p>}
+        {/*
+          The question, at the size of a question. The reasoning behind it is
+          worth having and is not the thing being answered, so it is a
+          disclosure: a reader who wants it opens it, and one who is answering
+          sees the question rather than a paragraph about the question.
+        */}
         <RichMarkdown text={turn.text} className={turn.proposesDirection === true ? undefined : "rp-chat__ask"} />
-        {turn.why !== undefined && turn.why.length > 0 && <p className="rp-chat__note">为什么问这个：{turn.why}</p>}
+        {turn.why !== undefined && turn.why.length > 0 && (
+          <details className="rp-chat__why" data-testid={`intent-why-${turn.id}`}>
+            <summary>为什么这样问</summary>
+            <p className="rp-chat__note">{turn.why}</p>
+          </details>
+        )}
       </div>
     </div>
   );
@@ -262,6 +273,9 @@ export function IntentPanel(props: IntentPanelProps): React.ReactElement {
   const [answer, setAnswer] = useState("");
   const [attached, setAttached] = useState<readonly string[]>([]);
   const [decisionsOpen, setDecisionsOpen] = useState(false);
+  // The decision card is open by default; on a narrow screen the reader can
+  // fold it away to keep the conversation readable.
+  const [directionOpen, setDirectionOpen] = useState(true);
   const textarea = useRef<HTMLTextAreaElement | null>(null);
 
   // A new proposal — or the same one after the user's own edit came back — is a
@@ -316,6 +330,81 @@ export function IntentPanel(props: IntentPanelProps): React.ReactElement {
   const waitText = TASK_WAIT_TEXTS[waitPhase];
   const waiting = confirmed && intent.taskId === null && confirmedAt !== null;
 
+  /**
+   * The composer, as an element rather than in place.
+   *
+   * It renders at the bottom of the conversation column, which is where a
+   * reader looks for it, instead of after the direction card that used to
+   * push it off the page.
+   */
+  const composer = !confirmed ? (
+    <div style={{ marginTop: 0, maxWidth: 740 }}>
+          {ready.length > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <div className="rp-chat__note" style={{ marginBottom: 6 }}>
+                随这条消息附上已入库文档（可选，只有已经入库的文件才能被引用）：
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
+                {ready.map((document) => (
+                  <Checkbox
+                    key={document.documentId}
+                    size="xs"
+                    checked={attached.includes(document.documentId)}
+                    onChange={(event) => {
+                      const on = event.currentTarget.checked;
+                      setAttached((current) =>
+                        on ? [...current, document.documentId] : current.filter((id) => id !== document.documentId),
+                      );
+                    }}
+                    label={document.title}
+                    data-testid={`intent-attach-${document.documentId}`}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="rp-composer">
+            <Textarea
+              ref={textarea}
+              className="rp-composer__field"
+              autosize
+              minRows={1}
+              maxRows={6}
+              maxLength={MAX_MESSAGE_CHARS}
+              value={answer}
+              placeholder="回答助手的问题，或者直接说明你要研究什么…"
+              onChange={(event) => {
+                setAnswer(event.currentTarget.value);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  send();
+                }
+              }}
+              data-testid="intent-message-input"
+            />
+            <div className="rp-composer__side">
+              <Button
+                size="md"
+                rightSection={busy || working ? <Loader size={14} color="white" /> : <Send size={15} />}
+                disabled={!sendGate.allowed}
+                onClick={send}
+                data-testid="intent-message-send"
+                title={sendGate.reason}
+              >
+                发送
+              </Button>
+            </div>
+          </div>
+          {!sendGate.allowed && sendGate.reason.length > 0 && (
+            <p className="rp-chat__note" data-testid="intent-send-reason">
+              {sendGate.reason}
+            </p>
+          )}
+    </div>
+  ) : null;
+
   return (
     <div className="rp-page" data-testid="intent-view">
       <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
@@ -339,6 +428,16 @@ export function IntentPanel(props: IntentPanelProps): React.ReactElement {
         这一段是「确定研究什么」：助手会问清楚对象、范围与读者，你确认方向之后才会建立任务卡并开始检索。确认之前不会调用检索或撰写。
       </p>
 
+      {/*
+        Two columns on a wide desktop, one on a narrow screen.
+
+        The direction card is the *decision*; the conversation is the reasoning
+        that led to it. Side by side, a long form cannot push the composer off
+        the page, and the thing being confirmed stays visible while the reader
+        reads why.
+      */}
+      <div className="rp-intent" style={{ marginTop: 22 }}>
+        <div className="rp-intent__main">
       {/* ------------------------------------------------------ conversation */}
       <div className="rp-chat" style={{ marginTop: 22 }}>
         {intent.turns.map((turn) => (
@@ -409,6 +508,27 @@ export function IntentPanel(props: IntentPanelProps): React.ReactElement {
         </div>
       )}
 
+          {/*
+            The composer is last in the column and sticky: whatever is above it,
+            the place to type is at the bottom of the column being read.
+          */}
+          {!confirmed && <div className="rp-intent__composer">{composer}</div>}
+        </div>
+
+        {/* ------------------------------------------------------- decision */}
+        <aside className="rp-intent__aside" aria-label="研究方向确认">
+          <button
+            type="button"
+            className="rp-intent__aside-toggle"
+            aria-expanded={directionOpen}
+            onClick={() => {
+              setDirectionOpen((open) => !open);
+            }}
+            data-testid="direction-toggle"
+          >
+            研究方向确认 {directionOpen ? "收起" : "展开"}
+          </button>
+          <div className="rp-intent__aside-body" hidden={!directionOpen}>
       {/* -------------------------------------------------------- direction */}
       {confirmed && direction !== null ? (
         <div className="rp-chat__embedded" style={{ marginTop: 18 }} data-testid="intent-confirmed">
@@ -483,75 +603,9 @@ export function IntentPanel(props: IntentPanelProps): React.ReactElement {
           )}
         </div>
       )}
-
-      {/* --------------------------------------------------------- composer */}
-      {!confirmed && (
-        <div style={{ marginTop: 22, maxWidth: 880 }}>
-          {ready.length > 0 && (
-            <div style={{ marginBottom: 10 }}>
-              <div className="rp-chat__note" style={{ marginBottom: 6 }}>
-                随这条消息附上已入库文档（可选，只有已经入库的文件才能被引用）：
-              </div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
-                {ready.map((document) => (
-                  <Checkbox
-                    key={document.documentId}
-                    size="xs"
-                    checked={attached.includes(document.documentId)}
-                    onChange={(event) => {
-                      const on = event.currentTarget.checked;
-                      setAttached((current) =>
-                        on ? [...current, document.documentId] : current.filter((id) => id !== document.documentId),
-                      );
-                    }}
-                    label={document.title}
-                    data-testid={`intent-attach-${document.documentId}`}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-          <div className="rp-composer">
-            <Textarea
-              ref={textarea}
-              className="rp-composer__field"
-              autosize
-              minRows={1}
-              maxRows={6}
-              maxLength={MAX_MESSAGE_CHARS}
-              value={answer}
-              placeholder="回答助手的问题，或者直接说明你要研究什么…"
-              onChange={(event) => {
-                setAnswer(event.currentTarget.value);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  send();
-                }
-              }}
-              data-testid="intent-message-input"
-            />
-            <div className="rp-composer__side">
-              <Button
-                size="md"
-                rightSection={busy || working ? <Loader size={14} color="white" /> : <Send size={15} />}
-                disabled={!sendGate.allowed}
-                onClick={send}
-                data-testid="intent-message-send"
-                title={sendGate.reason}
-              >
-                发送
-              </Button>
-            </div>
           </div>
-          {!sendGate.allowed && sendGate.reason.length > 0 && (
-            <p className="rp-chat__note" data-testid="intent-send-reason">
-              {sendGate.reason}
-            </p>
-          )}
-        </div>
-      )}
+        </aside>
+      </div>
 
       {/* ------------------------------------------------------- newer files */}
       {props.newerDocumentIds.length > 0 && !confirmed && (

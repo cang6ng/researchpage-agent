@@ -1,25 +1,27 @@
 /**
- * Where the research actually is.
+ * Where the research actually is, summary first.
  *
- * A reader watching a project run needs four different things and they are not
- * the same question: what the product is doing right now, how far *this*
- * attempt has got, what the network has answered, and what happened while they
- * were away. The page draws all four from the record the server keeps —
- * `progress`, `attempt`, `discovery` and the stored activity log — and draws
- * nothing it computed itself. There is no percentage anywhere, because there is
- * no denominator: a research pass is not a file being copied, and a bar that
- * filled up while nothing was being read would be a picture of a guess.
+ * A reader watching a project run needs one thing immediately and one thing on
+ * demand. The one thing is the summary: which stage is running, what has been
+ * found, how much material has really been read, what is still open, how long
+ * it has been going, and when anything last happened. The other is the full
+ * record, which is thirty lines of provider names and retry counts and is
+ * exactly right for a diagnosis and exactly wrong as a default.
  *
- * The retry button is the one action here, and it is offered only when the
- * server says the project really stopped: confirmed, failed, not busy, nothing
- * of this page's own in flight. A retry preserves everything the project has —
- * sources, evidence, assessments, reports, frozen revisions — and the page says
- * so before and after, because "start again" and "start over" are different
- * promises.
+ * There is no percentage anywhere and no estimate of the remaining time.
+ * Research does not complete a fixed amount of work per second, so a bar or an
+ * ETA would be a picture of a guess; what the page can say truthfully is what
+ * has happened and what is happening. The research deadline is a budget for
+ * research *actions*, not a completion promise for the report, and the page
+ * says so where it shows it.
+ *
+ * Nothing here is private model reasoning: every word comes from the stored
+ * activity record, and the one action is a retry the server has already agreed
+ * to accept.
  */
 
-import { Alert, Badge, Button, Loader, Timeline } from "@mantine/core";
-import { AlertTriangle, CheckCircle2, Clock, History, Radio } from "lucide-react";
+import { Alert, Badge, Button, Loader } from "@mantine/core";
+import { AlertTriangle, CheckCircle2, Clock, History, Radio, RotateCcw } from "lucide-react";
 import { useState } from "react";
 
 import type { ActivityEventView, ProgressView, SourceView, TaskBundle } from "../api.js";
@@ -30,20 +32,155 @@ const LEVEL_LABELS: Readonly<Record<string, string>> = Object.freeze({
   error: "错误",
 });
 
+/**
+ * Which reader-facing group an activity line belongs to.
+ *
+ * The stored record keeps the product's own stage vocabulary — `searching`,
+ * `waiting_retry`, `provider_skipped`, `stage_completed` — because that is what
+ * a diagnosis needs. What a reader wants is five headings, so the mapping is
+ * here, once, rather than in the reader's head.
+ */
+export const ACTIVITY_GROUPS: readonly { readonly id: string; readonly label: string; readonly match: RegExp }[] = Object.freeze([
+  { id: "searching", label: "检索", match: /search|discovery|provider/ },
+  { id: "reading", label: "读取", match: /read|fetch|source/ },
+  { id: "gap", label: "补查", match: /gap|retry|waiting/ },
+  { id: "assessment", label: "评估", match: /assess|coverage|matrix/ },
+  { id: "reporting", label: "报告", match: /report|synthesis|section|draft/ },
+  { id: "validation", label: "校验", match: /valid|quality|propos/ },
+]);
+
+export function groupOf(event: ActivityEventView): string {
+  const haystack = `${event.kind} ${event.stage}`.toLowerCase();
+  for (const group of ACTIVITY_GROUPS) {
+    if (group.match.test(haystack)) return group.id;
+  }
+  return "other";
+}
+
 function when(iso: string | null): string {
   if (iso === null) return "—";
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "—";
-  return `${String(date.getMonth() + 1)}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
+  return `${String(date.getMonth() + 1)}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
-function Fact({ label, value, tone }: { readonly label: string; readonly value: string; readonly tone?: string }): React.ReactElement {
+/** How long something has been running, in words rather than in a fraction. */
+function elapsed(from: string | null, until: string | null = null): string {
+  if (from === null) return "—";
+  const start = Date.parse(from);
+  if (Number.isNaN(start)) return "—";
+  const end = until === null ? Date.now() : Date.parse(until);
+  if (Number.isNaN(end)) return "—";
+  const minutes = Math.max(0, Math.round((end - start) / 60_000));
+  if (minutes < 1) return "不到 1 分钟";
+  if (minutes < 60) return `${String(minutes)} 分钟`;
+  return `${String(Math.floor(minutes / 60))} 小时 ${String(minutes % 60)} 分钟`;
+}
+
+function Fact({ label, value, tone, testId }: { readonly label: string; readonly value: string; readonly tone?: string; readonly testId?: string }): React.ReactElement {
   return (
     <div className="rp-fact">
       <span className="rp-fact__k">{label}</span>
-      <span className="rp-fact__v" style={tone === undefined ? undefined : { color: tone }}>
+      <span className="rp-fact__v" style={tone === undefined ? undefined : { color: tone }} data-testid={testId}>
         {value}
       </span>
+    </div>
+  );
+}
+
+/**
+ * The full record, as the reader asked for it.
+ *
+ * It is a component rather than an inlined branch so that what it renders can
+ * be checked directly: the default is *not* to render it, and a test that could
+ * only reach the collapsed state would have no way to say whether the whole
+ * history is still available at all.
+ */
+export function ActivityDetails({
+  events,
+  grouped,
+}: {
+  readonly events: readonly ActivityEventView[];
+  readonly grouped: boolean;
+}): React.ReactElement {
+  if (grouped) {
+    const byGroup = new Map<string, ActivityEventView[]>();
+    for (const event of events) {
+      const key = groupOf(event);
+      const list = byGroup.get(key) ?? [];
+      list.push(event);
+      byGroup.set(key, list);
+    }
+    return (
+      <div data-testid="activity-log-grouped">
+        {ACTIVITY_GROUPS.filter((group) => (byGroup.get(group.id)?.length ?? 0) > 0).map((group) => (
+          <div key={group.id} style={{ marginBottom: 14 }}>
+            <div className="rp-kicker" style={{ marginBottom: 6 }}>
+              {group.label} · {(byGroup.get(group.id) ?? []).length} 条
+            </div>
+            {(byGroup.get(group.id) ?? []).map((event) => (
+              <div key={event.id} className="rp-file__fact" style={{ display: "block", lineHeight: 1.7 }}>
+                {when(event.at)} · {event.message}
+                {event.level !== "info" ? `（${LEVEL_LABELS[event.level] ?? event.level}）` : ""}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return (
+    <div data-testid="activity-log">
+      {events.map((event) => (
+        <div key={event.id} className="rp-file__fact" style={{ display: "block", lineHeight: 1.8 }}>
+          {when(event.at)} · {event.stage} · {event.message}
+          {event.provider === undefined ? "" : ` · ${event.provider}`}
+          {event.level !== "info" ? `（${LEVEL_LABELS[event.level] ?? event.level}）` : ""}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The diagnostic counts, shown only when the reader opened the details.
+ *
+ * Provider successes and failures, the read-state breakdown and the stages the
+ * project has been through are what a diagnosis needs and what a reader waiting
+ * does not. Keeping them out of the summary is the difference between a status
+ * and a log; keeping them *available* is the difference between simplifying and
+ * hiding.
+ */
+export function ResearchDetailFacts({
+  progress,
+  discovery,
+  sources,
+}: {
+  readonly progress: ProgressView;
+  readonly discovery: TaskBundle["discovery"];
+  readonly sources: readonly SourceView[];
+}): React.ReactElement {
+  const readCounts = sources.reduce<Record<string, number>>((counts, source) => {
+    counts[source.readStatus] = (counts[source.readStatus] ?? 0) + 1;
+    return counts;
+  }, {});
+  return (
+    <div style={{ display: "flex", gap: 26, flexWrap: "wrap", marginTop: 12 }} data-testid="research-detail-facts">
+      {discovery !== null && (
+        <>
+          <Fact
+            label="发现请求"
+            value={`成功 ${String(discovery.successfulRequests)} / 尝试 ${String(discovery.attemptedRequests)} / 失败 ${String(discovery.failedRequests)}`}
+          />
+          <Fact label="最近使用服务" value={discovery.lastProvider ?? "—"} />
+          <Fact label="最近一次耗时" value={discovery.lastElapsedMs === null ? "—" : `${String(Math.round(discovery.lastElapsedMs / 100) / 10)} 秒`} />
+        </>
+      )}
+      <Fact
+        label="来源读取状态"
+        value={`已读 ${String(readCounts["ok"] ?? 0)} · 失败 ${String(readCounts["failed"] ?? 0)} · 未读 ${String(readCounts["not_read"] ?? 0)}`}
+      />
+      {progress.completedStages.length > 0 && <Fact label="已完成过的阶段" value={progress.completedStages.join(" → ")} />}
     </div>
   );
 }
@@ -55,26 +192,25 @@ export interface ResearchProgressProps {
   readonly activityLog: readonly ActivityEventView[];
   readonly sources: readonly SourceView[];
   readonly usage: TaskBundle["usage"];
+  readonly budget: TaskBundle["budget"];
   readonly status: TaskBundle["task"]["status"];
   readonly confirmed: boolean;
   readonly error: string | null;
   readonly busy: boolean;
   readonly retrying: boolean;
   readonly retryMessage: string | null;
+  readonly unresolved: number;
   readonly onRetry: () => void;
 }
 
 export function ResearchProgress(props: ResearchProgressProps): React.ReactElement {
   const { progress, attempt, discovery, activityLog } = props;
-  const [expanded, setExpanded] = useState(false);
-  const shown = expanded ? activityLog : activityLog.slice(-10);
-  const readCounts = props.sources.reduce<Record<string, number>>((counts, source) => {
-    counts[source.readStatus] = (counts[source.readStatus] ?? 0) + 1;
-    return counts;
-  }, {});
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [grouped, setGrouped] = useState(false);
   const failure = props.error;
   const historical = failure === null && discovery?.lastFailure != null && props.status !== "failed";
   const canRetry = props.confirmed && props.status === "failed" && !props.busy && !props.retrying;
+  const running = props.busy || progress.currentStage === "searching" || progress.currentStage === "reading";
 
   return (
     <section className="rp-research" data-testid="research-progress">
@@ -84,7 +220,7 @@ export function ResearchProgress(props: ResearchProgressProps): React.ReactEleme
           <div className="rp-runstate">
             {props.status === "failed" ? (
               <AlertTriangle size={15} strokeWidth={1.75} />
-            ) : props.busy ? (
+            ) : running ? (
               <Loader size="xs" color="ink" />
             ) : (
               <CheckCircle2 size={15} strokeWidth={1.75} />
@@ -113,29 +249,36 @@ export function ResearchProgress(props: ResearchProgressProps): React.ReactEleme
         </div>
       </div>
 
-      <div className="rp-facts" style={{ display: "flex", gap: 26, flexWrap: "wrap", marginTop: 12 }}>
-        <Fact label="研究轮次" value={attempt === null ? "尚未开始" : `第 ${String(attempt.number)} 轮`} />
-        <Fact label="本轮开始" value={attempt === null ? "—" : when(attempt.startedAt)} />
-        <Fact label="最近活动" value={when(progress.lastActivityAt)} />
-        <Fact label="检索请求" value={`${String(progress.searchAttempts)} 次（含失败）`} />
-        <Fact label="候选来源" value={String(progress.candidatesFound)} />
-        <Fact label="已读来源" value={String(progress.sourcesRead)} />
-        <Fact label="本项目累计检索" value={`${String(props.usage.searches)} 次 · 读取 ${String(props.usage.reads)} 次 · 补查 ${String(props.usage.gapRounds)} 轮`} />
+      {/*
+        The summary. Four numbers and three times, all of them facts the server
+        keeps: what was found, what was really read, what is still open, and how
+        long it has been. Nothing here is a fraction of a whole.
+      */}
+      <div className="rp-facts" style={{ display: "flex", gap: 26, flexWrap: "wrap", marginTop: 14 }}>
+        <Fact label="找到候选" value={`${String(progress.candidatesFound)} 个来源`} testId="summary-candidates" />
+        <Fact label="已读来源" value={`${String(progress.sourcesRead)} 个`} testId="summary-read" />
+        <Fact
+          label="尚未解决"
+          value={props.unresolved === 0 ? "没有待查项" : `${String(props.unresolved)} 项`}
+          tone={props.unresolved === 0 ? undefined : "var(--rp-ink)"}
+          testId="summary-unresolved"
+        />
+        <Fact label="研究轮次" value={attempt === null ? "尚未开始" : `第 ${String(attempt.number)} 轮`} testId="summary-round" />
+        <Fact label="已用时" value={attempt === null ? "—" : elapsed(attempt.startedAt, props.status === "failed" || props.status === "ready" ? null : null)} testId="summary-elapsed" />
+        <Fact label="最近活动" value={when(progress.lastActivityAt)} testId="summary-last-activity" />
       </div>
 
-      <div style={{ display: "flex", gap: 26, flexWrap: "wrap", marginTop: 12 }}>
-        {discovery !== null && (
-          <>
-            <Fact label="发现请求" value={`成功 ${String(discovery.successfulRequests)} / 尝试 ${String(discovery.attemptedRequests)} / 失败 ${String(discovery.failedRequests)}`} />
-            <Fact label="最近使用服务" value={discovery.lastProvider ?? "—"} />
-            <Fact label="最近一次耗时" value={discovery.lastElapsedMs === null ? "—" : `${String(Math.round(discovery.lastElapsedMs / 100) / 10)} 秒`} />
-          </>
-        )}
-        <Fact label="来源读取状态" value={`已读 ${String(readCounts["ok"] ?? 0)} · 失败 ${String(readCounts["failed"] ?? 0)} · 未读 ${String(readCounts["not_read"] ?? 0)}`} />
-        {progress.completedStages.length > 0 && (
-          <Fact label="已完成过的阶段" value={progress.completedStages.join(" → ")} />
-        )}
-      </div>
+      {/*
+        What the deadline is, and what it is not. It bounds the *research
+        actions* of this project; it is not an arrival time for the report, and
+        saying so here is cheaper than a reader waiting for a clock that was
+        never counting the thing they were waiting for.
+      */}
+      <p className="rp-research__budget" data-testid="research-budget">
+        研究动作时间预算约 {Math.round(props.budget.deadlineMs / 60_000)} 分钟（已用 {String(props.usage.searches)} 次检索 ·{" "}
+        {String(props.usage.reads)} 次读取 · 补查 {String(props.usage.gapRounds)}/{String(props.budget.maxGapRounds)} 轮）。
+        这是研究动作的预算，不是报告完成时间；完成时间目前无法准确预估。
+      </p>
 
       {(failure !== null || historical) && (
         <Alert
@@ -154,18 +297,26 @@ export function ResearchProgress(props: ResearchProgressProps): React.ReactEleme
           )}
           {failure !== null && (
             <div style={{ marginTop: 10 }}>
+              {/*
+                The recovery first. A failed report does not mean the material
+                is gone, and the action that reuses it is the one offered
+                prominently; starting the research over is described for what
+                it is — a second pass over the sources — and kept secondary.
+              */}
               <Button
                 size="xs"
                 variant="light"
                 disabled={!canRetry}
                 loading={props.retrying}
+                leftSection={<RotateCcw size={13} />}
                 onClick={props.onRetry}
                 data-testid="research-retry"
               >
-                重开一轮研究
+                重新研究（会重新检索与读取）
               </Button>
               <p style={{ margin: "8px 0 0", fontSize: 12, color: "var(--rp-ink-3)" }}>
-                重开一轮会重新检索与读取；已经有的来源、证据、评估、报告和冻结版本都会保留。
+                已经有的来源、证据、评估、报告和冻结版本都会保留。若只是报告没有写出来，优先用项目页的「使用现有资料恢复报告」，
+                它不会重新检索。
               </p>
             </div>
           )}
@@ -178,54 +329,71 @@ export function ResearchProgress(props: ResearchProgressProps): React.ReactEleme
         </Alert>
       )}
 
+      {/*
+        The full record, closed by default. What a reader needs while waiting is
+        the summary above; what a diagnosis needs is every provider attempt, and
+        that is one click away rather than in the way.
+      */}
       <div className="rp-section-head" style={{ marginTop: 20 }}>
         <h2>
-          <History size={13} strokeWidth={1.75} aria-hidden="true" /> 活动记录
+          <History size={13} strokeWidth={1.75} aria-hidden="true" /> 活动详情
         </h2>
         <span>
-          {activityLog.length === 0 ? "还没有记录" : `共 ${String(activityLog.length)} 条（最早的在前）`}
-          {activityLog.length > 10 && (
+          {activityLog.length === 0 ? "还没有记录" : `共 ${String(activityLog.length)} 条`}
+          {activityLog.length > 0 && (
             <button
               type="button"
               className="rp-inline"
               style={{ marginLeft: 10 }}
               onClick={() => {
-                setExpanded((open) => !open);
+                setDetailsOpen((open) => !open);
               }}
               data-testid="activity-log-toggle"
             >
-              {expanded ? "只看最近 10 条" : "展开全部"}
+              {detailsOpen ? "收起" : "查看活动详情"}
             </button>
           )}
         </span>
       </div>
-      {shown.length === 0 ? (
-        <p className="rp-empty">研究开始之后，这里会按时间记录每一次检索、读取与重试。</p>
-      ) : (
-        <Timeline active={shown.length} bulletSize={14} lineWidth={1} data-testid="activity-log">
-          {shown.map((event) => (
-            <Timeline.Item
-              key={event.id}
-              title={
-                <span style={{ display: "inline-flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                  <span style={{ fontSize: 12.5, color: "var(--rp-ink)" }}>{event.message}</span>
-                  {event.level !== "info" && (
-                    <Badge size="xs" variant="light" color={event.level === "error" ? "red" : "yellow"}>
-                      {LEVEL_LABELS[event.level] ?? event.level}
-                    </Badge>
-                  )}
-                  {event.provider !== undefined && <span className="rp-file__fact">{event.provider}</span>}
-                  {event.attempt !== undefined && <span className="rp-file__fact">第 {String(event.attempt)} 轮</span>}
-                </span>
-              }
+
+      {detailsOpen && activityLog.length > 0 && (
+        <>
+          <div style={{ display: "flex", gap: 9, marginBottom: 10 }}>
+            <button
+              type="button"
+              className="rp-inline"
+              aria-pressed={!grouped}
+              onClick={() => {
+                setGrouped(false);
+              }}
+              data-testid="activity-mode-flat"
             >
-              <span className="rp-file__fact">
-                {when(event.at)} · {event.stage}
-                {event.nextRetryAt === undefined || event.nextRetryAt === null ? "" : ` · 计划重试 ${when(event.nextRetryAt)}`}
-              </span>
-            </Timeline.Item>
-          ))}
-        </Timeline>
+              按时间
+            </button>
+            <button
+              type="button"
+              className="rp-inline"
+              aria-pressed={grouped}
+              onClick={() => {
+                setGrouped(true);
+              }}
+              data-testid="activity-mode-grouped"
+            >
+              按类型
+            </button>
+          </div>
+          <ResearchDetailFacts progress={progress} discovery={discovery} sources={props.sources} />
+          <ActivityDetails events={activityLog} grouped={grouped} />
+        </>
+      )}
+
+      {!detailsOpen && activityLog.length > 0 && (
+        <p className="rp-empty" style={{ marginTop: 4 }}>
+          默认不展开：完整记录包含每一次服务请求与重试，需要诊断时再打开。
+        </p>
+      )}
+      {activityLog.length === 0 && (
+        <p className="rp-empty">研究开始之后，这里会按时间记录每一次检索、读取与重试。</p>
       )}
     </section>
   );
